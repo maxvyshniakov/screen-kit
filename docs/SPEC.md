@@ -70,25 +70,58 @@ render is correct and re-render it from the same take.
    - YouTube: upload, captions and the thumbnail by API. Extra audio-language tracks have no
      API and are added by hand in YouTube Studio.
 
+## Decisions (owner, 2026-11-04)
+
+1. **Renderer:** Remotion 4, read through our own timeline only, so the renderer can be
+   swapped.
+2. **Licence:** MIT. The repository and packages stay private until the owner authorizes
+   publishing.
+3. **Flow-builder benchmark:** the Straylight Desktop scenario editor, recorded as the real
+   interface, not an imitation.
+   - The interface is Electron + React (`@xyflow/react`, Sid-Kit) and runs in a browser: the
+     desktop's web mode, its test host without device access, or its `Straylight/Scenarios`
+     stories. Its action-creation tests already drive palette drags in Playwright Chromium.
+   - The render draws the macOS window frame (traffic lights) on a wallpaper stage. The camera
+     can therefore leave the window to show the frame.
+   - Scenario:
+     - drag an action card from the palette onto the canvas;
+     - pan and pinch-zoom the canvas;
+     - select cards (marquee, Shift/⌘);
+     - show the shortcuts used.
+4. **Where scripts live:** next to their use.
+   - The personal site (`maxvyshniakov`) keeps its video recipes beside its screenshot recipes
+     (`config/case-shots.json`, the `case-shots` skill).
+   - screen-kit is the tool, not the place for scripts.
+5. **Picture format follows the site** (`docs/screenshots.md` there):
+   - a 16:9 frame of 1440 × 810 CSS px;
+   - demo data only;
+   - Display P3 (`--force-color-profile=display-p3-d65`).
+
+## Retina: recommendation, pending a spike
+
+The site shoots stills at 3× (4320 × 2430). Headless screencast on macOS stops at 1×.
+Recommended order:
+
+1. **Per-frame capture on a virtual clock** at device scale 2 (or 3), in headless Chromium.
+   - It stays agent-operated, never touches the owner's screen and gives any scale, in P3, as
+     the stills do.
+   - Unknown: whether the CDP trackpad gesture and the rubber band still play under a virtual
+     clock. The first spike answers this.
+2. **Fallback: record a real window** with ScreenCaptureKit at the display's 2× scale.
+   - This needs the Screen Recording permission and a quiet screen: a virtual display, or a
+     time the owner is away.
+   - It is the only path for Safari and Firefox gestures, and for native windows.
+
+Video size: a 2× master (2880 × 1620) encodes the web loop. 3× stills stay stills.
+
 ## v0 milestone
 
-- One end-to-end path:
-  - Chromium, headless, a Storybook story or any URL;
+- **Spike:** per-frame capture at 2× with the trackpad gesture, as above.
+- **One end-to-end path:**
+  - Chromium, a Storybook story or any URL;
   - a silent web loop with captions;
   - the review assertions.
-- First scenario: the Data Grid sideways rubber band, after Data Grid #51 lands.
-- Out of v0: Safari and Firefox capture, retina capture, native apps, voice, YouTube upload and
-  Shorts.
-
-## Open decisions for the owner
-
-- **Renderer:** Remotion now behind the timeline (recommended), or our own renderer from the
-  start.
-- **Licence:** MIT is the research's recommendation. Public npm or a public repository needs
-  your authorization.
-- **The flow-builder benchmark:** which app or page it runs against.
-- **Retina capture:**
-  - headless capture on macOS stops at 1×;
-  - 2× needs either per-frame capture on a virtual clock (it is unknown whether the trackpad
-    gesture survives it) or a real window recorded with Screen Recording permission.
-- **Where scripts live:** in each product repository next to its stories, or here.
+- **Scenarios:**
+  - the Data Grid sideways rubber band, after Data Grid #51 lands;
+  - the Straylight scenario editor flow.
+- **Out of v0:** Safari and Firefox capture, native windows, voice, YouTube upload and Shorts.
