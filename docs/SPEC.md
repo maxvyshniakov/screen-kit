@@ -97,28 +97,23 @@ render is correct and re-render it from the same take.
    - demo data only;
    - Display P3 (`--force-color-profile=display-p3-d65`).
 
-## Retina: recommendation, pending a spike
+## Retina capture
 
-The site shoots stills at 3× (4320 × 2430). Headless screencast on macOS stops at 1×.
-Recommended order:
-
-1. **Per-frame capture on a virtual clock** at device scale 2 (or 3), in headless Chromium.
-   - It stays agent-operated, never touches the owner's screen and gives any scale, in P3, as
-     the stills do.
-   - Unknown: whether the CDP trackpad gesture and the rubber band still play under a virtual
-     clock. The first spike answers this.
-2. **Fallback: record a real window** with ScreenCaptureKit at the display's 2× scale.
-   - This needs the Screen Recording permission and a quiet screen: a virtual display, or a
-     time the owner is away.
-   - It is the only path for Safari and Firefox gestures, and for native windows.
-
-Video size: a 2× master (2880 × 1620) encodes the web loop. 3× stills stay stills.
+Decided by the [retina spike](research/retina-spike.md):
+- Capture runs in a real Chromium window on the Retina display with `deviceScaleFactor: 2`:
+  2880 × 1620 frames at 60 fps, with a real rubber band. The window works behind the owner's
+  apps: focus is handed back, and Chromium's occlusion backgrounding is off.
+- Headless capture at 1× is kept for quick drafts and CI. Headless 2× renders crisply but
+  only at about 16 fps.
+- Frame-by-frame capture on a virtual clock is not available on macOS
+  (`HeadlessExperimental.beginFrame`).
+- The video master is 2× (2880 × 1620); the site's stills stay 3×.
+- Still open: whether Display P3 survives the screencast frames.
 
 ## v0 milestone
 
-- **Spike:** per-frame capture at 2× with the trackpad gesture, as above.
 - **One end-to-end path:**
-  - Chromium, a Storybook story or any URL;
+  - Chromium in a background window at 2×, a Storybook story or any URL;
   - a silent web loop with captions;
   - the review assertions.
 - **Scenarios:**
