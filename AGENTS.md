@@ -1,7 +1,7 @@
 # screen-kit
 
-Agent-operated demo videos: a script is recorded in real browsers and rendered from a timeline,
-and every render verifies itself. [docs/SPEC.md](docs/SPEC.md) is the design; change it before
+Product screenshots, animations and recordings: consumer-owned recipes drive real browser
+and terminal input; captures retain reusable takes and verification evidence. [docs/SPEC.md](docs/SPEC.md) is the design; change it before
 changing direction.
 
 - An agent must be able to run every step alone: write the script, record, render, review, fix

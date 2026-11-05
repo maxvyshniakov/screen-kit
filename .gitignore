@@ -5,3 +5,5 @@ out/
 .env*
 .DS_Store
 *.tgz
+
+!vendor/repo-kit-0.2.2.tgz

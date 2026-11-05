@@ -1,0 +1,29 @@
+{
+  "name": "@maxvyshniakov/screen-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "description": "Reproducible browser and terminal screenshots, animations and recordings.",
+  "bin": { "screen-kit": "src/cli.mjs" },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./browser": "./src/browser.mjs",
+    "./images": "./src/images.mjs",
+    "./catalog": "./src/catalog.mjs",
+    "./terminal": "./src/terminal.mjs",
+    "./video": "./src/video.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "fonts", "tools/build-symbol-font.py", "LICENSE", "README.md"],
+  "scripts": {
+    "prepare": "repo-kit hooks install",
+    "test": "node --test test/*.test.mjs",
+    "check:kit": "repo-kit check",
+    "check:syntax": "node --check src/cli.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/video.mjs",
+    "verify": "repo-kit verify"
+  },
+  "dependencies": { "sharp": "0.35.5", "@xterm/headless": "6.0.0" },
+  "devDependencies": { "@maxvyshniakov/repo-kit": "file:./vendor/repo-kit-0.2.2.tgz" },
+  "license": "MIT"
+}

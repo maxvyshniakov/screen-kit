@@ -1,14 +1,15 @@
 # Publishing
 
-## Branches
-- `main` only, until the repository gets a remote and adopts repo-kit; then `dev` for everyday pushes and `main`
-  for releases, as in the other `@maxvyshniakov` repositories.
+Repository: `maxvyshniakov/screen-kit`, private. Everyday destination: `dev`.
+`main` is reserved for an explicitly requested release, following the other private
+`@maxvyshniakov` repositories. Use Straylight’s `tools/lane promote <sha>` from this repository. It takes the
+landing lock, pushes the explicit SHA to `dev`, and moves the local branch. The
+repo-kit reference hook protects local `main` and `dev`; commit on a task branch.
 
-## Gate
-- None yet; see [checks.md](checks.md).
+The repo-kit pre-push hook runs `bun run verify` on the outgoing tree. Follow any
+GitHub checks on the pushed SHA to their final result. The initial repository has
+no hosted workflow yet; report that separately from local gate success.
 
-## Push
-- No remote yet. The owner decides when to create the private GitHub repository `maxvyshniakov/screen-kit`.
-
-## Release
-- No package yet. Publishing anywhere, including the private GitHub Packages registry, waits for the owner.
+Local private tarballs may be vendored by consumers with source digest and archive
+hash. Package registry publication, making the repository public and media uploads
+require separate explicit authorization.
