@@ -1,7 +1,7 @@
 # screen-kit
 
 Reproducible browser and terminal screenshots, animations and recordings. Recipes live with
-products; screen-kit owns capture, saved takes, export and verification. Private package.
+products; screen-kit owns capture, saved takes, export and verification. The package is not published to a registry.
 
 ## Local setup
 
@@ -14,7 +14,8 @@ screen-kit --help
 
 Browser capture needs `agent-browser` on PATH. Every capture, browser integration test and
 encoder runs through `slotfather run -n 1 -- ...`; timing benchmarks require all slots.
-Bundled JetBrains Mono and Noto Sans Symbols 2 include their licenses in `fonts/`.
+Terminal rendering uses agg 1.9 or newer and its swash backend. Bundled JetBrains Mono
+and Noto Sans Symbols 2 include their licenses in `fonts/`.
 
 ## Capture
 

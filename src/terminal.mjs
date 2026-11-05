@@ -96,18 +96,25 @@ export async function renderTerminalTake({cast,name,recipe={},cwd=process.cwd(),
  const takes=resolve(out,'takes');
  await mkdir(takes,{recursive:true});
  let input=cast;
- if(recipe.theme) {
-  const copy={...header,theme:recipe.theme};
+ // Render compact squares through their font outline; swash deliberately synthesizes
+ // terminal block elements, which must fill fractional-width cells without seams.
+ const compact=records.slice(1).some(event=>event[1]==='o'&&event[2].includes('■'));
+ if(recipe.theme||compact) {
+  const copy=recipe.theme?{...header,theme:recipe.theme}:header;
   input=join(takes,`${name}.render.cast`);
   if(input===cast)throw Error('Rendered take copy would overwrite its source');
-  await writeFile(input,[copy,...records.slice(1)].map(record=>JSON.stringify(record)).join('\n')+'\n');
+  const output=records.slice(1).map(event=>compact&&event[1]==='o'?[event[0],event[1],event[2].replaceAll('■','\ue000')]:event);
+  await writeFile(input,[copy,...output].map(record=>JSON.stringify(record)).join('\n')+'\n');
  }
  const gif=join(takes,`${name}.gif`);
  const fontSize=String(recipe.fontSize??20);
- const options=['--quiet','--renderer','resvg','--font-size',fontSize,
-  '--font-family',recipe.fontFamily??'JetBrains Mono,Noto Sans Symbols 2','--line-height',String(recipe.lineHeight??1.2),
+ const family=recipe.fontFamily??'Screen Kit Mono,JetBrains Mono,Noto Sans Symbols 2';
+ const fonts=family.includes('Screen Kit Mono')?family:family+',Screen Kit Mono';
+ const options=['--quiet','--renderer','swash','--font-size',fontSize,
+  '--font-family',fonts,'--line-height',String(recipe.lineHeight??1.2),
   '--fps-cap',String(fps),'--last-frame-duration','0','--idle-time-limit',String(duration)];
- options.push('--font-dir',recipe.fontDir?resolve(cwd,recipe.fontDir):FONTS);
+ options.push('--font-dir',FONTS);
+ if(recipe.fontDir)options.push('--font-dir',resolve(cwd,recipe.fontDir));
  if(recipe.at!==undefined) {
   if(!(recipe.at>=0&&recipe.at<=duration))throw Error('Terminal snapshot time must be within the take');
   options.push('--select',String(recipe.at));

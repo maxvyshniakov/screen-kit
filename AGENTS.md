@@ -7,8 +7,8 @@ changing direction.
 - An agent must be able to run every step alone: write the script, record, render, review, fix
   and publish. Each capability gets a CLI or file interface and machine-checkable output before
   any UI is considered.
-- The repository is private. Making it or a package public, publishing to npm, or uploading
-  videos anywhere needs the owner's explicit authorization.
+- The repository is public (owner-authorized 2026-11-05). Publishing a package to npm or
+  uploading videos anywhere still needs the owner's explicit authorization.
 - All code, docs and examples use English.
 - Research notes, one cited file per question: [docs/research](docs/research). Check a note's
   date before relying on it; tools in this field change monthly.

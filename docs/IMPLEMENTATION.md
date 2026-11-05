@@ -1,6 +1,6 @@
 # Implementation status
 
-2026-11-05. The initial delivery creates a private GitHub repository. Registry publication and site media import remain separate actions.
+2026-11-05. The initial delivery created a private GitHub repository; the owner made it public on the same day. Registry publication and site media import remain separate actions.
 
 Implemented:
 

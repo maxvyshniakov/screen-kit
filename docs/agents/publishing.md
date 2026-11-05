@@ -1,6 +1,6 @@
 # Publishing
 
-Repository: `maxvyshniakov/screen-kit`, private. Everyday destination: `dev`.
+Repository: `maxvyshniakov/screen-kit`, public. Everyday destination: `dev`.
 `main` is reserved for an explicitly requested release, following the other private
 `@maxvyshniakov` repositories. Use Straylight’s `tools/lane promote <sha>` from this repository. It takes the
 landing lock, pushes the explicit SHA to `dev`, and moves the local branch. The
@@ -10,6 +10,5 @@ The repo-kit pre-push hook runs `bun run verify` on the outgoing tree. Follow an
 GitHub checks on the pushed SHA to their final result. The initial repository has
 no hosted workflow yet; report that separately from local gate success.
 
-Local private tarballs may be vendored by consumers with source digest and archive
-hash. Package registry publication, making the repository public and media uploads
-require separate explicit authorization.
+Local unpublished tarballs may be vendored by consumers with source digest and archive
+hash. Package registry publication and media uploads require separate explicit authorization.
