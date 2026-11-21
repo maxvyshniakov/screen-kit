@@ -2,7 +2,7 @@
 import { writeFile } from 'node:fs/promises';
 import { resolve, dirname, basename, extname } from 'node:path';
 import { captureRun, loadConfiguration, statusRun, VERSION } from './run.mjs';
-import { reviewRun } from './review.mjs';
+import { reviewRun, reviewVideo } from './review.mjs';
 import { renderVideo } from './video.mjs';
 
 const help = `screen-kit ${VERSION}
@@ -10,16 +10,21 @@ const help = `screen-kit ${VERSION}
 screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit review --manifest out/run.json [--out review.json]
+screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--cursor-threshold 2] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30]
 
 Recipes live in the consumer repository. Browser and terminal capture use real input.
 Capture writes run.json, original takes and exported files; review verifies their hashes,
-dimensions, frame counts, duration and capture checkpoints. render exports silent MP4/WebM.
+dimensions, frame counts, duration, capture checkpoints and rendered video quality. render exports silent MP4/WebM.
 `;
 
 const [command = 'help', ...args] = process.argv.slice(2);
-const allowed = new Set(['config', 'cwd', 'only', 'out', 'manifest', 'input', 'fps', 'at']);
+const allowed = new Set([
+  'config', 'cwd', 'only', 'out', 'manifest', 'input', 'fps', 'at',
+  'video', 'timeline', 'event-track', 'baseline', 'out-dir', 'cursor-threshold', 'multimodal', 'provider',
+]);
+const booleanFlags = new Set(['multimodal']);
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
   else if (['--version', '-V'].includes(command)) console.log(VERSION);
@@ -28,9 +33,13 @@ try {
     for (let i = 0; i < args.length; i++) {
       if (!args[i].startsWith('--') || !allowed.has(args[i].slice(2))) throw Error(`unknown option: ${args[i]}`);
       const name = args[i].slice(2);
-      if (!args[i + 1] || args[i + 1].startsWith('--')) throw Error(`--${name} requires a value`);
       if (Object.hasOwn(flags, name)) throw Error(`duplicate option: --${name}`);
-      flags[name] = args[++i];
+      if (booleanFlags.has(name) && (!args[i + 1] || args[i + 1].startsWith('--'))) {
+        flags[name] = true;
+      } else {
+        if (!args[i + 1] || args[i + 1].startsWith('--')) throw Error(`--${name} requires a value`);
+        flags[name] = args[++i];
+      }
     }
     if (command === 'capture' || command === 'status') {
       const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
@@ -38,7 +47,28 @@ try {
         only: flags.only, ...(flags.out ? { out: flags.out } : {}), manifest: flags.manifest };
       console.log(JSON.stringify(await (command === 'capture' ? captureRun(options) : statusRun(options)), null, 2));
     } else if (command === 'review') {
-      const result = await reviewRun({ manifest: flags.manifest });
+      const result = flags.video
+        ? await reviewVideo({
+            video: flags.video,
+            timeline: flags.timeline,
+            eventTrack: flags['event-track'],
+            baseline: flags.baseline,
+            outDir: flags['out-dir'],
+            ...(flags['cursor-threshold'] ? { cursorThresholdPx: Number(flags['cursor-threshold']) } : {}),
+            ...(flags.multimodal
+              ? {
+                  multimodal: {
+                    enabled: true,
+                    provider: flags.provider ?? (flags.multimodal === true ? 'gemini' : flags.multimodal),
+                  },
+                }
+              : {}),
+          })
+        : await reviewRun({
+            manifest: flags.manifest,
+            ...(flags['out-dir'] ? { outDir: flags['out-dir'] } : {}),
+            ...(flags.baseline ? { baseline: flags.baseline } : {}),
+          });
       const text = JSON.stringify(result, null, 2) + '\n';
       if (flags.out) await writeFile(resolve(flags.out), text);
       console.log(text.trimEnd());

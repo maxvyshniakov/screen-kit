@@ -1,5 +1,20 @@
 export { captureRun, loadConfiguration, selectedRecipes, sourceRevision, statusRun, VERSION } from './run.mjs';
 export { reviewRun } from './review.mjs';
+export {
+  DEFAULT_CURSOR_THRESHOLD_PX,
+  reviewVideo,
+  probeVideoDetails,
+  probeFrameTimestamps,
+  detectFreezeAndBlackFrames,
+  verifyCameraBounds,
+  verifyCursorAccuracy,
+  locateCursorMarker,
+  resolveStillTargets,
+  extractStills,
+  generateContactSheet,
+  diffStillsAgainstBaseline,
+  runMultimodalReview,
+} from './review-video.mjs';
 export { renderVideo, probeVideo } from './video.mjs';
 export { renderTerminalTake } from './terminal.mjs';
 export {

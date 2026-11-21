@@ -1,9 +1,12 @@
 import { readFile } from 'node:fs/promises';
-import { dirname, extname, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import sharp from 'sharp';
 import { hash } from './run.mjs';
 import { validateEventTrack } from './take-browser.mjs';
 import { probeVideo } from './video.mjs';
+import { reviewVideo } from './review-video.mjs';
+
+export { reviewVideo };
 
 function inspectCast(bytes) {
   const [header, ...events] = bytes.toString('utf8').trim().split('\n').map(JSON.parse);
@@ -21,11 +24,12 @@ function inspectCast(bytes) {
 }
 
 /** Verify exported bytes against the capture manifest; no application is launched. */
-export async function reviewRun({ manifest } = {}) {
+export async function reviewRun({ manifest, videoReview, outDir, baseline, multimodal } = {}) {
   if (!manifest) throw Error('review requires a run.json manifest');
   manifest = resolve(manifest);
   const report = JSON.parse(await readFile(manifest, 'utf8'));
   const checks = [];
+  const videos = {};
   const check = (name, ok, message) => checks.push({ name, ok: Boolean(ok), message });
   check('run', report.version === 1 && report.status === 'complete', `run status: ${report.status}`);
   check('recipes', Object.keys(report.recipes ?? {}).length > 0, 'run contains captured recipes');
@@ -52,8 +56,9 @@ export async function reviewRun({ manifest } = {}) {
       }
       let actual;
       const cast = extname(file) === '.cast';
+      const isVideo = ['.mp4', '.webm', '.mov'].includes(extname(file));
       if (cast) actual = inspectCast(bytes);
-      else if (['.mp4', '.webm', '.mov'].includes(extname(file))) actual = await probeVideo(file);
+      else if (isVideo) actual = await probeVideo(file);
       else {
         const metadata = await sharp(bytes, { animated: true }).metadata();
         actual = { width: metadata.width, height: metadata.pageHeight ?? metadata.height,
@@ -71,7 +76,37 @@ export async function reviewRun({ manifest } = {}) {
         check(`${name}:assertion`, assertion.ok, assertion.message ?? assertion.expect ?? 'capture assertion');
       for (const checkpoint of artifact.checkpoints ?? [])
         check(`${name}:checkpoint`, checkpoint.passed, `expected screen content at ${checkpoint.at}s: ${JSON.stringify(checkpoint.expect)}`);
+      if (isVideo && (videoReview || artifact.timeline)) {
+        const extraOpts = typeof videoReview === 'object' && videoReview !== null ? videoReview : {};
+        const timelineRef = typeof artifact.timeline === 'string'
+          ? resolve(dirname(manifest), artifact.timeline)
+          : artifact.timeline;
+        const eventTrackRef = typeof artifact.eventTrack === 'string'
+          ? resolve(dirname(manifest), artifact.eventTrack)
+          : artifact.eventTrack;
+        const videoOutDir = outDir ? join(resolve(outDir), name) : undefined;
+        const videoBaseline = baseline ? join(resolve(baseline), name) : undefined;
+        const videoResult = await reviewVideo({
+          ...extraOpts,
+          video: file,
+          timeline: extraOpts.timeline ?? timelineRef,
+          eventTrack: extraOpts.eventTrack ?? eventTrackRef,
+          outDir: extraOpts.outDir ?? videoOutDir,
+          baseline: extraOpts.baseline ?? videoBaseline,
+          multimodal: extraOpts.multimodal ?? multimodal,
+        });
+        videos[name] = videoResult;
+        for (const videoCheck of videoResult.checks) {
+          check(`${name}:video:${videoCheck.name}`, videoCheck.ok, videoCheck.message);
+        }
+      }
     } catch (error) { check(`${name}:file`, false, error.message); }
   }
-  return { version: 1, manifest, ok: checks.every(check => check.ok), checks };
+  return {
+    version: 1,
+    manifest,
+    ok: checks.every(check => check.ok),
+    checks,
+    ...(Object.keys(videos).length > 0 ? { videos } : {}),
+  };
 }
