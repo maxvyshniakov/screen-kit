@@ -7,11 +7,13 @@ import sharp from 'sharp';
 import { difference } from './images.mjs';
 import {
   cameraViewportRect,
+  compileCursorSamples,
   projectViewportToScreen,
   sampleCamera,
   sampleCursor,
   validateTimeline,
 } from './timeline.mjs';
+import { screenToRender } from './remotion/layout.mjs';
 import { reviewNarration } from './narration.mjs';
 
 const exec = promisify(execFile);
@@ -538,48 +540,31 @@ export async function locateCursorMarker(image, options = {}) {
   };
 }
 
-function buildCursorFromEventTrack(eventTrack) {
+/**
+ * Quantize timestamp `t` down to the exact video frame boundary `Math.floor(t * fps) / fps`.
+ */
+export function snapToFrameBoundary(t, fps) {
+  if (!isFiniteNumber(t)) return t;
+  const clamped = Math.max(0, t);
+  if (!isFiniteNumber(fps) || fps <= 0) return clamped;
+  return Math.floor(clamped * fps + 1e-9) / fps;
+}
+
+function buildCursorFromEventTrack(eventTrack, fallbackDuration = 0) {
   if (!isObject(eventTrack) || !Array.isArray(eventTrack.events)) return null;
-  const samples = [];
-  let pressed = false;
-  for (const event of eventTrack.events) {
-    if (!isObject(event) || !isFiniteNumber(event.t)) continue;
-    if (event.type === 'pointermove' || event.type === 'pointerdown' || event.type === 'pointerup') {
-      if (event.type === 'pointerdown') pressed = true;
-      if (event.type === 'pointerup') pressed = false;
-      if (isFiniteNumber(event.x) && isFiniteNumber(event.y)) {
-        samples.push({ t: event.t, x: event.x, y: event.y, pressed, visible: true });
-      }
-    } else if (event.type === 'wheel' || event.type === 'gesture') {
-      if (isFiniteNumber(event.x) && isFiniteNumber(event.y)) {
-        samples.push({ t: event.t, x: event.x, y: event.y, pressed, visible: true });
-      }
-    } else if (event.type === 'drag' && Array.isArray(event.from) && Array.isArray(event.to)) {
-      samples.push({ t: event.t, x: event.from[0], y: event.from[1], pressed: true, visible: true });
-      if (isFiniteNumber(event.duration)) {
-        const endT = event.t + event.duration;
-        const hasInteriorPointer = eventTrack.events.some(
-          (other) =>
-            isObject(other) &&
-            (other.type === 'pointermove' || other.type === 'pointerup') &&
-            isFiniteNumber(other.t) &&
-            other.t > event.t &&
-            other.t <= endT
-        );
-        if (!hasInteriorPointer) {
-          samples.push({ t: endT, x: event.to[0], y: event.to[1], pressed: false, visible: true });
-        }
-      }
-    }
-  }
-  samples.sort((a, b) => a.t - b.t);
+  const duration = isFiniteNumber(eventTrack.video?.duration)
+    ? eventTrack.video.duration
+    : fallbackDuration;
+  const samples = compileCursorSamples(eventTrack.events, duration);
   return samples.length > 0 ? { enabled: true, style: 'macos', samples } : null;
 }
 
 /**
  * Pure geometric/sample verifier for cursor accuracy (`<= thresholdPx`, default 2 px).
- * Projects expected viewport coordinates with `projectViewportToScreen` and compares them
- * against observed screen-space `cursorSamples` (or cross-checks `eventTrack` against timeline).
+ * Projects expected viewport coordinates with `projectViewportToScreen` + `screenToRender`
+ * at frame-aligned timestamps and compares them against observed `cursorSamples`.
+ * Non-pixel fallback modes (`event-track-alignment`, `projection-self-check`) report
+ * `checked: false, skipped: true` so pixel verification is never falsely claimed.
  */
 export function verifyCursorAccuracy({
   timeline,
@@ -588,12 +573,17 @@ export function verifyCursorAccuracy({
   thresholdPx = DEFAULT_CURSOR_THRESHOLD_PX,
   outputWidth,
   outputHeight,
+  fps,
 } = {}) {
+  if (!isFiniteNumber(thresholdPx) || thresholdPx <= 0) {
+    throw Error('cursorThresholdPx must be a positive finite number');
+  }
   const cursor = timeline?.overlays?.cursor;
   if (!timeline || !cursor?.enabled) {
     return {
       ok: true,
       checked: false,
+      skipped: true,
       mode: 'disabled',
       thresholdPx,
       samplesChecked: 0,
@@ -604,7 +594,7 @@ export function verifyCursorAccuracy({
     };
   }
 
-  const trackCursor = buildCursorFromEventTrack(eventTrack);
+  const trackCursor = buildCursorFromEventTrack(eventTrack, timeline?.take?.duration ?? 0);
   const referenceCursor =
     Array.isArray(cursor.samples) && cursor.samples.length > 0 ? cursor : trackCursor;
 
@@ -612,6 +602,7 @@ export function verifyCursorAccuracy({
     return {
       ok: true,
       checked: false,
+      skipped: true,
       mode: 'no-samples',
       thresholdPx,
       samplesChecked: 0,
@@ -624,16 +615,23 @@ export function verifyCursorAccuracy({
 
   const cameraWidth = timeline.camera?.outputWidth;
   const cameraHeight = timeline.camera?.outputHeight;
-  const scaleX = outputWidth && cameraWidth ? outputWidth / cameraWidth : 1;
-  const scaleY = outputHeight && cameraHeight ? outputHeight / cameraHeight : 1;
+  const effectiveFps = fps !== undefined ? fps : timeline?.take?.fps;
 
   const projectExpected = (sourceCursor, t) => {
     const vp = sampleCursor(sourceCursor, t);
     if (!vp) return null;
     const screen = projectViewportToScreen(vp.x, vp.y, timeline, t);
+    const rendered = screenToRender(
+      screen.x,
+      screen.y,
+      cameraWidth,
+      cameraHeight,
+      outputWidth,
+      outputHeight
+    );
     return {
-      x: round(screen.x * scaleX, 3),
-      y: round(screen.y * scaleY, 3),
+      x: round(rendered.x, 3),
+      y: round(rendered.y, 3),
       visible: vp.visible,
       viewport: { x: vp.x, y: vp.y },
     };
@@ -642,19 +640,23 @@ export function verifyCursorAccuracy({
   const comparisons = [];
   const violations = [];
   let mode = 'observed-samples';
+  let pixelVerified = false;
 
   if (Array.isArray(cursorSamples) && cursorSamples.length > 0) {
     mode = 'observed-samples';
+    pixelVerified = true;
     for (const sample of cursorSamples) {
       if (!isObject(sample) || !isFiniteNumber(sample.t)) continue;
-      const expected = projectExpected(referenceCursor, sample.t);
+      const sampleT = snapToFrameBoundary(sample.t, effectiveFps);
+      const expected = projectExpected(referenceCursor, sampleT);
       if (!expected || !expected.visible) continue;
 
       const observedMissing =
         sample.found === false || !isFiniteNumber(sample.x) || !isFiniteNumber(sample.y);
       if (observedMissing) {
         const entry = {
-          t: round(sample.t, 4),
+          t: round(sampleT, 4),
+          ...(Math.abs(sampleT - sample.t) > EPS ? { requestedT: round(sample.t, 4) } : {}),
           expected: { x: expected.x, y: expected.y },
           actual: null,
           dx: null,
@@ -671,9 +673,17 @@ export function verifyCursorAccuracy({
       let actualX = sample.x;
       let actualY = sample.y;
       if (sample.space === 'viewport') {
-        const projected = projectViewportToScreen(sample.x, sample.y, timeline, sample.t);
-        actualX = projected.x * scaleX;
-        actualY = projected.y * scaleY;
+        const projected = projectViewportToScreen(sample.x, sample.y, timeline, sampleT);
+        const rendered = screenToRender(
+          projected.x,
+          projected.y,
+          cameraWidth,
+          cameraHeight,
+          outputWidth,
+          outputHeight
+        );
+        actualX = rendered.x;
+        actualY = rendered.y;
       }
 
       const dx = actualX - expected.x;
@@ -681,7 +691,8 @@ export function verifyCursorAccuracy({
       const distancePx = Math.hypot(dx, dy);
       const ok = distancePx <= thresholdPx + EPS;
       const entry = {
-        t: round(sample.t, 4),
+        t: round(sampleT, 4),
+        ...(Math.abs(sampleT - sample.t) > EPS ? { requestedT: round(sample.t, 4) } : {}),
         expected: { x: expected.x, y: expected.y },
         actual: { x: round(actualX, 3), y: round(actualY, 3) },
         dx: round(dx, 3),
@@ -695,15 +706,16 @@ export function verifyCursorAccuracy({
   } else if (trackCursor && Array.isArray(cursor.samples) && cursor.samples.length > 0) {
     mode = 'event-track-alignment';
     for (const sample of trackCursor.samples) {
-      const expected = projectExpected(trackCursor, sample.t);
-      const actual = projectExpected(cursor, sample.t);
+      const sampleT = snapToFrameBoundary(sample.t, effectiveFps);
+      const expected = projectExpected(trackCursor, sampleT);
+      const actual = projectExpected(cursor, sampleT);
       if (!expected || !actual || !expected.visible) continue;
       const dx = actual.x - expected.x;
       const dy = actual.y - expected.y;
       const distancePx = Math.hypot(dx, dy);
       const ok = distancePx <= thresholdPx + EPS;
       const entry = {
-        t: round(sample.t, 4),
+        t: round(sampleT, 4),
         expected: { x: expected.x, y: expected.y },
         actual: { x: actual.x, y: actual.y },
         dx: round(dx, 3),
@@ -717,11 +729,12 @@ export function verifyCursorAccuracy({
   } else {
     mode = 'projection-self-check';
     for (const sample of referenceCursor.samples) {
-      const expected = projectExpected(referenceCursor, sample.t);
+      const sampleT = snapToFrameBoundary(sample.t, effectiveFps);
+      const expected = projectExpected(referenceCursor, sampleT);
       if (!expected || !expected.visible) continue;
       const finite = Number.isFinite(expected.x) && Number.isFinite(expected.y);
       const entry = {
-        t: round(sample.t, 4),
+        t: round(sampleT, 4),
         expected: { x: expected.x, y: expected.y },
         actual: { x: expected.x, y: expected.y },
         dx: 0,
@@ -741,9 +754,11 @@ export function verifyCursorAccuracy({
       ? round(numericDistances.reduce((sum, d) => sum + d, 0) / numericDistances.length, 3)
       : 0;
 
+  const checked = pixelVerified && comparisons.length > 0;
   return {
     ok: violations.length === 0,
-    checked: comparisons.length > 0,
+    checked,
+    skipped: !checked,
     mode,
     thresholdPx,
     samplesChecked: comparisons.length,
@@ -1198,10 +1213,13 @@ async function callGeminiMultimodalReview({ payload, multimodal }) {
     });
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   const response = await fetchImpl(endpoint, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-goog-api-key': apiKey,
+    },
     body: JSON.stringify({
       contents: [{ role: 'user', parts }],
       generationConfig: { responseMimeType: 'application/json' },
@@ -1220,10 +1238,33 @@ async function callGeminiMultimodalReview({ payload, multimodal }) {
     .trim();
 
   if (!text) {
-    return { ran: true, skipped: false, ok: true, summary: 'No multimodal response text returned', findings: [] };
+    return {
+      ran: false,
+      skipped: true,
+      reason: 'Empty multimodal response text returned',
+      findings: [],
+    };
   }
 
-  const parsed = JSON.parse(text);
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return {
+      ran: true,
+      skipped: false,
+      ok: false,
+      summary: `Malformed multimodal JSON response: ${error.message}`,
+      findings: [
+        {
+          severity: 'error',
+          category: 'multimodal-parse',
+          message: `Failed to parse multimodal JSON response: ${error.message}`,
+        },
+      ],
+    };
+  }
+
   const rawFindings = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? parsed.findings : [];
   return {
     ran: true,
@@ -1288,6 +1329,130 @@ export async function runMultimodalReview({ payload, multimodal } = {}) {
   };
 }
 
+function collectActiveMotionWindows(timeline, eventTrack) {
+  const raw = [];
+  const pushWindow = (start, end) => {
+    if (!isFiniteNumber(start) || !isFiniteNumber(end)) return;
+    const s = Math.max(0, Math.min(start, end));
+    const e = Math.max(start, end);
+    if (e - s > EPS) raw.push([s, e]);
+  };
+
+  if (isObject(timeline)) {
+    const kfs = timeline.camera?.keyframes;
+    if (Array.isArray(kfs)) {
+      for (let i = 0; i + 1 < kfs.length; i += 1) {
+        const a = kfs[i];
+        const b = kfs[i + 1];
+        if (!isObject(a) || !isObject(b)) continue;
+        if (b.t > a.t && b.easing !== 'hold' && (b.x !== a.x || b.y !== a.y || b.zoom !== a.zoom)) {
+          pushWindow(a.t, b.t);
+        }
+      }
+    }
+
+    if (timeline.overlays?.cursor?.enabled && Array.isArray(timeline.overlays.cursor.samples)) {
+      const samples = timeline.overlays.cursor.samples;
+      for (let i = 0; i + 1 < samples.length; i += 1) {
+        const a = samples[i];
+        const b = samples[i + 1];
+        if (
+          isFiniteNumber(a?.t) &&
+          isFiniteNumber(b?.t) &&
+          b.t > a.t &&
+          b.t - a.t <= 0.25 &&
+          (Math.hypot((b.x ?? 0) - (a.x ?? 0), (b.y ?? 0) - (a.y ?? 0)) > 1 || a.pressed !== b.pressed)
+        ) {
+          pushWindow(a.t, b.t);
+        }
+      }
+    }
+
+    for (const ripple of timeline.overlays?.ripples ?? []) {
+      if (isFiniteNumber(ripple?.t) && isFiniteNumber(ripple?.duration)) {
+        pushWindow(ripple.t, ripple.t + ripple.duration);
+      }
+    }
+    for (const gesture of timeline.overlays?.gestures ?? []) {
+      if (isFiniteNumber(gesture?.t) && isFiniteNumber(gesture?.duration)) {
+        pushWindow(gesture.t, gesture.t + gesture.duration);
+      }
+    }
+  }
+
+  if (isObject(eventTrack) && Array.isArray(eventTrack.events)) {
+    const events = eventTrack.events;
+    for (let i = 0; i < events.length; i += 1) {
+      const e = events[i];
+      if (!isObject(e) || !isFiniteNumber(e.t)) continue;
+      if (e.type === 'drag' || e.type === 'gesture') {
+        pushWindow(e.t, e.t + (isFiniteNumber(e.duration) && e.duration > 0 ? e.duration : 0.25));
+      } else if (e.type === 'wheel') {
+        pushWindow(e.t, e.t + (isFiniteNumber(e.duration) && e.duration > 0 ? e.duration : 0.2));
+      } else if (e.type === 'pointerdown' || e.type === 'pointerup') {
+        pushWindow(e.t, e.t + 0.12);
+      }
+    }
+  }
+
+  if (raw.length === 0) return [];
+  raw.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [raw[0]];
+  for (let i = 1; i < raw.length; i += 1) {
+    const prev = merged[merged.length - 1];
+    const curr = raw[i];
+    if (curr[0] <= prev[1] + 0.05) {
+      prev[1] = Math.max(prev[1], curr[1]);
+    } else {
+      merged.push(curr);
+    }
+  }
+  return merged;
+}
+
+function classifyFreezeSegments(segments, { timeline, eventTrack, duration, minDuration, freezeOutsideActions }) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return { unexpectedSegments: [], quietPauseSegments: [] };
+  }
+  const hasSchedule = Boolean(timeline || eventTrack);
+  const mode = freezeOutsideActions ?? (hasSchedule ? 'info' : 'error');
+  if (mode === 'error') {
+    return { unexpectedSegments: segments, quietPauseSegments: [] };
+  }
+
+  const activeWindows = collectActiveMotionWindows(timeline, eventTrack);
+  const totalFrozen = segments.reduce((sum, s) => sum + s.duration, 0);
+  const entirelyFrozen =
+    duration >= minDuration &&
+    (totalFrozen >= Math.max(minDuration, duration - 0.15) ||
+      segments.some((s) => s.duration >= Math.max(minDuration, duration - 0.15))) &&
+    (activeWindows.length > 0 || !hasSchedule);
+
+  if (entirelyFrozen) {
+    return { unexpectedSegments: segments, quietPauseSegments: [] };
+  }
+
+  const unexpectedSegments = [];
+  const quietPauseSegments = [];
+  for (const seg of segments) {
+    let maxContiguousOverlap = 0;
+    let totalOverlap = 0;
+    for (const [winStart, winEnd] of activeWindows) {
+      const overlap = Math.min(seg.end, winEnd) - Math.max(seg.start, winStart);
+      if (overlap > 0) {
+        totalOverlap += overlap;
+        if (overlap > maxContiguousOverlap) maxContiguousOverlap = overlap;
+      }
+    }
+    if (maxContiguousOverlap >= minDuration - EPS || (totalOverlap >= Math.min(minDuration, 0.5) && totalOverlap >= seg.duration * 0.5)) {
+      unexpectedSegments.push(seg);
+    } else {
+      quietPauseSegments.push(seg);
+    }
+  }
+  return { unexpectedSegments, quietPauseSegments };
+}
+
 /**
  * Automatically review a rendered video using deterministic assertions, contact sheet & stills,
  * baseline pixel diffing, and an optional pluggable multimodal agent review hook.
@@ -1314,6 +1479,9 @@ export async function reviewVideo({
   multimodal,
 } = {}) {
   if (!video) throw Error('reviewVideo requires a video path');
+  if (!isFiniteNumber(cursorThresholdPx) || cursorThresholdPx <= 0) {
+    throw Error('cursorThresholdPx must be a positive finite number');
+  }
   const videoFile = resolve(video);
   const resolvedOutDir = outDir ? resolve(outDir) : null;
   const timeline = await loadJsonOrObject(timelineInput, 'timeline');
@@ -1407,23 +1575,63 @@ export async function reviewVideo({
     addFinding('error', 'ffprobe', reason);
   }
 
-  // 2. Capture gap / frame-drop detection via PTS deltas
+  // 2. Capture gap / frame-drop detection via PTS deltas + raw screencast capture stats
   const frameTiming = await probeFrameTimestamps(videoFile, {
     ...gapOptions,
     nominalFps: probe.nominalFps || probe.fps,
   });
+  const rawCapture = isObject(eventTrack?.video?.capture) ? eventTrack.video.capture : null;
+  if (rawCapture) {
+    frameTiming.rawCapture = rawCapture;
+  }
+
   const gapsEnabled = gapOptions.enabled !== false;
   const maxDroppedFrames = gapOptions.maxDroppedFrames ?? 0;
-  const gapsOk = !gapsEnabled || frameTiming.totalMissedFrames <= maxDroppedFrames;
+  const maxRawGaps = gapOptions.maxRawGaps ?? maxDroppedFrames;
+  const ptsGapsOk = !gapsEnabled || frameTiming.totalMissedFrames <= maxDroppedFrames;
+
+  let rawGapsOk = true;
+  let rawGapReason = '';
+  if (gapsEnabled && rawCapture) {
+    const rawZeroFrames = isFiniteNumber(rawCapture.rawFrames) && rawCapture.rawFrames <= 0;
+    const rawTruncated = rawCapture.truncated === true;
+    const rawExceedsGapThreshold = isFiniteNumber(gapOptions.maxGapMs)
+      ? isFiniteNumber(rawCapture.maxGapMs) && rawCapture.maxGapMs > gapOptions.maxGapMs + EPS
+      : isFiniteNumber(rawCapture.gapsOver2Frames) && rawCapture.gapsOver2Frames > maxRawGaps;
+    rawGapsOk = !rawZeroFrames && !rawTruncated && !rawExceedsGapThreshold;
+    if (!rawGapsOk) {
+      const reasons = [];
+      if (rawZeroFrames) reasons.push('0 raw screencast frames captured');
+      if (rawTruncated) reasons.push('raw capture was truncated at requested duration');
+      if (rawExceedsGapThreshold) {
+        reasons.push(
+          `raw capture reported ${rawCapture.gapsOver2Frames ?? 1} gap(s) > 2 frames (max gap ${rawCapture.maxGapMs} ms, rawFps ${rawCapture.rawFps})`
+        );
+      }
+      rawGapReason = reasons.join('; ');
+    }
+  }
+
+  const gapsOk = ptsGapsOk && rawGapsOk;
+  const gapFailureParts = [];
+  if (!ptsGapsOk) {
+    gapFailureParts.push(
+      `detected ${frameTiming.gaps.length} PTS gap(s) (~${frameTiming.totalMissedFrames} missed frame(s), max delta ${frameTiming.maxDeltaMs} ms > ${frameTiming.thresholdMs} ms)`
+    );
+  }
+  if (!rawGapsOk) {
+    gapFailureParts.push(rawGapReason);
+  }
+
   addCheck(
     'capture-gaps',
     gapsOk,
     gapsOk
-      ? `no capture gaps detected (${frameTiming.ptsCount} frames, max delta ${frameTiming.maxDeltaMs} ms)`
-      : `detected ${frameTiming.gaps.length} capture gap(s) (~${frameTiming.totalMissedFrames} missed frame(s), max delta ${frameTiming.maxDeltaMs} ms > ${frameTiming.thresholdMs} ms)`,
+      ? `no capture gaps detected (${frameTiming.ptsCount} frames, max delta ${frameTiming.maxDeltaMs} ms${rawCapture ? `, rawFps ${rawCapture.rawFps}, maxRawGap ${rawCapture.maxGapMs} ms` : ''})`
+      : gapFailureParts.join('; '),
     { skipped: !gapsEnabled }
   );
-  if (!gapsOk) {
+  if (!ptsGapsOk) {
     for (const gap of frameTiming.gaps) {
       addFinding(
         'error',
@@ -1433,6 +1641,11 @@ export async function reviewVideo({
       );
     }
   }
+  if (!rawGapsOk && rawCapture) {
+    addFinding('error', 'capture-gap', `Raw capture gap failure: ${rawGapReason}`, {
+      details: rawCapture,
+    });
+  }
 
   // 3. Freeze frame & black frame detection via FFmpeg filters
   const signalDetection = await detectFreezeAndBlackFrames(videoFile, {
@@ -1441,21 +1654,48 @@ export async function reviewVideo({
     black: blackOptions,
   });
 
-  const freezeOk = !signalDetection.freeze.enabled || signalDetection.freeze.segments.length === 0;
+  const freezeOutsideActions =
+    freezeOptions.freezeOutsideActions ?? (timeline || eventTrack ? 'info' : 'error');
+  const { unexpectedSegments: unexpectedFreezes, quietPauseSegments } = signalDetection.freeze.enabled
+    ? classifyFreezeSegments(signalDetection.freeze.segments, {
+        timeline,
+        eventTrack,
+        duration: probe.duration,
+        minDuration: signalDetection.freeze.minDuration,
+        freezeOutsideActions,
+      })
+    : { unexpectedSegments: [], quietPauseSegments: [] };
+
+  signalDetection.freeze.unexpectedSegments = unexpectedFreezes;
+  signalDetection.freeze.quietPauseSegments = quietPauseSegments;
+
+  const freezeOk = !signalDetection.freeze.enabled || unexpectedFreezes.length === 0;
   addCheck(
     'freeze-frames',
     freezeOk,
     freezeOk
-      ? `no frozen segments >= ${signalDetection.freeze.minDuration}s`
-      : `detected ${signalDetection.freeze.segments.length} frozen segment(s) totaling ${signalDetection.freeze.totalFrozenSeconds}s`,
+      ? quietPauseSegments.length > 0
+        ? `no unexpected frozen segments >= ${signalDetection.freeze.minDuration}s (${quietPauseSegments.length} quiet pause(s) outside active windows)`
+        : `no frozen segments >= ${signalDetection.freeze.minDuration}s`
+      : `detected ${unexpectedFreezes.length} frozen segment(s) totaling ${round(unexpectedFreezes.reduce((s, seg) => s + seg.duration, 0), 4)}s`,
     { skipped: !signalDetection.freeze.enabled }
   );
   if (!freezeOk) {
-    for (const seg of signalDetection.freeze.segments) {
+    for (const seg of unexpectedFreezes) {
       addFinding(
         'error',
         'freeze-frame',
         `Frozen frames detected from ${seg.start}s to ${seg.end}s (${seg.duration}s)`,
+        { timestamp: seg.start, details: seg }
+      );
+    }
+  }
+  if (quietPauseSegments.length > 0 && (freezeOutsideActions === 'info' || freezeOutsideActions === 'warning')) {
+    for (const seg of quietPauseSegments) {
+      addFinding(
+        freezeOutsideActions,
+        'freeze-pause',
+        `Quiet static pause from ${seg.start}s to ${seg.end}s (${seg.duration}s) outside active interaction windows`,
         { timestamp: seg.start, details: seg }
       );
     }
@@ -1533,56 +1773,75 @@ export async function reviewVideo({
     diffs: [],
   };
 
-  if (resolvedOutDir) {
-    await mkdir(resolvedOutDir, { recursive: true });
-    const targets = resolveStillTargets({
-      timeline,
-      eventTrack,
-      duration: probe.duration,
-      timestamps,
-      stillCount,
-    });
-    artifacts.stills = await extractStills({ video: videoFile, targets, outDir: resolvedOutDir });
-    artifacts.contactSheet = await generateContactSheet({
-      stills: artifacts.stills,
-      outputFile: join(resolvedOutDir, 'contact-sheet.png'),
-      ...contactSheetOptions,
-    });
+  const ephemeralReviewDir =
+    !resolvedOutDir && baseline ? await mkdtemp(join(tmpdir(), 'screen-kit-review-')) : null;
+  const workingOutDir = resolvedOutDir ?? ephemeralReviewDir;
 
-    if (baseline) {
-      baselineReport = {
-        ...(await diffStillsAgainstBaseline({
-          stills: artifacts.stills,
+  try {
+    if (workingOutDir) {
+      await mkdir(workingOutDir, { recursive: true });
+      const targets = resolveStillTargets({
+        timeline,
+        eventTrack,
+        duration: probe.duration,
+        timestamps,
+        stillCount,
+      });
+      const extractedStills = await extractStills({ video: videoFile, targets, outDir: workingOutDir });
+      if (resolvedOutDir) {
+        artifacts.stills = extractedStills;
+        artifacts.contactSheet = await generateContactSheet({
+          stills: extractedStills,
+          outputFile: join(resolvedOutDir, 'contact-sheet.png'),
+          ...contactSheetOptions,
+        });
+      }
+
+      if (baseline) {
+        const rawBaselineReport = await diffStillsAgainstBaseline({
+          stills: extractedStills,
           baselineDir: baseline,
-          outDir: resolvedOutDir,
+          outDir: workingOutDir,
           maxDiffRatio: baselineMaxDiff,
-        })),
-        checked: true,
-      };
-      artifacts.diffs = baselineReport.diffs;
-      addCheck(
-        'baseline-diff',
-        baselineReport.ok,
-        baselineReport.ok
-          ? `all ${baselineReport.compared} step still(s) within ${(baselineMaxDiff * 100).toFixed(2)}% of baseline (max ${(baselineReport.maxChangedRatio * 100).toFixed(2)}%)`
-          : `${baselineReport.mismatches} of ${baselineReport.compared} step still(s) diverged from baseline (max ${(baselineReport.maxChangedRatio * 100).toFixed(2)}%)`
-      );
-      for (const diff of baselineReport.diffs) {
-        if (!diff.ok) {
-          addFinding('error', 'baseline-diff', `Step ${diff.index} (${diff.label}): ${diff.reason}`, {
-            timestamp: diff.t,
-            details: {
-              filename: diff.filename,
-              changedRatio: diff.changedRatio,
-              diffFile: diff.diffFile,
-            },
-          });
+        });
+        const normalizedDiffs = resolvedOutDir
+          ? rawBaselineReport.diffs
+          : rawBaselineReport.diffs.map((d) => ({ ...d, stillFile: null, diffFile: null }));
+        baselineReport = {
+          ...rawBaselineReport,
+          diffs: normalizedDiffs,
+          checked: true,
+        };
+        artifacts.diffs = normalizedDiffs;
+        addCheck(
+          'baseline-diff',
+          baselineReport.ok,
+          baselineReport.ok
+            ? `all ${baselineReport.compared} step still(s) within ${(baselineMaxDiff * 100).toFixed(2)}% of baseline (max ${(baselineReport.maxChangedRatio * 100).toFixed(2)}%)`
+            : `${baselineReport.mismatches} of ${baselineReport.compared} step still(s) diverged from baseline (max ${(baselineReport.maxChangedRatio * 100).toFixed(2)}%)`
+        );
+        for (const diff of baselineReport.diffs) {
+          if (!diff.ok) {
+            addFinding('error', 'baseline-diff', `Step ${diff.index} (${diff.label}): ${diff.reason}`, {
+              timestamp: diff.t,
+              details: {
+                filename: diff.filename,
+                changedRatio: diff.changedRatio,
+                diffFile: diff.diffFile,
+              },
+            });
+          }
         }
       }
+    }
+  } finally {
+    if (ephemeralReviewDir) {
+      await rm(ephemeralReviewDir, { recursive: true, force: true });
     }
   }
 
   // 6. Cursor accuracy check (observed samples, image-based marker locator, or event-track cross-check)
+  const cursorFps = probe.nominalFps || probe.fps || timeline?.take?.fps || 0;
   let resolvedCursorSamples = cursorSamples;
   if (!resolvedCursorSamples && cursorDetection && timeline?.overlays?.cursor?.enabled) {
     const sampleTimes = Array.isArray(cursorDetection.timestamps) && cursorDetection.timestamps.length > 0
@@ -1593,26 +1852,38 @@ export async function reviewVideo({
     const frameDir = resolvedOutDir ? join(resolvedOutDir, 'cursor-frames') : ephemeralDir;
     await mkdir(frameDir, { recursive: true });
 
+    const maxFrameTime =
+      cursorFps > 0 && probe.frames > 0
+        ? Math.max(0, (probe.frames - 1) / cursorFps)
+        : Math.max(0, probe.duration - (cursorFps > 0 ? 1 / cursorFps : 0.04));
+
     try {
       const detectedSamples = [];
       for (let i = 0; i < sampleTimes.length; i += 1) {
-        const t = sampleTimes[i];
-        const clampedT = Math.max(0, Math.min(t, Math.max(0, probe.duration - 0.04)));
+        const rawT = sampleTimes[i];
+        const boundedT = Math.max(0, Math.min(rawT, maxFrameTime));
+        const frameT = snapToFrameBoundary(boundedT, cursorFps);
         const framePath = join(frameDir, `cursor-${padIndex(i)}.png`);
-        await extractFramePng(videoFile, clampedT, framePath);
+        await extractFramePng(videoFile, frameT, framePath);
         let locateOptions = cursorDetection;
         if (!cursorDetection.region && isFiniteNumber(cursorDetection.searchRadius) && cursorDetection.searchRadius > 0) {
-          const vp = sampleCursor(timeline.overlays.cursor, t);
+          const vp = sampleCursor(timeline.overlays.cursor, frameT);
           if (vp) {
-            const expectedPt = projectViewportToScreen(vp.x, vp.y, timeline, t);
-            const scaleX = probe.width && timeline.camera?.outputWidth ? probe.width / timeline.camera.outputWidth : 1;
-            const scaleY = probe.height && timeline.camera?.outputHeight ? probe.height / timeline.camera.outputHeight : 1;
+            const expectedPt = projectViewportToScreen(vp.x, vp.y, timeline, frameT);
+            const renderedPt = screenToRender(
+              expectedPt.x,
+              expectedPt.y,
+              timeline.camera?.outputWidth,
+              timeline.camera?.outputHeight,
+              probe.width || undefined,
+              probe.height || undefined
+            );
             const r = cursorDetection.searchRadius;
             locateOptions = {
               ...cursorDetection,
               region: {
-                x: expectedPt.x * scaleX - r,
-                y: expectedPt.y * scaleY - r,
+                x: renderedPt.x - r,
+                y: renderedPt.y - r,
                 width: r * 2,
                 height: r * 2,
               },
@@ -1621,10 +1892,11 @@ export async function reviewVideo({
         }
         const locatorResult =
           typeof cursorDetection.locateFn === 'function'
-            ? await cursorDetection.locateFn(framePath, { t, index: i, timeline })
+            ? await cursorDetection.locateFn(framePath, { t: frameT, requestedT: rawT, index: i, timeline })
             : await locateCursorMarker(framePath, locateOptions);
         detectedSamples.push({
-          t,
+          t: frameT,
+          requestedT: round(rawT, 4),
           x: locatorResult?.x ?? null,
           y: locatorResult?.y ?? null,
           found: Boolean(locatorResult?.found),
@@ -1643,16 +1915,21 @@ export async function reviewVideo({
     thresholdPx: cursorThresholdPx,
     outputWidth: probe.width || undefined,
     outputHeight: probe.height || undefined,
+    fps: cursorFps || undefined,
   });
 
-  if (cursorReport.checked) {
+  if (cursorReport.checked || !cursorReport.ok) {
     addCheck(
       'cursor-accuracy',
       cursorReport.ok,
       cursorReport.ok
         ? `cursor within ${cursorReport.thresholdPx} px across ${cursorReport.samplesChecked} sample(s) (max error ${cursorReport.maxErrorPx} px, mode=${cursorReport.mode})`
-        : `${cursorReport.violations.length} cursor sample(s) exceeded ${cursorReport.thresholdPx} px threshold (max error ${cursorReport.maxErrorPx} px)`,
-      { details: { mode: cursorReport.mode, maxErrorPx: cursorReport.maxErrorPx } }
+        : `${cursorReport.violations.length} cursor sample(s) exceeded ${cursorReport.thresholdPx} px threshold (max error ${cursorReport.maxErrorPx} px, mode=${cursorReport.mode})`,
+      {
+        checked: cursorReport.checked,
+        skipped: cursorReport.skipped,
+        details: { mode: cursorReport.mode, maxErrorPx: cursorReport.maxErrorPx },
+      }
     );
     for (const violation of cursorReport.violations) {
       const msg = violation.reason
@@ -1664,7 +1941,16 @@ export async function reviewVideo({
       });
     }
   } else {
-    addCheck('cursor-accuracy', true, `cursor accuracy check skipped (${cursorReport.mode})`, { skipped: true });
+    addCheck(
+      'cursor-accuracy',
+      true,
+      `cursor pixel accuracy check skipped (${cursorReport.mode})`,
+      {
+        checked: false,
+        skipped: true,
+        details: { mode: cursorReport.mode, samplesChecked: cursorReport.samplesChecked },
+      }
+    );
   }
 
   // 6b. Optional narration & caption checks (only when captions/audio tracks are active or explicitly enabled)
@@ -1724,6 +2010,7 @@ export async function reviewVideo({
     },
     cursor: {
       checked: cursorReport.checked,
+      skipped: cursorReport.skipped,
       mode: cursorReport.mode,
       thresholdPx: cursorReport.thresholdPx,
       samplesChecked: cursorReport.samplesChecked,
@@ -1731,6 +2018,7 @@ export async function reviewVideo({
       meanErrorPx: cursorReport.meanErrorPx,
       violations: cursorReport.violations.length,
     },
+    ...(rawCapture ? { rawCapture } : {}),
     baseline: {
       checked: baselineReport.checked,
       compared: baselineReport.compared,

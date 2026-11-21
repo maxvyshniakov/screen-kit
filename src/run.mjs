@@ -90,7 +90,9 @@ export async function captureRun({ config, cwd = process.cwd(), out = join(cwd, 
         }
         if (video) {
           const { probeVideo } = await import('./video.mjs');
-          Object.assign(artifact, await probeVideo(artifact.file), {
+          const probed = await probeVideo(artifact.file);
+          Object.assign(artifact, probed, {
+            encodedFps: Number(probed.fps.toFixed(2)),
             ...(recipe.duration !== undefined ? { requestedDuration: recipe.duration } : {}),
             ...(artifact.requestedFps !== undefined || recipe.fps !== undefined ? { requestedFps: artifact.requestedFps ?? recipe.fps } : {}),
           });

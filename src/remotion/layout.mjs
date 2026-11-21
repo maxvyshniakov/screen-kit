@@ -175,19 +175,70 @@ export function computeStageBackground(background, mapAsset) {
 }
 
 /**
+ * Map a point `(x, y)` in logical camera output space (`cameraOutputWidth x cameraOutputHeight`)
+ * into rendered frame pixel coordinates (`renderWidth x renderHeight`) using uniform aspect-ratio
+ * scaling and centered pillarbox/letterbox offsets.
+ */
+export function screenToRender(
+  x,
+  y,
+  cameraOutputWidth,
+  cameraOutputHeight,
+  renderWidth,
+  renderHeight
+) {
+  const hasCameraDims =
+    Number.isFinite(cameraOutputWidth) &&
+    cameraOutputWidth > 0 &&
+    Number.isFinite(cameraOutputHeight) &&
+    cameraOutputHeight > 0;
+  if (!hasCameraDims) {
+    return {
+      x,
+      y,
+      scale: 1,
+      offsetX: 0,
+      offsetY: 0,
+      logicalWidth: renderWidth ?? 0,
+      logicalHeight: renderHeight ?? 0,
+    };
+  }
+  const outW =
+    Number.isFinite(renderWidth) && renderWidth > 0 ? renderWidth : cameraOutputWidth;
+  const outH =
+    Number.isFinite(renderHeight) && renderHeight > 0 ? renderHeight : cameraOutputHeight;
+  const scale = Math.min(outW / cameraOutputWidth, outH / cameraOutputHeight);
+  const logicalWidth = cameraOutputWidth * scale;
+  const logicalHeight = cameraOutputHeight * scale;
+  const offsetX = (outW - logicalWidth) / 2;
+  const offsetY = (outH - logicalHeight) / 2;
+  return {
+    x: offsetX + x * scale,
+    y: offsetY + y * scale,
+    scale,
+    offsetX,
+    offsetY,
+    logicalWidth,
+    logicalHeight,
+  };
+}
+
+/**
  * Compute camera sample and stage-to-render-frame affine transform at timestamp `t`.
  * Supports output profiles (`renderWidth x renderHeight`) that scale relative to
  * `camera.outputWidth x camera.outputHeight` (e.g. 2560x1440 YouTube master).
  */
 export function computeCameraTransform(camera, t, renderWidth, renderHeight) {
   const sample = sampleCamera(camera, t);
-  const outW = renderWidth ?? camera.outputWidth;
-  const outH = renderHeight ?? camera.outputHeight;
-  const outputScale = Math.min(outW / camera.outputWidth, outH / camera.outputHeight);
-  const logicalWidth = camera.outputWidth * outputScale;
-  const logicalHeight = camera.outputHeight * outputScale;
-  const offsetX = (outW - logicalWidth) / 2;
-  const offsetY = (outH - logicalHeight) / 2;
+  const frameMap = screenToRender(
+    0,
+    0,
+    camera.outputWidth,
+    camera.outputHeight,
+    renderWidth,
+    renderHeight
+  );
+  const { scale: outputScale, offsetX, offsetY, logicalWidth, logicalHeight } = frameMap;
   const effectiveScale = sample.zoom * outputScale;
   const translateX = offsetX + logicalWidth / 2 - sample.x * effectiveScale;
   const translateY = offsetY + logicalHeight / 2 - sample.y * effectiveScale;
@@ -239,10 +290,17 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight) {
   const cameraState = computeCameraTransform(timeline.camera, t, renderWidth, renderHeight);
   const { outputScale, offsetX, offsetY, logicalWidth, logicalHeight } = cameraState;
 
-  const toRenderPoint = (screenPoint) => ({
-    x: offsetX + screenPoint.x * outputScale,
-    y: offsetY + screenPoint.y * outputScale,
-  });
+  const toRenderPoint = (screenPoint) => {
+    const pt = screenToRender(
+      screenPoint.x,
+      screenPoint.y,
+      timeline.camera.outputWidth,
+      timeline.camera.outputHeight,
+      renderWidth,
+      renderHeight
+    );
+    return { x: pt.x, y: pt.y };
+  };
 
   // 1. Cursor overlay
   let cursor = null;

@@ -12,7 +12,9 @@ import { captureRun, hash } from '../src/run.mjs';
 import {
   CAPTURE_MODES,
   captureBrowserTake,
+  computeRawCaptureStats,
   createMacFocusController,
+  encodeScreencastFrames,
   minimumJerk,
   minimumJerkTrajectory,
   resolveChromiumExecutable,
@@ -20,6 +22,7 @@ import {
   validateCaptureMode,
   validateEventTrack,
 } from '../src/take-browser.mjs';
+import { compileTimeline, validateTimeline } from '../src/timeline.mjs';
 import { probeVideo } from '../src/video.mjs';
 
 test('validateCaptureMode accepts explicit quality and headless modes and rejects invalid values', () => {
@@ -306,8 +309,193 @@ test('quality mode configures Retina 2x headful occlusion flags, hands back focu
   assert.equal(result.fps, 60);
   assert.ok(trace.some((e) => e.step === 'cdp:Input.dispatchMouseEvent' && e.params?.modifiers === 2));
   assert.ok(result.eventTrackData.events.some((e) => e.type === 'gesture' && e.kind === 'pinch' && e.duration >= 0.04));
+  assert.equal(result.encodedFps, 60);
+  assert.ok(result.rawCapture);
+  assert.equal(result.rawCapture.rawFrames, 2);
+  assert.equal(result.rawCapture.gapsOver2Frames, 0);
+  assert.deepEqual(result.eventTrackData.video.capture, result.rawCapture);
   assert.equal(closed, true);
   assert.equal(cdpDetached, true);
+
+  // Event track emitted by take-browser compiles cleanly through compileTimeline()
+  const compiled = compileTimeline({ eventTrack: result.eventTrackData });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+});
+
+test('computeRawCaptureStats reports honest rawFps (including >250ms gaps), captureBrowserTake extends past exceeded duration without silent truncation, and encodeScreencastFrames tags BT.709 / P3 on MP4 & WebM', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-raw-capture-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  // 1. Honest rawFps & gap stats (400ms stall is NOT excluded from rawFps)
+  const stats = computeRawCaptureStats({
+    rawFrames: [
+      { index: 1, cdpTimestamp: 10.0, elapsed: 0.01 },
+      { index: 2, cdpTimestamp: 10.016, elapsed: 0.026 },
+      { index: 3, cdpTimestamp: 10.416, elapsed: 0.426 }, // 400ms stall!
+      { index: 4, cdpTimestamp: 10.432, elapsed: 0.442 },
+    ],
+    elapsedDuration: 1.0,
+    requestedFps: 60,
+  });
+  assert.equal(stats.rawFrames, 4);
+  assert.equal(stats.rawFps, 4); // Honest 4 / 1.0s = 4 fps, NOT ~60 fps!
+  assert.equal(stats.maxGapMs, 400);
+  assert.equal(stats.gapsOver2Frames, 1);
+  assert.equal(stats.truncated, false);
+
+  // 2. EventTrack validated by take-browser (with stationary, mayBegin, 0-dur gesture, blank label) compiles cleanly
+  const richTrack = validateEventTrack({
+    version: 1,
+    captureMode: 'headless',
+    viewport: { width: 640, height: 360, deviceScaleFactor: 1 },
+    video: {
+      file: 'take.mp4',
+      width: 640,
+      height: 360,
+      fps: 30,
+      encodedFps: 30,
+      duration: 2.0,
+      frames: 60,
+      capture: stats,
+    },
+    startedAt: '2026-11-22T00:00:00.000Z',
+    events: [
+      { t: 0, type: 'pointermove', x: 100, y: 100 },
+      { t: 0.2, type: 'wheel', x: 100, y: 100, deltaX: 0, deltaY: -20, phase: 'mayBegin' },
+      { t: 0.3, type: 'wheel', x: 100, y: 100, deltaX: 0, deltaY: 0, phase: 'stationary' },
+      { t: 0.5, type: 'gesture', kind: 'scroll', x: 100, y: 100, deltaX: 50, deltaY: 0, duration: 0 },
+      { t: 0.8, type: 'step', index: 0, label: '' },
+    ],
+  });
+  const compiled = compileTimeline({ eventTrack: richTrack });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+  assert.equal(compiled.steps[0].label, 'step-0');
+
+  // 3. Steps exceeding recipe.duration extend targetDuration and flag durationExceeded instead of silently truncating
+  const dummyFrame = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#2563eb' } }).png().toBuffer();
+  const base64Frame = dummyFrame.toString('base64');
+  let encodedTargetDuration = 0;
+
+  const mockPw = {
+    chromium: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                return {
+                  async goto() {},
+                  async evaluate() { return true; },
+                  mouse: { async move() {}, async down() {}, async up() {}, async wheel() {} },
+                  keyboard: { async press() {}, async down() {}, async up() {} },
+                };
+              },
+              async newCDPSession() {
+                let listener = null;
+                return {
+                  on(ev, fn) { if (ev === 'Page.screencastFrame') listener = fn; },
+                  async send(method) {
+                    if (method === 'Page.captureScreenshot') return { data: base64Frame };
+                    if (method === 'Page.startScreencast' && listener) {
+                      listener({ data: base64Frame, metadata: { timestamp: 50.0 }, sessionId: 1 });
+                    }
+                    return {};
+                  },
+                  async detach() {},
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+  };
+
+  const overrunTake = await captureBrowserTake({
+    out: join(dir, 'overrun'),
+    captureMode: 'headless',
+    playwright: mockPw,
+    encodeFrames: async ({ outputFile, targetDuration, rawFrames }) => {
+      encodedTargetDuration = targetDuration;
+      await writeFile(outputFile, Buffer.from('video'));
+      return {
+        width: 640,
+        height: 360,
+        fps: 30,
+        duration: targetDuration,
+        frames: Math.max(1, Math.round(targetDuration * 30)),
+        measuredFps: 10,
+        capturedFrames: rawFrames.length,
+        codec: 'h264',
+        audio: false,
+      };
+    },
+    recipe: {
+      url: 'https://example.test/slow-steps',
+      viewport: [640, 360],
+      fps: 30,
+      duration: 0.05,
+      steps: [
+        { type: 'pause', duration: 0.16 },
+        { type: 'key', key: 'Enter', label: '' },
+      ],
+    },
+  });
+
+  assert.equal(overrunTake.durationExceeded, true);
+  assert.equal(overrunTake.rawCapture.durationExceeded, true);
+  assert.equal(overrunTake.rawCapture.truncated, false);
+  assert.ok(encodedTargetDuration >= 0.15, `expected extended targetDuration >= 0.15s, got ${encodedTargetDuration}`);
+  assert.equal(overrunTake.eventTrackData.events.find((e) => e.type === 'step')?.label, 'step-1');
+
+  // 4. Explicit BT.709 (sRGB) and Display P3 color tags across both MP4 and WebM in encodeScreencastFrames
+  const encDir = join(dir, 'enc');
+  await writeFile(join(dir, 'f0.png'), dummyFrame);
+  await writeFile(join(dir, 'f1.png'), dummyFrame);
+  for (const format of ['mp4', 'webm']) {
+    const srgbOut = join(dir, `srgb.${format}`);
+    const p3Out = join(dir, `p3.${format}`);
+    await encodeScreencastFrames({
+      initialFrameFile: join(dir, 'f0.png'),
+      rawFrames: [
+        { index: 1, file: join(dir, 'f0.png'), elapsed: 0 },
+        { index: 2, file: join(dir, 'f1.png'), elapsed: 0.1 },
+      ],
+      framesDir: dir,
+      outputFile: srgbOut,
+      format,
+      fps: 10,
+      targetDuration: 0.2,
+      colorSpace: 'srgb',
+    });
+    const srgbProbe = await probeVideo(srgbOut);
+    assert.equal(srgbProbe.colorPrimaries, 'bt709', `srgb ${format} colorPrimaries`);
+    assert.equal(srgbProbe.colorTransfer, 'bt709', `srgb ${format} colorTransfer`);
+    assert.equal(srgbProbe.colorSpace, 'bt709', `srgb ${format} colorSpace`);
+    assert.equal(srgbProbe.colorRange, 'tv', `srgb ${format} colorRange`);
+
+    await encodeScreencastFrames({
+      initialFrameFile: join(dir, 'f0.png'),
+      rawFrames: [
+        { index: 1, file: join(dir, 'f0.png'), elapsed: 0 },
+        { index: 2, file: join(dir, 'f1.png'), elapsed: 0.1 },
+      ],
+      framesDir: dir,
+      outputFile: p3Out,
+      format,
+      fps: 10,
+      targetDuration: 0.2,
+      colorSpace: 'p3',
+    });
+    const p3Probe = await probeVideo(p3Out);
+    assert.equal(p3Probe.colorPrimaries, 'smpte432', `p3 ${format} colorPrimaries`);
+    assert.equal(p3Probe.colorTransfer, 'iec61966-2-1', `p3 ${format} colorTransfer`);
+    assert.equal(p3Probe.colorSpace, 'bt709', `p3 ${format} colorSpace`);
+    assert.equal(p3Probe.colorRange, 'tv', `p3 ${format} colorRange`);
+    void encDir;
+  }
 });
 
 test('real headless browser captures clean video take, rich event-track.json, and verifiable run.json', {
@@ -340,13 +528,25 @@ test('real headless browser captures clean video take, rich event-track.json, an
     width: 2200px; height: 100%;
     background: repeating-linear-gradient(90deg, rgb(50, 70, 100) 0 80px, rgb(90, 130, 180) 80px 160px);
   }
+  #pulse {
+    position: absolute; right: 6px; bottom: 6px; width: 8px; height: 8px; border-radius: 50%;
+    background: rgb(40, 80, 120);
+  }
 </style>
 </head>
 <body>
   <button id="action-btn">Activate</button>
   <div id="card">Drag</div>
   <div id="scroller"><div id="scroller-inner"></div></div>
+  <div id="pulse"></div>
   <script>
+    const pulseEl = document.getElementById('pulse');
+    let pulseTick = 0;
+    (function loop() {
+      pulseTick = (pulseTick + 1) % 60;
+      pulseEl.style.opacity = String(0.4 + (pulseTick / 60) * 0.5);
+      requestAnimationFrame(loop);
+    })();
     window.__state = { hovered: false, clicked: false, draggedTo: null, wheelEvents: 0, scrolledMax: 0, shortcut: null };
     const btn = document.getElementById('action-btn');
     btn.addEventListener('pointerenter', () => { window.__state.hovered = true; });

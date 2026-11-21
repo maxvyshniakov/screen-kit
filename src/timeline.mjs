@@ -37,8 +37,18 @@ const EVENT_TYPES = new Set([
   'key',
   'step',
 ]);
-const WHEEL_PHASES = new Set(['began', 'changed', 'ended', 'none', 'maybegin', 'cancelled']);
+const WHEEL_PHASES = new Set([
+  'began',
+  'changed',
+  'stationary',
+  'ended',
+  'cancelled',
+  'mayBegin',
+  'maybegin',
+  'none',
+]);
 const KEY_ACTIONS = new Set(['press', 'down', 'up']);
+const VALID_MODIFIERS = new Set(['Meta', 'Control', 'Alt', 'Shift']);
 const EASING_ALIASES = {
   linear: 'linear',
   'ease-in': 'ease-in',
@@ -279,7 +289,13 @@ export function validateEventTrack(eventTrack) {
     errors.push(`eventTrack.version must be ${EVENT_TRACK_VERSION}`);
   }
   if (eventTrack.captureMode !== undefined && !CAPTURE_MODES.includes(eventTrack.captureMode)) {
-    errors.push(`eventTrack.captureMode must be one of ${CAPTURE_MODES.join(', ')}`);
+    errors.push(`Invalid capture mode: eventTrack.captureMode must be one of ${CAPTURE_MODES.join(', ')}`);
+  }
+  if (
+    eventTrack.startedAt !== undefined &&
+    (typeof eventTrack.startedAt !== 'string' || Number.isNaN(Date.parse(eventTrack.startedAt)))
+  ) {
+    errors.push('eventTrack.startedAt must be a valid ISO timestamp');
   }
   if (eventTrack.viewport !== undefined) {
     if (!isObject(eventTrack.viewport)) {
@@ -308,11 +324,48 @@ export function validateEventTrack(eventTrack) {
       if (eventTrack.video.fps !== undefined && !isPositiveNumber(eventTrack.video.fps)) {
         errors.push('eventTrack.video.fps must be a positive number');
       }
+      if (eventTrack.video.encodedFps !== undefined && !isPositiveNumber(eventTrack.video.encodedFps)) {
+        errors.push('eventTrack.video.encodedFps must be a positive number');
+      }
       if (eventTrack.video.duration !== undefined && !isPositiveNumber(eventTrack.video.duration)) {
         errors.push('eventTrack.video.duration must be a positive number');
       }
       if (eventTrack.video.frames !== undefined && !isPositiveInteger(eventTrack.video.frames)) {
         errors.push('eventTrack.video.frames must be a positive integer');
+      }
+      if (eventTrack.video.capture !== undefined) {
+        const cap = eventTrack.video.capture;
+        if (!isObject(cap)) {
+          errors.push('eventTrack.video.capture must be an object');
+        } else {
+          if (cap.rawFrames !== undefined && !isNonNegativeInteger(cap.rawFrames)) {
+            errors.push('eventTrack.video.capture.rawFrames must be a non-negative integer');
+          }
+          if (cap.firstFrameAt !== undefined && cap.firstFrameAt !== null && !isNonNegativeNumber(cap.firstFrameAt)) {
+            errors.push('eventTrack.video.capture.firstFrameAt must be null or a non-negative number');
+          }
+          if (cap.lastFrameAt !== undefined && cap.lastFrameAt !== null && !isNonNegativeNumber(cap.lastFrameAt)) {
+            errors.push('eventTrack.video.capture.lastFrameAt must be null or a non-negative number');
+          }
+          if (cap.elapsedDuration !== undefined && !isNonNegativeNumber(cap.elapsedDuration)) {
+            errors.push('eventTrack.video.capture.elapsedDuration must be a non-negative number');
+          }
+          if (cap.rawFps !== undefined && !isNonNegativeNumber(cap.rawFps)) {
+            errors.push('eventTrack.video.capture.rawFps must be a non-negative number');
+          }
+          if (cap.maxGapMs !== undefined && !isNonNegativeNumber(cap.maxGapMs)) {
+            errors.push('eventTrack.video.capture.maxGapMs must be a non-negative number');
+          }
+          if (cap.gapsOver2Frames !== undefined && !isNonNegativeInteger(cap.gapsOver2Frames)) {
+            errors.push('eventTrack.video.capture.gapsOver2Frames must be a non-negative integer');
+          }
+          if (cap.truncated !== undefined && typeof cap.truncated !== 'boolean') {
+            errors.push('eventTrack.video.capture.truncated must be a boolean');
+          }
+          if (cap.durationExceeded !== undefined && typeof cap.durationExceeded !== 'boolean') {
+            errors.push('eventTrack.video.capture.durationExceeded must be a boolean');
+          }
+        }
       }
     }
   }
@@ -330,7 +383,7 @@ export function validateEventTrack(eventTrack) {
       return;
     }
     if (!isNonNegativeNumber(event.t)) {
-      errors.push(`${prefix}.t must be a non-negative finite number`);
+      errors.push(`${prefix}.t must be a finite number >= 0`);
     } else {
       if (index > 0 && event.t < prevT) {
         errors.push(`${prefix}.t (${event.t}) must be monotonically non-decreasing (previous ${prevT})`);
@@ -350,7 +403,7 @@ export function validateEventTrack(eventTrack) {
           errors.push(`${prefix} (${event.type}) requires finite x and y`);
         }
         if (event.button !== undefined && !MOUSE_BUTTONS.includes(event.button)) {
-          errors.push(`${prefix}.button must be one of ${MOUSE_BUTTONS.join(', ')}`);
+          errors.push(`${prefix}.button must be a valid button (${MOUSE_BUTTONS.join(', ')})`);
         }
         break;
       case 'wheel':
@@ -363,8 +416,8 @@ export function validateEventTrack(eventTrack) {
         if (event.phase !== undefined && !WHEEL_PHASES.has(event.phase)) {
           errors.push(`${prefix}.phase must be one of ${[...WHEEL_PHASES].join(', ')}`);
         }
-        if (event.duration !== undefined && !isPositiveNumber(event.duration)) {
-          errors.push(`${prefix}.duration must be a positive number`);
+        if (event.duration !== undefined && !isNonNegativeNumber(event.duration)) {
+          errors.push(`${prefix}.duration must be a non-negative number`);
         }
         break;
       case 'gesture':
@@ -380,22 +433,22 @@ export function validateEventTrack(eventTrack) {
         if (event.deltaY !== undefined && !isFiniteNumber(event.deltaY)) {
           errors.push(`${prefix}.deltaY must be a finite number`);
         }
-        if (event.duration !== undefined && !isPositiveNumber(event.duration)) {
-          errors.push(`${prefix}.duration must be a positive number`);
+        if (event.duration !== undefined && !isNonNegativeNumber(event.duration)) {
+          errors.push(`${prefix}.duration must be a non-negative number`);
         }
         break;
       case 'drag':
         if (!Array.isArray(event.from) || event.from.length !== 2 || !event.from.every(isFiniteNumber)) {
-          errors.push(`${prefix}.from must be a [x, y] pair of finite numbers`);
+          errors.push(`${prefix} (drag) .from must be a [x, y] pair of finite numbers`);
         }
         if (!Array.isArray(event.to) || event.to.length !== 2 || !event.to.every(isFiniteNumber)) {
-          errors.push(`${prefix}.to must be a [x, y] pair of finite numbers`);
+          errors.push(`${prefix} (drag) .to must be a [x, y] pair of finite numbers`);
         }
-        if (!isPositiveNumber(event.duration)) {
-          errors.push(`${prefix}.duration must be a positive finite number`);
+        if (!isNonNegativeNumber(event.duration)) {
+          errors.push(`${prefix} (drag) .duration must be a non-negative finite number`);
         }
         if (event.button !== undefined && !MOUSE_BUTTONS.includes(event.button)) {
-          errors.push(`${prefix}.button must be one of ${MOUSE_BUTTONS.join(', ')}`);
+          errors.push(`${prefix} (drag) .button must be a valid button (${MOUSE_BUTTONS.join(', ')})`);
         }
         break;
       case 'key':
@@ -403,23 +456,28 @@ export function validateEventTrack(eventTrack) {
           errors.push(`${prefix}.key must be a non-empty string`);
         }
         if (event.modifiers !== undefined) {
-          if (!Array.isArray(event.modifiers) || !event.modifiers.every(isNonEmptyString)) {
-            errors.push(`${prefix}.modifiers must be an array of non-empty strings`);
+          if (
+            !Array.isArray(event.modifiers) ||
+            event.modifiers.some((mod) => !VALID_MODIFIERS.has(mod))
+          ) {
+            errors.push(
+              `${prefix}.modifiers must be an array of canonical modifiers (${[...VALID_MODIFIERS].join(', ')})`
+            );
           }
         }
         if (event.action !== undefined && !KEY_ACTIONS.has(event.action)) {
           errors.push(`${prefix}.action must be one of ${[...KEY_ACTIONS].join(', ')}`);
         }
-        if (event.duration !== undefined && !isPositiveNumber(event.duration)) {
-          errors.push(`${prefix}.duration must be a positive number`);
+        if (event.duration !== undefined && !isNonNegativeNumber(event.duration)) {
+          errors.push(`${prefix}.duration must be a non-negative number`);
         }
         break;
       case 'step':
         if (!isNonNegativeInteger(event.index)) {
           errors.push(`${prefix}.index must be a non-negative integer`);
         }
-        if (!isNonEmptyString(event.label)) {
-          errors.push(`${prefix}.label must be a non-empty string`);
+        if (event.label !== undefined && typeof event.label !== 'string') {
+          errors.push(`${prefix}.label must be a string when provided`);
         }
         break;
     }
@@ -1003,28 +1061,37 @@ function buildOutputProfiles(recipeOutputs, camera, take) {
   });
 }
 
-function compileOverlays(events, recipeOverlays, duration) {
-  const cursorCfg = recipeOverlays?.cursor ?? {};
-  const rippleCfg = recipeOverlays?.ripples ?? {};
-  const gestureCfg = recipeOverlays?.gestures ?? {};
-  const keystrokeCfg = recipeOverlays?.keystrokes ?? {};
-  const captionCfg = recipeOverlays?.captions ?? {};
+function hasTrackedDragRelease(events, dragIndex, dragStartT, dragEndT, pointerAlreadyDown) {
+  let sawDragDown = pointerAlreadyDown;
+  for (let j = dragIndex + 1; j < events.length; j += 1) {
+    const other = events[j];
+    if (!isObject(other) || !isFiniteNumber(other.t)) continue;
+    if (other.type === 'drag') return false;
+    if (other.type === 'pointerdown') {
+      if (!sawDragDown && other.t <= dragStartT + 0.05) {
+        sawDragDown = true;
+        continue;
+      }
+      return false;
+    }
+    if (other.type === 'pointerup') {
+      return sawDragDown || other.t <= dragEndT + 0.1;
+    }
+  }
+  return false;
+}
 
-  const rippleEnabled = rippleCfg.enabled !== false;
-  const rippleDuration = rippleCfg.duration ?? 0.45;
-  const gestureEnabled = gestureCfg.enabled !== false;
-  const wheelDuration = gestureCfg.wheelDuration ?? 0.25;
-  const gestureDefaultDuration = gestureCfg.duration ?? 0.35;
-  const keystrokeEnabled = keystrokeCfg.enabled !== false;
-  const keystrokeDuration = keystrokeCfg.duration ?? 1.2;
-
+/**
+ * Compile viewport-space cursor samples from Event Track v1 events with consistent
+ * drag `pressed` state tracking and drag end-sample parity across compiler and reviewer.
+ */
+export function compileCursorSamples(events, duration = 0) {
+  if (!Array.isArray(events)) return [];
   const cursorSamples = [];
-  const ripples = [];
-  const gestures = [];
-  const keystrokes = [];
-  const steps = [];
+  let pointerDown = false;
+  let activeDragEndT = null;
+  let pendingDragRelease = null;
 
-  let pressed = false;
   const pushCursorSample = (t, x, y, nextPressed, visible = true) => {
     const sample = {
       t: roundTime(t),
@@ -1047,15 +1114,126 @@ function compileOverlays(events, recipeOverlays, duration) {
     cursorSamples.push(sample);
   };
 
+  const flushPendingDragBefore = (nextT) => {
+    if (!pendingDragRelease) return;
+    if (nextT > pendingDragRelease.t) {
+      pushCursorSample(pendingDragRelease.t, pendingDragRelease.x, pendingDragRelease.y, false, true);
+      pendingDragRelease = null;
+      if (!pointerDown) activeDragEndT = null;
+    }
+  };
+
+  const currentPressed = (t) => pointerDown || (activeDragEndT !== null && t < activeDragEndT);
+
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i];
+    if (!isObject(event) || !isFiniteNumber(event.t)) continue;
+    flushPendingDragBefore(event.t);
+    if (activeDragEndT !== null && event.t >= activeDragEndT && !pointerDown) {
+      activeDragEndT = null;
+    }
+
+    switch (event.type) {
+      case 'pointermove': {
+        if (!isFiniteNumber(event.x) || !isFiniteNumber(event.y)) break;
+        if (pendingDragRelease && roundTime(event.t) === pendingDragRelease.t) {
+          pushCursorSample(event.t, event.x, event.y, false, true);
+          pendingDragRelease = null;
+          activeDragEndT = null;
+        } else {
+          pushCursorSample(event.t, event.x, event.y, currentPressed(event.t), true);
+        }
+        break;
+      }
+      case 'pointerdown': {
+        pointerDown = true;
+        if (isFiniteNumber(event.x) && isFiniteNumber(event.y)) {
+          pushCursorSample(event.t, event.x, event.y, true, true);
+        }
+        break;
+      }
+      case 'pointerup': {
+        pointerDown = false;
+        activeDragEndT = null;
+        pendingDragRelease = null;
+        if (isFiniteNumber(event.x) && isFiniteNumber(event.y)) {
+          pushCursorSample(event.t, event.x, event.y, false, true);
+        }
+        break;
+      }
+      case 'wheel':
+      case 'gesture': {
+        if (isFiniteNumber(event.x) && isFiniteNumber(event.y)) {
+          pushCursorSample(event.t, event.x, event.y, currentPressed(event.t), true);
+        }
+        break;
+      }
+      case 'drag': {
+        if (
+          !Array.isArray(event.from) ||
+          event.from.length !== 2 ||
+          !Array.isArray(event.to) ||
+          event.to.length !== 2
+        ) {
+          break;
+        }
+        const [fromX, fromY] = event.from;
+        const [toX, toY] = event.to;
+        const dragDur = isNonNegativeNumber(event.duration) ? event.duration : 0;
+        const rawEndT = event.t + dragDur;
+        const endT = roundTime(
+          duration > 0 ? Math.min(rawEndT, Math.max(duration, event.t)) : rawEndT
+        );
+        const trackedByPointerUp = hasTrackedDragRelease(
+          events,
+          i,
+          event.t,
+          endT,
+          pointerDown
+        );
+        pushCursorSample(event.t, fromX, fromY, true, true);
+        activeDragEndT = endT;
+        if (!trackedByPointerUp) {
+          pendingDragRelease = { t: endT, x: toX, y: toY };
+        }
+        break;
+      }
+    }
+  }
+
+  if (pendingDragRelease) {
+    pushCursorSample(pendingDragRelease.t, pendingDragRelease.x, pendingDragRelease.y, false, true);
+  }
+
+  cursorSamples.sort((a, b) => a.t - b.t);
+  return cursorSamples;
+}
+
+function compileOverlays(events, recipeOverlays, duration) {
+  const cursorCfg = recipeOverlays?.cursor ?? {};
+  const rippleCfg = recipeOverlays?.ripples ?? {};
+  const gestureCfg = recipeOverlays?.gestures ?? {};
+  const keystrokeCfg = recipeOverlays?.keystrokes ?? {};
+  const captionCfg = recipeOverlays?.captions ?? {};
+
+  const rippleEnabled = rippleCfg.enabled !== false;
+  const rippleDuration = rippleCfg.duration ?? 0.45;
+  const gestureEnabled = gestureCfg.enabled !== false;
+  const wheelDuration = gestureCfg.wheelDuration ?? 0.25;
+  const gestureDefaultDuration = gestureCfg.duration ?? 0.35;
+  const keystrokeEnabled = keystrokeCfg.enabled !== false;
+  const keystrokeDuration = keystrokeCfg.duration ?? 1.2;
+
+  const cursorSamples = compileCursorSamples(events, duration);
+  const ripples = [];
+  const gestures = [];
+  const keystrokes = [];
+  const steps = [];
+
   for (let i = 0; i < events.length; i += 1) {
     const event = events[i];
     switch (event.type) {
-      case 'pointermove':
-        pushCursorSample(event.t, event.x, event.y, pressed, true);
-        break;
       case 'pointerdown': {
-        pressed = true;
-        pushCursorSample(event.t, event.x, event.y, true, true);
         if (rippleEnabled) {
           ripples.push({
             t: roundTime(event.t),
@@ -1067,12 +1245,7 @@ function compileOverlays(events, recipeOverlays, duration) {
         }
         break;
       }
-      case 'pointerup':
-        pressed = false;
-        pushCursorSample(event.t, event.x, event.y, false, true);
-        break;
       case 'wheel':
-        pushCursorSample(event.t, event.x, event.y, pressed, true);
         if (gestureEnabled) {
           gestures.push({
             t: roundTime(event.t),
@@ -1081,12 +1254,11 @@ function compileOverlays(events, recipeOverlays, duration) {
             y: normalizeZero(event.y),
             deltaX: normalizeZero(event.deltaX),
             deltaY: normalizeZero(event.deltaY),
-            duration: event.duration ?? wheelDuration,
+            duration: isPositiveNumber(event.duration) ? event.duration : wheelDuration,
           });
         }
         break;
       case 'gesture':
-        pushCursorSample(event.t, event.x, event.y, pressed, true);
         if (gestureEnabled) {
           gestures.push({
             t: roundTime(event.t),
@@ -1095,24 +1267,13 @@ function compileOverlays(events, recipeOverlays, duration) {
             y: normalizeZero(event.y),
             deltaX: normalizeZero(event.deltaX ?? 0),
             deltaY: normalizeZero(event.deltaY ?? 0),
-            duration: event.duration ?? gestureDefaultDuration,
+            duration: isPositiveNumber(event.duration) ? event.duration : gestureDefaultDuration,
           });
         }
         break;
       case 'drag': {
         const [fromX, fromY] = event.from;
         const [toX, toY] = event.to;
-        const endT = roundTime(Math.min(event.t + event.duration, Math.max(duration, event.t)));
-        const hasInteriorPointer = events.some(
-          (other) =>
-            (other.type === 'pointermove' || other.type === 'pointerup') &&
-            other.t > event.t &&
-            other.t <= endT
-        );
-        pushCursorSample(event.t, fromX, fromY, true, true);
-        if (!hasInteriorPointer) {
-          pushCursorSample(endT, toX, toY, false, true);
-        }
         if (rippleEnabled) {
           const duplicateRipple = ripples.some(
             (r) => r.t === roundTime(event.t) && r.x === normalizeZero(fromX) && r.y === normalizeZero(fromY)
@@ -1135,7 +1296,7 @@ function compileOverlays(events, recipeOverlays, duration) {
             y: normalizeZero(fromY),
             deltaX: normalizeZero(toX - fromX),
             deltaY: normalizeZero(toY - fromY),
-            duration: event.duration,
+            duration: isPositiveNumber(event.duration) ? event.duration : gestureDefaultDuration,
           });
         }
         break;
@@ -1148,23 +1309,22 @@ function compileOverlays(events, recipeOverlays, duration) {
             t: roundTime(event.t),
             label: formatKeystrokeLabel(modifiers, event.key),
             keys: [...modifiers, event.key],
-            duration: event.duration ?? keystrokeDuration,
+            duration: isPositiveNumber(event.duration) ? event.duration : keystrokeDuration,
           });
         }
         break;
       }
-      case 'step':
+      case 'step': {
+        const label = isNonEmptyString(event.label) ? event.label.trim() : `step-${event.index}`;
         steps.push({
           t: roundTime(event.t),
           index: event.index,
-          label: event.label,
+          label,
         });
         break;
+      }
     }
   }
-
-  // Keep cursor samples stably ordered by timestamp (drag end points can overlap later events).
-  cursorSamples.sort((a, b) => a.t - b.t);
 
   return {
     overlays: {

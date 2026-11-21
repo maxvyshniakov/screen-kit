@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import sharp from 'sharp';
 import { hash } from './run.mjs';
@@ -7,6 +7,15 @@ import { probeVideo } from './video.mjs';
 import { reviewVideo } from './review-video.mjs';
 
 export { reviewVideo };
+
+async function pathExists(p) {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function inspectCast(bytes) {
   const [header, ...events] = bytes.toString('utf8').trim().split('\n').map(JSON.parse);
@@ -76,7 +85,7 @@ export async function reviewRun({ manifest, videoReview, outDir, baseline, multi
         check(`${name}:assertion`, assertion.ok, assertion.message ?? assertion.expect ?? 'capture assertion');
       for (const checkpoint of artifact.checkpoints ?? [])
         check(`${name}:checkpoint`, checkpoint.passed, `expected screen content at ${checkpoint.at}s: ${JSON.stringify(checkpoint.expect)}`);
-      if (isVideo && (videoReview || artifact.timeline)) {
+      if (isVideo && videoReview !== false) {
         const extraOpts = typeof videoReview === 'object' && videoReview !== null ? videoReview : {};
         const timelineRef = typeof artifact.timeline === 'string'
           ? resolve(dirname(manifest), artifact.timeline)
@@ -85,8 +94,19 @@ export async function reviewRun({ manifest, videoReview, outDir, baseline, multi
           ? resolve(dirname(manifest), artifact.eventTrack)
           : artifact.eventTrack;
         const videoOutDir = outDir ? join(resolve(outDir), name) : undefined;
-        const videoBaseline = baseline ? join(resolve(baseline), name) : undefined;
+        let videoBaseline;
+        if (baseline) {
+          const baseRoot = resolve(baseline);
+          const perRecipeStills = join(baseRoot, name, 'stills');
+          const perRecipeDir = join(baseRoot, name);
+          if (await pathExists(perRecipeStills)) videoBaseline = perRecipeStills;
+          else if (await pathExists(perRecipeDir)) videoBaseline = perRecipeDir;
+          else if (Object.keys(report.recipes ?? {}).length === 1) videoBaseline = baseRoot;
+          else videoBaseline = perRecipeDir;
+        }
+        const cheapOnly = !timelineRef && !videoReview;
         const videoResult = await reviewVideo({
+          ...(cheapOnly ? { freeze: { enabled: false }, black: { enabled: false } } : {}),
           ...extraOpts,
           video: file,
           timeline: extraOpts.timeline ?? timelineRef,

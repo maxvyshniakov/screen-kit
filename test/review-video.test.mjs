@@ -11,8 +11,10 @@ import {
   DEFAULT_CURSOR_THRESHOLD_PX,
   locateCursorMarker,
   reviewVideo,
+  snapToFrameBoundary,
   verifyCursorAccuracy,
 } from '../src/review-video.mjs';
+import { computeFrameScene, screenToRender } from '../src/remotion/layout.mjs';
 import { reviewRun, reviewVideo as reviewVideoFromReview } from '../src/review.mjs';
 import * as rootApi from '../src/index.mjs';
 import { hash } from '../src/run.mjs';
@@ -535,7 +537,9 @@ test('multimodal review hook never runs implicitly and merges structured finding
       )
     );
 
-    // 4. Gemini provider adapter with mocked fetchImpl
+    // 4. Gemini provider adapter with mocked fetchImpl (verifying x-goog-api-key header, no key in URL)
+    let geminiRequestUrl = null;
+    let geminiRequestHeaders = null;
     let geminiRequestBody = null;
     const geminiReport = await reviewVideo({
       video,
@@ -545,7 +549,9 @@ test('multimodal review hook never runs implicitly and merges structured finding
         enabled: true,
         provider: 'gemini',
         apiKey: 'test-key-not-real',
-        fetchImpl: async (_url, init) => {
+        fetchImpl: async (url, init) => {
+          geminiRequestUrl = url;
+          geminiRequestHeaders = init.headers;
           geminiRequestBody = JSON.parse(init.body);
           return {
             ok: true,
@@ -580,8 +586,55 @@ test('multimodal review hook never runs implicitly and merges structured finding
     assert.equal(geminiReport.ok, true);
     assert.equal(geminiReport.multimodal.ran, true);
     assert.equal(geminiReport.multimodal.provider, 'gemini');
+    assert.doesNotMatch(geminiRequestUrl, /key=/i);
+    assert.doesNotMatch(geminiRequestUrl, /test-key-not-real/);
+    assert.equal(geminiRequestHeaders['x-goog-api-key'], 'test-key-not-real');
     assert.ok(geminiRequestBody.contents[0].parts.some((p) => p.inline_data?.mime_type === 'image/png'));
     assert.ok(geminiReport.findings.some((f) => f.source === 'multimodal' && f.category === 'composition'));
+
+    // 5. Empty Gemini response is treated as skipped (not pass)
+    const emptyReplyReport = await reviewVideo({
+      video,
+      timeline,
+      multimodal: {
+        enabled: true,
+        provider: 'gemini',
+        apiKey: 'test-key-not-real',
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ candidates: [{ content: { parts: [{ text: '   ' }] } }] }),
+        }),
+      },
+    });
+    assert.equal(emptyReplyReport.ok, true);
+    assert.equal(emptyReplyReport.multimodal.ran, false);
+    assert.equal(emptyReplyReport.multimodal.skipped, true);
+    assert.equal(emptyReplyReport.checks.find((c) => c.name === 'multimodal')?.skipped, true);
+
+    // 6. Malformed non-JSON Gemini response fails multimodal check without throwing away deterministic report
+    const malformedReport = await reviewVideo({
+      video,
+      timeline,
+      outDir: join(dir, 'out-malformed'),
+      multimodal: {
+        enabled: true,
+        provider: 'gemini',
+        apiKey: 'test-key-not-real',
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [{ content: { parts: [{ text: '```json\n{ truncated...' }] } }],
+          }),
+        }),
+      },
+    });
+    assert.equal(malformedReport.ok, false);
+    assert.equal(malformedReport.checks.find((c) => c.name === 'ffprobe')?.ok, true);
+    assert.equal(malformedReport.checks.find((c) => c.name === 'multimodal')?.ok, false);
+    assert.equal(malformedReport.artifacts.stills.length, 3);
+    assert.ok(malformedReport.findings.some((f) => f.category === 'multimodal-parse' && f.severity === 'error'));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -665,6 +718,320 @@ test('CLI review --video exits 0 on valid video, non-zero on broken video, and r
     assert.ok(runResult.videos?.demo);
     assert.equal(runResult.videos.demo.ok, true);
     await access(runResult.videos.demo.artifacts.contactSheet.file);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('1440x900 camera rendered to 2560x1440 matches screenToRender between layout.mjs and review-video.mjs with 0 px error', () => {
+  const eventTrack = {
+    version: 1,
+    captureMode: 'quality',
+    viewport: { width: 1440, height: 900, deviceScaleFactor: 2 },
+    video: { file: 'take.mp4', width: 2880, height: 1800, fps: 60, duration: 2, frames: 120 },
+    events: [
+      { t: 0, type: 'pointermove', x: 100, y: 100 },
+      { t: 1, type: 'pointermove', x: 1340, y: 800 },
+    ],
+  };
+  const timeline = compileTimeline({
+    eventTrack,
+    recipe: {
+      stage: { width: 1680, height: 1140, padding: 120 },
+      window: { frame: 'macos', width: 1440, height: 900 },
+      camera: { outputWidth: 1440, outputHeight: 900 },
+      outputs: ['youtube-master'],
+    },
+  });
+
+  // 1440x900 -> 2560x1440 uses uniform scale = min(2560/1440, 1440/900) = 1.6 and pillarbox offsetX = 128
+  const mapped = screenToRender(100, 100, 1440, 900, 2560, 1440);
+  assert.equal(mapped.scale, 1.6);
+  assert.equal(mapped.offsetX, 128);
+  assert.equal(mapped.offsetY, 0);
+  assert.equal(mapped.x, 288);
+  assert.equal(mapped.y, 160);
+
+  const sceneStart = computeFrameScene(timeline, { frame: 0, fps: 60, width: 2560, height: 1440 });
+  const sceneEnd = computeFrameScene(timeline, { frame: 60, fps: 60, width: 2560, height: 1440 });
+
+  const accuracy = verifyCursorAccuracy({
+    timeline,
+    cursorSamples: [
+      { t: 0, x: sceneStart.overlays.cursor.x, y: sceneStart.overlays.cursor.y },
+      { t: 1, x: sceneEnd.overlays.cursor.x, y: sceneEnd.overlays.cursor.y },
+    ],
+    outputWidth: 2560,
+    outputHeight: 1440,
+    fps: 60,
+    thresholdPx: 2,
+  });
+  assert.equal(accuracy.ok, true);
+  assert.equal(accuracy.checked, true);
+  assert.equal(accuracy.skipped, false);
+  assert.equal(accuracy.maxErrorPx, 0);
+});
+
+test('non-pixel cursor modes report checked=false/skipped=true, frame-boundary rounding avoids inter-frame drift, and drag end-samples match', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-rv-cursor-honesty-'));
+  try {
+    // 1. Non-pixel modes (projection-self-check & event-track-alignment) report checked: false, skipped: true
+    const eventTrack = {
+      version: 1,
+      captureMode: 'headless',
+      viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+      video: { file: 'move.mp4', width: 320, height: 180, fps: 10, duration: 1, frames: 10 },
+      events: [
+        { t: 0.0, type: 'pointermove', x: 20, y: 90 },
+        // Fast drag with real pointerdown + pointermove + pointerup extending slightly past drag.duration
+        { t: 0.2, type: 'drag', from: [20, 90], to: [220, 90], duration: 0.4 },
+        { t: 0.21, type: 'pointerdown', x: 20, y: 90, button: 'left' },
+        { t: 0.5, type: 'pointermove', x: 170, y: 90 },
+        { t: 0.65, type: 'pointermove', x: 220, y: 90 },
+        { t: 0.68, type: 'pointerup', x: 220, y: 90, button: 'left' },
+      ],
+    };
+    const timeline = compileTimeline({
+      eventTrack,
+      recipe: {
+        stage: { width: 320, height: 180, padding: 0 },
+        window: { frame: 'none', width: 320, height: 180 },
+        camera: { outputWidth: 320, outputHeight: 180 },
+      },
+    });
+
+    const selfCheck = verifyCursorAccuracy({ timeline });
+    assert.equal(selfCheck.mode, 'projection-self-check');
+    assert.equal(selfCheck.ok, true);
+    assert.equal(selfCheck.checked, false);
+    assert.equal(selfCheck.skipped, true);
+
+    const alignCheck = verifyCursorAccuracy({ timeline, eventTrack });
+    assert.equal(alignCheck.mode, 'event-track-alignment');
+    assert.equal(alignCheck.ok, true);
+    assert.equal(alignCheck.checked, false);
+    assert.equal(alignCheck.skipped, true);
+    assert.equal(alignCheck.maxErrorPx, 0);
+
+    // 2. Frame-boundary rounding: 10 fps video where marker moves X = 20 + 200 * (N / 10)
+    // Sampled at non-boundary t = 0.58s -> floor(0.58 * 10) / 10 = 0.5s (frame 5, X = 120; at 0.58s X would be 136 -> 16px error without rounding!)
+    assert.equal(snapToFrameBoundary(0.58, 10), 0.5);
+    const fastTimeline = compileTimeline({
+      eventTrack: {
+        version: 1,
+        captureMode: 'headless',
+        viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+        video: { file: 'fast.mp4', width: 320, height: 180, fps: 10, duration: 1, frames: 10 },
+        events: [
+          { t: 0.0, type: 'pointermove', x: 20, y: 90 },
+          { t: 1.0, type: 'pointermove', x: 220, y: 90 },
+        ],
+      },
+      recipe: {
+        stage: { width: 320, height: 180, padding: 0 },
+        window: { frame: 'none', width: 320, height: 180 },
+        camera: { outputWidth: 320, outputHeight: 180 },
+      },
+    });
+
+    for (let n = 0; n < 10; n += 1) {
+      const cx = 20 + n * 20;
+      const marker = await sharp({
+        create: { width: 9, height: 9, channels: 3, background: { r: 255, g: 0, b: 255 } },
+      }).png().toBuffer();
+      await sharp({
+        create: { width: 320, height: 180, channels: 3, background: { r: 20, g: 30 + n * 5, b: 50 } },
+      })
+        .composite([{ input: marker, left: cx - 4, top: 86 }])
+        .png()
+        .toFile(join(dir, `f-${n}.png`));
+    }
+    const fastVideo = join(dir, 'fast.mp4');
+    await runFfmpeg([
+      '-framerate', '10', '-i', join(dir, 'f-%d.png'),
+      '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-crf', '10', fastVideo,
+    ]);
+
+    const nonPixelReview = await reviewVideo({ video: fastVideo, timeline: fastTimeline });
+    const cursorCheck = nonPixelReview.checks.find((c) => c.name === 'cursor-accuracy');
+    assert.equal(nonPixelReview.ok, true);
+    assert.equal(cursorCheck?.checked, false);
+    assert.equal(cursorCheck?.skipped, true);
+
+    const roundedReview = await reviewVideo({
+      video: fastVideo,
+      timeline: fastTimeline,
+      cursorDetection: { color: '#ff00ff', tolerance: 45, searchRadius: 24, timestamps: [0.58] },
+    });
+    assert.equal(roundedReview.ok, true, JSON.stringify(roundedReview.findings, null, 2));
+    assert.equal(roundedReview.metrics.cursor.checked, true);
+    assert.equal(roundedReview.metrics.cursor.skipped, false);
+    assert.ok(roundedReview.metrics.cursor.maxErrorPx <= 2);
+
+    // 3. CLI --cursor-detection and --cursor-threshold validation
+    const fastTimelineFile = join(dir, 'fast-timeline.json');
+    await writeFile(fastTimelineFile, JSON.stringify(fastTimeline, null, 2));
+    const { stdout: cliCursorOut } = await exec('node', [
+      CLI_PATH, 'review',
+      '--video', fastVideo,
+      '--timeline', fastTimelineFile,
+      '--cursor-detection', '#ff00ff',
+    ]);
+    const cliCursorReport = JSON.parse(cliCursorOut);
+    assert.equal(cliCursorReport.ok, true);
+    assert.equal(cliCursorReport.metrics.cursor.checked, true);
+
+    await assert.rejects(
+      exec('node', [CLI_PATH, 'review', '--video', fastVideo, '--cursor-threshold', '0']),
+      /positive finite number/
+    );
+    await assert.rejects(
+      exec('node', [CLI_PATH, 'review', '--video', fastVideo, '--cursor-threshold', 'not-a-number']),
+      /positive finite number/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reviewVideo catches CFR-resampled raw capture gaps, excuses intentional quiet pauses outside active windows, diffs baseline without outDir, and reviewRun checks manifest videos without timeline', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-rv-rawgaps-pause-'));
+  try {
+    // 1. CFR video whose PTS deltas are uniform, but eventTrack.video.capture recorded raw screencast stalls
+    const cfrVideo = join(dir, 'cfr.mp4');
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=1.5',
+      '-pix_fmt', 'yuv420p', '-c:v', 'libx264', cfrVideo,
+    ]);
+
+    const stalledEventTrack = {
+      version: 1,
+      captureMode: 'quality',
+      startedAt: '2026-11-22T00:00:00.000Z',
+      viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+      video: {
+        file: 'cfr.mp4',
+        width: 320,
+        height: 180,
+        fps: 30,
+        encodedFps: 30,
+        duration: 1.5,
+        frames: 45,
+        capture: {
+          rawFrames: 18,
+          firstFrameAt: 0,
+          lastFrameAt: 1.46,
+          elapsedDuration: 1.5,
+          rawFps: 12,
+          maxGapMs: 420,
+          gapsOver2Frames: 3,
+          truncated: false,
+        },
+      },
+      events: [{ t: 0, type: 'pointermove', x: 160, y: 90 }],
+    };
+
+    const rawGapReport = await reviewVideo({ video: cfrVideo, eventTrack: stalledEventTrack });
+    assert.equal(rawGapReport.ok, false);
+    assert.equal(rawGapReport.checks.find((c) => c.name === 'capture-gaps')?.ok, false);
+    assert.ok(rawGapReport.findings.some((f) => f.category === 'capture-gap' && /raw capture/i.test(f.message)));
+
+    // 2. Intentional quiet pause (1.3s static hold between active segments) passes with timeline, while frozen active segment fails
+    const pauseVideo = join(dir, 'quiet-pause.mp4');
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=0.6',
+      '-f', 'lavfi', '-i', 'color=c=0x1e293b:s=320x180:r=30:d=1.3',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=0.6',
+      '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0',
+      '-pix_fmt', 'yuv420p', '-c:v', 'libx264', pauseVideo,
+    ]);
+
+    const pauseEventTrack = {
+      version: 1,
+      captureMode: 'headless',
+      viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+      video: { file: 'quiet-pause.mp4', width: 320, height: 180, fps: 30, duration: 2.5, frames: 75 },
+      events: [
+        { t: 0.1, type: 'pointerdown', x: 80, y: 90, button: 'left' },
+        { t: 0.2, type: 'pointerup', x: 80, y: 90, button: 'left' },
+        { t: 0.7, type: 'step', index: 0, label: 'Read static modal' },
+        { t: 2.15, type: 'pointerdown', x: 200, y: 90, button: 'left' },
+        { t: 2.25, type: 'pointerup', x: 200, y: 90, button: 'left' },
+      ],
+    };
+    const pauseTimeline = compileTimeline({
+      eventTrack: pauseEventTrack,
+      recipe: {
+        stage: { width: 320, height: 180, padding: 0 },
+        window: { frame: 'none', width: 320, height: 180 },
+        camera: { outputWidth: 320, outputHeight: 180 },
+      },
+    });
+
+    const quietPauseReport = await reviewVideo({ video: pauseVideo, timeline: pauseTimeline });
+    assert.equal(quietPauseReport.ok, true, JSON.stringify(quietPauseReport.checks, null, 2));
+    assert.equal(quietPauseReport.checks.find((c) => c.name === 'freeze-frames')?.ok, true);
+    assert.equal(quietPauseReport.metrics.freeze.quietPauseSegments.length, 1);
+    assert.ok(quietPauseReport.findings.some((f) => f.category === 'freeze-pause' && f.severity === 'info'));
+
+    // Without timeline/eventTrack, the same 1.3s static segment still fails freeze-frames
+    const unscheduledFreezeReport = await reviewVideo({ video: pauseVideo });
+    assert.equal(unscheduledFreezeReport.ok, false);
+    assert.equal(unscheduledFreezeReport.checks.find((c) => c.name === 'freeze-frames')?.ok, false);
+
+    // 3. Baseline diff WITHOUT outDir runs via ephemeral temp dir and catches regressions
+    const baselinePrepDir = join(dir, 'baseline-prep');
+    const timelineCfr = makeFixtureTimeline({ video: cfrVideo, duration: 1.5 });
+    await reviewVideo({ video: cfrVideo, timeline: timelineCfr, outDir: baselinePrepDir });
+    const baselineStills = join(baselinePrepDir, 'stills');
+
+    const noOutDirMatch = await reviewVideo({ video: cfrVideo, timeline: timelineCfr, baseline: baselineStills });
+    assert.equal(noOutDirMatch.ok, true);
+    assert.equal(noOutDirMatch.metrics.baseline.checked, true);
+    assert.equal(noOutDirMatch.metrics.baseline.compared, 3);
+
+    const hueShiftedVideo = join(dir, 'shifted.mp4');
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=1.5',
+      '-vf', 'hue=h=120',
+      '-pix_fmt', 'yuv420p', '-c:v', 'libx264', hueShiftedVideo,
+    ]);
+    const noOutDirFail = await reviewVideo({ video: hueShiftedVideo, timeline: timelineCfr, baseline: baselineStills });
+    assert.equal(noOutDirFail.ok, false);
+    assert.equal(noOutDirFail.checks.find((c) => c.name === 'baseline-diff')?.ok, false);
+
+    // 4. reviewRun runs deterministic video checks even WITHOUT artifact.timeline and forwards --baseline / --out-dir
+    const cfrBytes = await readFile(cfrVideo);
+    const stalledTrackPath = join(dir, 'stalled-track.json');
+    const stalledTrackText = JSON.stringify(stalledEventTrack, null, 2);
+    await writeFile(stalledTrackPath, stalledTrackText);
+    const manifestNoTimeline = join(dir, 'run-no-timeline.json');
+    await writeFile(
+      manifestNoTimeline,
+      JSON.stringify({
+        version: 1,
+        status: 'complete',
+        recipes: {
+          rawTake: {
+            status: 'complete',
+            file: 'cfr.mp4',
+            eventTrack: 'stalled-track.json',
+            eventTrackSha256: hash(stalledTrackText),
+            captureMode: 'quality',
+            width: 320,
+            height: 180,
+            frames: 45,
+            duration: 1.5,
+            sha256: hash(cfrBytes),
+          },
+        },
+      })
+    );
+    const manifestReview = await reviewRun({ manifest: manifestNoTimeline });
+    assert.equal(manifestReview.ok, false);
+    assert.ok(manifestReview.videos?.rawTake);
+    assert.equal(manifestReview.checks.find((c) => c.name === 'rawTake:video:ffprobe')?.ok, true);
+    assert.equal(manifestReview.checks.find((c) => c.name === 'rawTake:video:capture-gaps')?.ok, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

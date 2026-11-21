@@ -5,6 +5,9 @@ on:
     branches: [dev, main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +17,7 @@ jobs:
     # macos-latest provides python3 out of the box and installs ffmpeg, webp (gif2webp),
     # and agg (>= 1.9) cleanly via Homebrew without custom binary downloads.
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4

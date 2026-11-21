@@ -545,3 +545,63 @@ test('post-capture edits to timeline.json remain valid and update projections wi
   const click = edited.overlays.ripples[0];
   assert.deepEqual(projectViewportToScreen(click.x, click.y, edited, click.t), { x: 960, y: 540 });
 });
+
+test('unified Event Track v1 schema supports stationary/mayBegin wheel phases, 0-duration gestures, optional step labels, and drag pressed state tracking', () => {
+  const track = makeFixtureEventTrack({
+    video: {
+      file: 'take.mp4',
+      width: 2880,
+      height: 1620,
+      fps: 60,
+      encodedFps: 60,
+      duration: 4.0,
+      frames: 240,
+      capture: {
+        rawFrames: 240,
+        firstFrameAt: 0,
+        lastFrameAt: 3.9833,
+        elapsedDuration: 4.0,
+        rawFps: 60,
+        maxGapMs: 18.2,
+        gapsOver2Frames: 0,
+        truncated: false,
+      },
+    },
+    events: [
+      { t: 0.0, type: 'pointermove', x: 100, y: 100 },
+      { t: 0.2, type: 'wheel', x: 100, y: 100, deltaX: 0, deltaY: 0, phase: 'mayBegin', duration: 0 },
+      { t: 0.3, type: 'wheel', x: 100, y: 100, deltaX: 0, deltaY: -40, phase: 'stationary' },
+      { t: 0.5, type: 'gesture', kind: 'scroll', x: 100, y: 100, deltaX: 120, deltaY: 0, duration: 0 },
+      // Drag WITHOUT explicit pointerdown/pointerup, WITH interior pointermove events
+      { t: 1.0, type: 'drag', from: [100, 100], to: [300, 200], duration: 0.6 },
+      { t: 1.2, type: 'pointermove', x: 180, y: 140 },
+      { t: 1.4, type: 'pointermove', x: 250, y: 175 },
+      // After drag ends at 1.6, pointermove at 2.0 must have pressed: false
+      { t: 2.0, type: 'pointermove', x: 320, y: 210 },
+      { t: 2.5, type: 'step', index: 0 },
+      { t: 2.8, type: 'step', index: 1, label: '' },
+    ],
+  });
+
+  assert.deepEqual(validateEventTrack(track), { ok: true, errors: [] });
+  const compiled = compileTimeline({ eventTrack: track });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+
+  // Interior pointermove samples during drag (1.2, 1.4) keep pressed: true; release at 1.6 and move at 2.0 have pressed: false
+  const samples = compiled.overlays.cursor.samples;
+  assert.equal(samples.find((s) => s.t === 1.0)?.pressed, true);
+  assert.equal(samples.find((s) => s.t === 1.2)?.pressed, true);
+  assert.equal(samples.find((s) => s.t === 1.4)?.pressed, true);
+  assert.equal(samples.find((s) => s.t === 1.6)?.pressed, false);
+  assert.deepEqual(
+    { x: samples.find((s) => s.t === 1.6)?.x, y: samples.find((s) => s.t === 1.6)?.y },
+    { x: 300, y: 200 }
+  );
+  assert.equal(samples.find((s) => s.t === 2.0)?.pressed, false);
+
+  // Missing and empty step labels normalize to non-empty fallback step-<index>
+  assert.deepEqual(compiled.steps, [
+    { t: 2.5, index: 0, label: 'step-0' },
+    { t: 2.8, index: 1, label: 'step-1' },
+  ]);
+});

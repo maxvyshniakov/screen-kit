@@ -8,6 +8,10 @@ import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import { helpers, storyUrl } from './browser.mjs';
 import { hash } from './run.mjs';
+import {
+  GESTURE_KINDS as TIMELINE_GESTURE_KINDS,
+  validateEventTrack as checkEventTrackSchema,
+} from './timeline.mjs';
 import { probeVideo } from './video.mjs';
 
 const exec = promisify(execFile);
@@ -17,8 +21,17 @@ const roundCoord = (px) => Number(px.toFixed(2));
 
 export const CAPTURE_MODES = Object.freeze(['quality', 'headless']);
 const BUTTONS = new Set(['left', 'middle', 'right']);
-const WHEEL_PHASES = new Set(['began', 'changed', 'stationary', 'ended', 'cancelled', 'mayBegin', 'none']);
-const GESTURE_KINDS = new Set(['scroll', 'pinch']);
+const WHEEL_PHASES = new Set([
+  'began',
+  'changed',
+  'stationary',
+  'ended',
+  'cancelled',
+  'mayBegin',
+  'maybegin',
+  'none',
+]);
+const GESTURE_KINDS = new Set(TIMELINE_GESTURE_KINDS);
 const KEY_ACTIONS = new Set(['press', 'down', 'up']);
 const MODIFIER_MAP = new Map([
   ['meta', 'Meta'], ['cmd', 'Meta'], ['command', 'Meta'], ['super', 'Meta'],
@@ -109,7 +122,7 @@ export function minimumJerkTrajectory({
   return samples;
 }
 
-/** Validate an Event Track v1 object against the schema and monotonicity invariants. */
+/** Validate an Event Track v1 object against the unified schema and monotonicity invariants. */
 export function validateEventTrack(track) {
   if (!track || typeof track !== 'object' || Array.isArray(track)) {
     throw Error('Event track must be an object');
@@ -146,80 +159,18 @@ export function validateEventTrack(track) {
     throw Error('Event track startedAt must be a valid ISO timestamp');
   }
 
-  if (!Array.isArray(track.events)) {
-    throw Error('Event track events must be an array');
+  const unified = checkEventTrackSchema(track);
+  if (!unified.ok) {
+    throw Error(unified.errors.join('; '));
   }
 
-  let previousT = 0;
   for (let i = 0; i < track.events.length; i++) {
     const event = track.events[i];
-    if (!event || typeof event !== 'object' || Array.isArray(event)) {
-      throw Error(`Event[${i}] must be an object`);
+    if ((event.type === 'pointerdown' || event.type === 'pointerup') && !BUTTONS.has(event.button)) {
+      throw Error(`Event[${i}] ${event.type} requires finite x, y and valid button`);
     }
-    if (!Number.isFinite(event.t) || event.t < 0) {
-      throw Error(`Event[${i}].t must be a finite number >= 0`);
-    }
-    if (event.t < previousT) {
-      throw Error(`Event[${i}].t (${event.t}) must be monotonically non-decreasing (previous ${previousT})`);
-    }
-    previousT = event.t;
-
-    switch (event.type) {
-      case 'pointermove':
-        if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) {
-          throw Error(`Event[${i}] pointermove requires finite x and y`);
-        }
-        break;
-      case 'pointerdown':
-      case 'pointerup':
-        if (!Number.isFinite(event.x) || !Number.isFinite(event.y) || !BUTTONS.has(event.button)) {
-          throw Error(`Event[${i}] ${event.type} requires finite x, y and valid button`);
-        }
-        break;
-      case 'wheel':
-        if (
-          !Number.isFinite(event.x) || !Number.isFinite(event.y) ||
-          !Number.isFinite(event.deltaX) || !Number.isFinite(event.deltaY) ||
-          !WHEEL_PHASES.has(event.phase)
-        ) {
-          throw Error(`Event[${i}] wheel requires finite x, y, deltaX, deltaY and valid phase`);
-        }
-        break;
-      case 'gesture':
-        if (
-          !GESTURE_KINDS.has(event.kind) ||
-          !Number.isFinite(event.x) || !Number.isFinite(event.y) ||
-          !Number.isFinite(event.duration) || event.duration < 0 ||
-          (event.kind === 'scroll' && (!Number.isFinite(event.deltaX) || !Number.isFinite(event.deltaY)))
-        ) {
-          throw Error(`Event[${i}] gesture has invalid kind, coordinates, deltas or duration`);
-        }
-        break;
-      case 'drag':
-        if (
-          !Array.isArray(event.from) || event.from.length !== 2 || !event.from.every(Number.isFinite) ||
-          !Array.isArray(event.to) || event.to.length !== 2 || !event.to.every(Number.isFinite) ||
-          !Number.isFinite(event.duration) || event.duration < 0
-        ) {
-          throw Error(`Event[${i}] drag requires [x, y] from/to tuples and nonnegative duration`);
-        }
-        break;
-      case 'key':
-        if (
-          typeof event.key !== 'string' || !event.key.length ||
-          !Array.isArray(event.modifiers) || event.modifiers.some((m) => !VALID_MODIFIERS.has(m)) ||
-          !KEY_ACTIONS.has(event.action)
-        ) {
-          throw Error(`Event[${i}] key requires non-empty key, canonical modifiers array and valid action`);
-        }
-        break;
-      case 'step':
-        if (!Number.isInteger(event.index) || event.index < 0 || typeof event.label !== 'string') {
-          throw Error(`Event[${i}] step requires nonnegative integer index and string label`);
-        }
-        break;
-      default:
-        throw Error(`Event[${i}] has unsupported event type: ${JSON.stringify(event.type)}`);
+    if (event.type === 'key' && (!Array.isArray(event.modifiers) || event.modifiers.some((m) => !VALID_MODIFIERS.has(m)) || !KEY_ACTIONS.has(event.action))) {
+      throw Error(`Event[${i}] key requires non-empty key, canonical modifiers array and valid action`);
     }
   }
 
@@ -505,27 +456,66 @@ async function runPrepAction(page, action) {
   throw Error(`Invalid preparation action: ${JSON.stringify(action)}`);
 }
 
-function computeMeasuredFps(sortedFrames, totalDuration) {
-  if (!sortedFrames.length || !(totalDuration > 0)) return 0;
-  if (sortedFrames.length === 1) return Number((1 / totalDuration).toFixed(2));
-  const deltas = [];
-  for (let i = 1; i < sortedFrames.length; i++) {
-    const dt = sortedFrames[i].t - sortedFrames[i - 1].t;
-    if (dt > 0.0005 && dt < 0.25) deltas.push(dt);
+function orderRawScreencastFrames(rawFrames = []) {
+  const withValidTs = rawFrames.filter((f) => Number.isFinite(f.cdpTimestamp));
+  if (withValidTs.length === rawFrames.length && rawFrames.length > 0) {
+    const sorted = [...rawFrames].sort((a, b) => a.cdpTimestamp - b.cdpTimestamp || a.index - b.index);
+    const offset = Math.min(...sorted.map((f) => f.elapsed - f.cdpTimestamp));
+    return sorted.map((f) => ({ ...f, t: Math.max(0, f.cdpTimestamp + offset) }));
   }
-  if (deltas.length > 0) {
-    const activeSpan = deltas.reduce((sum, dt) => sum + dt, 0);
-    return Number((deltas.length / activeSpan).toFixed(2));
+  return [...rawFrames]
+    .sort((a, b) => a.elapsed - b.elapsed || a.index - b.index)
+    .map((f) => ({ ...f, t: Math.max(0, f.elapsed) }));
+}
+
+/**
+ * Compute honest raw screencast frame timing and inter-frame gap statistics
+ * before temporary frame files are deleted or resampled to CFR.
+ */
+export function computeRawCaptureStats({
+  rawFrames = [],
+  elapsedDuration = 0,
+  requestedFps = 60,
+  truncated = false,
+  durationExceeded = false,
+} = {}) {
+  const ordered = orderRawScreencastFrames(rawFrames);
+  const safeElapsed = Math.max(0, Number.isFinite(elapsedDuration) ? elapsedDuration : 0);
+  const count = ordered.length;
+  const firstFrameAt = count > 0 ? roundTime(ordered[0].t) : null;
+  const lastFrameAt = count > 0 ? roundTime(ordered.at(-1).t) : null;
+  const rawFps = safeElapsed > 0 ? Number((count / safeElapsed).toFixed(2)) : 0;
+
+  const twoFrameThresholdSec = requestedFps > 0 ? 2 / requestedFps : Infinity;
+  let maxGapSec = count === 0 ? safeElapsed : 0;
+  let gapsOver2Frames = count === 0 && safeElapsed > twoFrameThresholdSec + 1e-6 ? 1 : 0;
+
+  for (let i = 1; i < count; i++) {
+    const dt = Math.max(0, ordered[i].t - ordered[i - 1].t);
+    if (dt > maxGapSec) maxGapSec = dt;
+    if (dt > twoFrameThresholdSec + 1e-6) {
+      gapsOver2Frames += 1;
+    }
   }
-  const span = sortedFrames.at(-1).t - sortedFrames[0].t;
-  return span > 0 ? Number(((sortedFrames.length - 1) / span).toFixed(2)) : Number((sortedFrames.length / totalDuration).toFixed(2));
+
+  return {
+    rawFrames: count,
+    firstFrameAt,
+    lastFrameAt,
+    elapsedDuration: roundTime(safeElapsed),
+    rawFps,
+    maxGapMs: Number((maxGapSec * 1000).toFixed(3)),
+    gapsOver2Frames,
+    truncated: Boolean(truncated),
+    ...(durationExceeded ? { durationExceeded: true } : {}),
+  };
 }
 
 function escapeConcatPath(filePath) {
   return filePath.replaceAll("'", "'\\''");
 }
 
-async function encodeScreencastFrames({
+export async function encodeScreencastFrames({
   initialFrameFile,
   rawFrames,
   framesDir,
@@ -533,21 +523,19 @@ async function encodeScreencastFrames({
   format,
   fps,
   targetDuration,
+  colorSpace = 'srgb',
   signal,
 }) {
-  const withValidTs = rawFrames.filter((f) => Number.isFinite(f.cdpTimestamp));
-  let ordered;
-  if (withValidTs.length === rawFrames.length && rawFrames.length > 0) {
-    const sorted = [...rawFrames].sort((a, b) => a.cdpTimestamp - b.cdpTimestamp || a.index - b.index);
-    const offset = Math.min(...sorted.map((f) => f.elapsed - f.cdpTimestamp));
-    ordered = sorted.map((f) => ({ file: f.file, t: Math.max(0, f.cdpTimestamp + offset) }));
-  } else {
-    ordered = [...rawFrames]
-      .sort((a, b) => a.elapsed - b.elapsed || a.index - b.index)
-      .map((f) => ({ file: f.file, t: Math.max(0, f.elapsed) }));
+  if (!['srgb', 'p3'].includes(colorSpace)) {
+    throw Error(`Unsupported browser take colorSpace: ${colorSpace}`);
   }
 
-  const measuredFps = computeMeasuredFps(ordered, targetDuration);
+  const ordered = orderRawScreencastFrames(rawFrames);
+  const rawStats = computeRawCaptureStats({
+    rawFrames,
+    elapsedDuration: targetDuration,
+    requestedFps: fps,
+  });
 
   const timeline = [];
   if (initialFrameFile && (!ordered.length || ordered[0].t > 0.02)) {
@@ -556,8 +544,12 @@ async function encodeScreencastFrames({
     ordered[0] = { ...ordered[0], t: 0 };
   }
 
+  let truncated = false;
   for (const frame of ordered) {
-    if (frame.t >= targetDuration && timeline.length > 0) break;
+    if (frame.t >= targetDuration && timeline.length > 0) {
+      if (frame.t > targetDuration + 0.5 / fps) truncated = true;
+      break;
+    }
     if (timeline.length > 0 && frame.t - timeline.at(-1).t < 0.0005) {
       timeline[timeline.length - 1] = { file: frame.file, t: timeline.at(-1).t };
     } else {
@@ -582,10 +574,15 @@ async function encodeScreencastFrames({
   await writeFile(concatFile, lines.join('\n') + '\n');
 
   const temporary = join(framesDir, `encoded-${randomUUID()}.${format}`);
+  const vfColor = colorSpace === 'p3'
+    ? 'scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
+    : 'scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv';
+  const colorFlags = colorSpace === 'p3'
+    ? ['-color_range', 'tv', '-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709']
+    : ['-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'];
   const codec = format === 'mp4'
     ? [
         '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-profile:v', 'high',
-        '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
         '-movflags', '+faststart',
       ]
     : [
@@ -598,9 +595,10 @@ async function encodeScreencastFrames({
     '-f', 'concat', '-safe', '0', '-i', concatFile,
     '-t', targetDuration.toFixed(6),
     '-an',
-    '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2`,
+    '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2,${vfColor}`,
     '-pix_fmt', 'yuv420p',
     ...codec,
+    ...colorFlags,
     '-threads', '2',
     temporary,
   ], { signal, timeout: 300000, maxBuffer: 5e6 });
@@ -610,7 +608,7 @@ async function encodeScreencastFrames({
     throw Error('Video encoder produced an empty take');
   }
   await rename(temporary, outputFile);
-  return { ...info, measuredFps, capturedFrames: rawFrames.length };
+  return { ...info, measuredFps: rawStats.rawFps, capturedFrames: rawFrames.length, truncated };
 }
 
 export async function createBrowserTakeCapture({
@@ -676,6 +674,11 @@ export async function createBrowserTakeCapture({
       throw Error(`Invalid browser take duration: ${recipe.duration}`);
     }
 
+    const colorSpace = recipe.colorSpace ?? 'srgb';
+    if (!['srgb', 'p3'].includes(colorSpace)) {
+      throw Error(`Unsupported browser take colorSpace: ${colorSpace}`);
+    }
+
     const defaultDsf = mode === 'quality' ? 2 : 1;
     const dsf = recipe.deviceScaleFactor ?? scale ?? recipe.scale ?? defaultDsf;
     const viewport = normalizeViewport(recipe.viewport ?? [1440, 810], dsf);
@@ -697,6 +700,7 @@ export async function createBrowserTakeCapture({
             '--disable-background-timer-throttling',
           ]
         : []),
+      ...(colorSpace === 'p3' ? ['--force-color-profile=display-p3-d65'] : []),
       ...(recipe.browserArgs ?? []),
     ];
 
@@ -855,7 +859,8 @@ export async function createBrowserTakeCapture({
 
         const stepLabel = rawStep && typeof rawStep === 'object' && !Array.isArray(rawStep) ? rawStep.label : undefined;
         if (stepLabel !== undefined) {
-          emit({ type: 'step', index: stepIndex, label: String(stepLabel) });
+          const normalizedLabel = String(stepLabel).trim() || `step-${stepIndex}`;
+          emit({ type: 'step', index: stepIndex, label: normalizedLabel });
         }
 
         if (typeof rawStep === 'string') {
@@ -900,7 +905,9 @@ export async function createBrowserTakeCapture({
         switch (kind) {
           case 'step': {
             if (stepLabel === undefined) {
-              emit({ type: 'step', index: rawStep.index ?? stepIndex, label: String(rawStep.name ?? `step-${stepIndex}`) });
+              const resolvedIndex = rawStep.index ?? stepIndex;
+              const normalizedLabel = String(rawStep.name ?? '').trim() || `step-${resolvedIndex}`;
+              emit({ type: 'step', index: resolvedIndex, label: normalizedLabel });
             }
             break;
           }
@@ -1010,8 +1017,9 @@ export async function createBrowserTakeCapture({
             for (let s = 0; s < wheelSteps; s++) {
               const dx = Number((totalDx / wheelSteps).toFixed(2));
               const dy = Number((totalDy / wheelSteps).toFixed(2));
-              const phase = rawStep.phase ?? (wheelSteps === 1 ? 'changed' : s === 0 ? 'began' : s === wheelSteps - 1 ? 'ended' : 'changed');
-              if (!WHEEL_PHASES.has(phase)) throw Error(`Invalid wheel phase: ${phase}`);
+              const rawPhase = rawStep.phase ?? (wheelSteps === 1 ? 'changed' : s === 0 ? 'began' : s === wheelSteps - 1 ? 'ended' : 'changed');
+              if (!WHEEL_PHASES.has(rawPhase)) throw Error(`Invalid wheel phase: ${rawPhase}`);
+              const phase = rawPhase === 'maybegin' ? 'mayBegin' : rawPhase;
               await page.mouse.wheel(dx, dy);
               emit({ type: 'wheel', x: pointerX, y: pointerY, deltaX: dx, deltaY: dy, phase });
               if (stepDelayMs > 0 && s + 1 < wheelSteps) await sleep(stepDelayMs);
@@ -1147,6 +1155,9 @@ export async function createBrowserTakeCapture({
         }
       }
 
+      const stepsElapsed = Math.max(lastT, (performance.now() - takeStartMs) / 1000);
+      const durationExceeded = recipe.duration !== undefined && stepsElapsed > recipe.duration + 1e-3;
+
       if (recipe.duration !== undefined) {
         await sleep(recipe.duration * 1000 - (performance.now() - takeStartMs));
       } else {
@@ -1156,12 +1167,22 @@ export async function createBrowserTakeCapture({
       // Allow any in-flight compositor frame from the final action to arrive before stopping.
       await sleep(40);
       const actualElapsed = Math.max(1 / requestedFps, (performance.now() - takeStartMs) / 1000);
-      const targetDuration = recipe.duration ?? actualElapsed;
+      const targetDuration = recipe.duration !== undefined
+        ? (recipe.truncate === true ? recipe.duration : Math.max(recipe.duration, stepsElapsed))
+        : actualElapsed;
 
       screencasting = false;
       await activeCdp.send('Page.stopScreencast').catch(() => {});
       await Promise.all(pendingWrites);
       await cleanupActive();
+
+      const preEncodeCapture = computeRawCaptureStats({
+        rawFrames,
+        elapsedDuration: recipe.duration !== undefined && !durationExceeded ? recipe.duration : actualElapsed,
+        requestedFps,
+        truncated: recipe.truncate === true && durationExceeded,
+        durationExceeded,
+      });
 
       const videoFileName = `take.${format}`;
       const videoPath = join(out, videoFileName);
@@ -1173,8 +1194,15 @@ export async function createBrowserTakeCapture({
         format,
         fps: requestedFps,
         targetDuration,
+        colorSpace,
         signal,
       });
+
+      const rawCapture = {
+        ...preEncodeCapture,
+        truncated: Boolean(preEncodeCapture.truncated || encoded.truncated),
+      };
+      const encodedFps = Number(encoded.fps.toFixed(2));
 
       const eventTrackData = {
         version: 1,
@@ -1184,9 +1212,11 @@ export async function createBrowserTakeCapture({
           file: basename(videoPath),
           width: encoded.width,
           height: encoded.height,
-          fps: Number(encoded.fps.toFixed(2)),
+          fps: encodedFps,
+          encodedFps,
           duration: Number(encoded.duration.toFixed(4)),
           frames: encoded.frames,
+          capture: rawCapture,
         },
         startedAt,
         events,
@@ -1212,16 +1242,25 @@ export async function createBrowserTakeCapture({
         width: encoded.width,
         height: encoded.height,
         requestedFps,
-        fps: Number(encoded.fps.toFixed(2)),
-        measuredFps: encoded.measuredFps,
-        capturedFrames: encoded.capturedFrames,
+        fps: encodedFps,
+        encodedFps,
+        rawFps: rawCapture.rawFps,
+        measuredFps: rawCapture.rawFps,
+        capturedFrames: rawCapture.rawFrames,
+        rawCapture,
         frames: encoded.frames,
         duration: encoded.duration,
         ...(recipe.duration !== undefined ? { requestedDuration: recipe.duration } : {}),
+        ...(durationExceeded ? { durationExceeded: true } : {}),
+        ...(rawCapture.truncated ? { truncated: true } : {}),
         codec: encoded.codec,
         audio: encoded.audio,
+        ...(encoded.colorSpace ? { colorSpace: encoded.colorSpace } : {}),
+        ...(encoded.colorPrimaries ? { colorPrimaries: encoded.colorPrimaries } : {}),
+        ...(encoded.colorTransfer ? { colorTransfer: encoded.colorTransfer } : {}),
+        ...(encoded.colorRange ? { colorRange: encoded.colorRange } : {}),
         startedAt,
-        source: { url, format, captureMode: mode, deviceScaleFactor: viewport.deviceScaleFactor, kind: 'browser-take' },
+        source: { url, format, captureMode: mode, colorSpace, deviceScaleFactor: viewport.deviceScaleFactor, kind: 'browser-take' },
       };
     } finally {
       await cleanupActive();

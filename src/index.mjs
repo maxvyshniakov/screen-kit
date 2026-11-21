@@ -8,6 +8,7 @@ export {
   detectFreezeAndBlackFrames,
   verifyCameraBounds,
   verifyCursorAccuracy,
+  snapToFrameBoundary,
   locateCursorMarker,
   resolveStillTargets,
   extractStills,
@@ -22,6 +23,8 @@ export {
   resolveRenderTargets,
   renderTimeline,
   computeFrameScene,
+  screenToRender,
+  moveFileAtomic,
 } from './render-timeline.mjs';
 export {
   TIMELINE_VERSION,
@@ -37,6 +40,7 @@ export {
   sampleCamera,
   cameraViewportRect,
   sampleCursor,
+  compileCursorSamples,
   projectViewportToStage,
   projectViewportToScreen,
   validateEventTrack,
@@ -47,6 +51,8 @@ export {
 export {
   captureBrowserTake,
   createBrowserTakeCapture,
+  computeRawCaptureStats,
+  encodeScreencastFrames,
   minimumJerk,
   minimumJerkTrajectory,
   serializeEventTrack,

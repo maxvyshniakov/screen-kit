@@ -12,8 +12,10 @@ import * as rootApi from '../src/index.mjs';
 import {
   RENDER_PROFILES,
   computeFrameScene,
+  moveFileAtomic,
   renderTimeline,
   resolveRenderTargets,
+  screenToRender,
 } from '../src/render-timeline.mjs';
 import { calculateTimelineMetadata } from '../src/remotion/Root.mjs';
 import {
@@ -389,6 +391,10 @@ test('headless Remotion CLI renders web-loop (WebM + MP4 + poster), youtube-mast
     assert.equal(webmProbe.frames, 10);
     assert.equal(webmProbe.audio, false);
     assert.match(webmProbe.codec, /vp9/);
+    assert.equal(webmProbe.colorSpace, 'bt709');
+    assert.equal(webmProbe.colorPrimaries, 'bt709');
+    assert.equal(webmProbe.colorTransfer, 'bt709');
+    assert.equal(webmProbe.colorRange, 'tv');
 
     const mp4Probe = await probeVideo(mp4Out.file);
     assert.equal(mp4Probe.width, 480);
@@ -396,6 +402,10 @@ test('headless Remotion CLI renders web-loop (WebM + MP4 + poster), youtube-mast
     assert.equal(mp4Probe.frames, 10);
     assert.equal(mp4Probe.audio, false);
     assert.equal(mp4Probe.codec, 'h264');
+    assert.equal(mp4Probe.colorSpace, 'bt709');
+    assert.equal(mp4Probe.colorPrimaries, 'bt709');
+    assert.equal(mp4Probe.colorTransfer, 'bt709');
+    assert.equal(mp4Probe.colorRange, 'tv');
 
     const posterMeta = await sharp(posterOut.file).metadata();
     assert.equal(posterMeta.format, 'png');
@@ -500,6 +510,10 @@ test('headless Remotion CLI renders web-loop (WebM + MP4 + poster), youtube-mast
     assert.equal(ytProbe.height, 1440);
     assert.equal(ytProbe.codec, 'h264');
     assert.equal(ytProbe.frames, 12);
+    assert.equal(ytProbe.colorSpace, 'bt709');
+    assert.equal(ytProbe.colorPrimaries, 'bt709');
+    assert.equal(ytProbe.colorTransfer, 'bt709');
+    assert.equal(ytProbe.colorRange, 'tv');
     assert.deepEqual(await readdir(scratchDir), []);
 
     // 6. Verify failure cleanup both on corrupt media and mid-flight abort after bundling/browser launch
@@ -530,7 +544,95 @@ test('headless Remotion CLI renders web-loop (WebM + MP4 + poster), youtube-mast
       /aborted/i
     );
     assert.deepEqual(await readdir(scratchDir), []);
+
+    // 7. End-to-end CLI `screen-kit timeline --input ... --out ...` -> `render` -> `review`
+    const cliTakeDir = join(workDir, 'takes', 'cli-demo');
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(cliTakeDir, { recursive: true });
+    const cliTakeVideo = join(cliTakeDir, 'take.mp4');
+    await renderVideo({ input: join(workDir, 'seq-%d.png'), output: cliTakeVideo, fps: 10 });
+    const cliEventTrackPath = join(cliTakeDir, 'event-track.json');
+    await writeFile(
+      cliEventTrackPath,
+      JSON.stringify(
+        makeSyntheticEventTrack({
+          video: { file: 'take.mp4', width: 320, height: 180, fps: 10, duration: 1, frames: 10 },
+        }),
+        null,
+        2
+      )
+    );
+    const cliTimelineOut = join(workDir, 'compiled-timeline.json');
+    const { stdout: tlStdout } = await execFile(
+      process.execPath,
+      [CLI_PATH, 'timeline', '--input', cliEventTrackPath, '--out', cliTimelineOut],
+      { cwd: REPO_ROOT, timeout: 30000 }
+    );
+    const tlSummary = JSON.parse(tlStdout);
+    assert.equal(tlSummary.ok, true);
+    assert.equal(tlSummary.take.video, 'takes/cli-demo/take.mp4');
+    assert.equal(tlSummary.take.eventTrack, 'takes/cli-demo/event-track.json');
+
+    const cliRenderedMp4 = join(workDir, 'cli-rendered.mp4');
+    await execFile(
+      process.execPath,
+      [CLI_PATH, 'render', '--input', cliTimelineOut, '--out', cliRenderedMp4],
+      { cwd: REPO_ROOT, timeout: 120000 }
+    );
+    const { stdout: revStdout } = await execFile(
+      process.execPath,
+      [CLI_PATH, 'review', '--video', cliRenderedMp4, '--timeline', cliTimelineOut],
+      { cwd: REPO_ROOT, timeout: 60000 }
+    );
+    const revJson = JSON.parse(revStdout);
+    assert.equal(revJson.ok, true);
   } finally {
     await rm(workDir, { recursive: true, force: true });
+  }
+});
+
+test('moveFileAtomic copies to <dest>.tmp then renames atomically on EXDEV and CI workflow sets timeout + read permissions', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-atomic-'));
+  try {
+    const src = join(dir, 'src.bin');
+    const dest = join(dir, 'nested', 'dest.bin');
+    await writeFile(src, 'atomic-payload');
+
+    const opsLog = [];
+    let firstRename = true;
+    await moveFileAtomic(src, dest, {
+      rename: async (from, to) => {
+        opsLog.push(['rename', from, to]);
+        if (firstRename) {
+          firstRename = false;
+          const err = Error('cross-device link not permitted');
+          err.code = 'EXDEV';
+          throw err;
+        }
+        const { rename: realRename } = await import('node:fs/promises');
+        return realRename(from, to);
+      },
+      copyFile: async (from, to) => {
+        opsLog.push(['copyFile', from, to]);
+        const { copyFile: realCopy } = await import('node:fs/promises');
+        return realCopy(from, to);
+      },
+    });
+
+    assert.equal(await readFile(dest, 'utf8'), 'atomic-payload');
+    assert.equal(opsLog.length, 3);
+    assert.equal(opsLog[0][0], 'rename');
+    assert.equal(opsLog[1][0], 'copyFile');
+    assert.ok(opsLog[1][2].startsWith(`${dest}.`) && opsLog[1][2].endsWith('.tmp'));
+    assert.equal(opsLog[2][0], 'rename');
+    assert.equal(opsLog[2][1], opsLog[1][2]);
+    assert.equal(opsLog[2][2], dest);
+    assert.equal(screenToRender(100, 100, 1440, 900, 2560, 1440).x, 288);
+
+    const ciYaml = await readFile(join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+    assert.match(ciYaml, /permissions:\s*\n\s*contents:\s*read/);
+    assert.match(ciYaml, /timeout-minutes:\s*20/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

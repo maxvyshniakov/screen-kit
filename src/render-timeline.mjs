@@ -14,10 +14,10 @@ import {
 } from '@remotion/renderer';
 import { assertValidTimeline } from './timeline.mjs';
 import { probeVideo } from './video.mjs';
-import { computeFrameScene } from './remotion/layout.mjs';
+import { computeFrameScene, screenToRender } from './remotion/layout.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
 
-export { computeFrameScene };
+export { computeFrameScene, screenToRender };
 
 export const RENDER_PROFILES = ['web-loop', 'youtube-master'];
 const POSTER_FORMATS = new Set(['png', 'webp']);
@@ -405,14 +405,26 @@ async function prepareStagedTimeline(timeline, baseDir, publicDir) {
   return staged;
 }
 
-async function moveFileAtomic(source, destination) {
-  await mkdir(dirname(destination), { recursive: true });
+export async function moveFileAtomic(source, destination, fsOps = {}) {
+  const mkdirFn = fsOps.mkdir ?? mkdir;
+  const renameFn = fsOps.rename ?? rename;
+  const copyFileFn = fsOps.copyFile ?? copyFile;
+  const rmFn = fsOps.rm ?? rm;
+
+  await mkdirFn(dirname(destination), { recursive: true });
   try {
-    await rename(source, destination);
+    await renameFn(source, destination);
   } catch (error) {
     if (error?.code !== 'EXDEV') throw error;
-    await copyFile(source, destination);
-    await rm(source, { force: true });
+    const tempDest = `${destination}.${randomUUID().slice(0, 8)}.tmp`;
+    try {
+      await copyFileFn(source, tempDest);
+      await renameFn(tempDest, destination);
+      await rmFn(source, { force: true });
+    } catch (copyError) {
+      await rmFn(tempDest, { force: true }).catch(() => {});
+      throw copyError;
+    }
   }
 }
 
@@ -504,9 +516,12 @@ export async function renderTimeline({
     }
 
     const hasAudio = stagedTimeline.audio.tracks.length > 0;
-    const renderedOutputs = [];
+    const stagedOutputs = [];
 
     for (const target of plan.targets) {
+      if (signal?.aborted) {
+        throw Error('Timeline render aborted');
+      }
       const inputProps = {
         timeline: stagedTimeline,
         output: {
@@ -551,17 +566,20 @@ export async function renderTimeline({
           throw Error(`Poster render produced invalid image for ${target.id}`);
         }
         const bytes = await readFile(tempFile);
-        await moveFileAtomic(tempFile, target.file);
-        renderedOutputs.push({
-          id: target.id,
-          role: target.role,
-          format: target.format,
-          file: target.file,
-          width: meta.width,
-          height: meta.height,
-          frame,
-          bytes: bytes.length,
-          sha256: sha256(bytes),
+        stagedOutputs.push({
+          tempFile,
+          destination: target.file,
+          record: {
+            id: target.id,
+            role: target.role,
+            format: target.format,
+            file: target.file,
+            width: meta.width,
+            height: meta.height,
+            frame,
+            bytes: bytes.length,
+            sha256: sha256(bytes),
+          },
         });
       } else {
         const crf = target.codec === 'vp9' ? 24 : 18;
@@ -572,6 +590,7 @@ export async function renderTimeline({
           codec: target.codec,
           crf,
           pixelFormat: 'yuv420p',
+          colorSpace: 'bt709',
           muted: !hasAudio,
           outputLocation: tempFile,
           puppeteerInstance: browser,
@@ -586,24 +605,41 @@ export async function renderTimeline({
           throw Error(`Remotion produced an empty video for ${target.id} (${target.format})`);
         }
         const bytes = await readFile(tempFile);
-        await moveFileAtomic(tempFile, target.file);
-        renderedOutputs.push({
-          id: target.id,
-          role: target.role,
-          format: target.format,
-          file: target.file,
-          codec: info.codec,
-          width: info.width,
-          height: info.height,
-          frames: info.frames,
-          duration: info.duration,
-          fps: info.fps,
-          audio: info.audio,
-          loop: target.loop,
-          bytes: bytes.length,
-          sha256: sha256(bytes),
+        stagedOutputs.push({
+          tempFile,
+          destination: target.file,
+          record: {
+            id: target.id,
+            role: target.role,
+            format: target.format,
+            file: target.file,
+            codec: info.codec,
+            width: info.width,
+            height: info.height,
+            frames: info.frames,
+            duration: info.duration,
+            fps: info.fps,
+            audio: info.audio,
+            colorSpace: info.colorSpace,
+            colorPrimaries: info.colorPrimaries,
+            colorTransfer: info.colorTransfer,
+            colorRange: info.colorRange,
+            loop: target.loop,
+            bytes: bytes.length,
+            sha256: sha256(bytes),
+          },
         });
       }
+    }
+
+    if (signal?.aborted) {
+      throw Error('Timeline render aborted');
+    }
+
+    const renderedOutputs = [];
+    for (const item of stagedOutputs) {
+      await moveFileAtomic(item.tempFile, item.destination);
+      renderedOutputs.push(item.record);
     }
 
     return {
