@@ -19,30 +19,41 @@ export async function probeVideo(file) {
     frames: Number(stream.nb_read_frames ?? stream.nb_frames),
     duration: Number(info.format.duration ?? stream.duration),
     fps: fraction(stream.avg_frame_rate), codec: stream.codec_name,
-    audio: info.streams.some(s => s.codec_type === 'audio') };
+    audio: info.streams.some(s => s.codec_type === 'audio'),
+    colorPrimaries: stream.color_primaries ?? null,
+    colorTransfer: stream.color_transfer ?? null,
+    colorSpace: stream.color_space ?? null,
+    colorRange: stream.color_range ?? null };
 }
 
 /** Encode a real captured take or image sequence. Never records or drives an application. */
-export async function renderVideo({ input, output, fps } = {}) {
+export async function renderVideo({ input, output, fps, colorSpace = 'srgb' } = {}) {
   if (!input || !output) throw Error('video rendering requires input and output paths');
   input = resolve(input);
   output = resolve(output);
   if (input === output) throw Error('video input and output must differ');
   const format = extname(output).slice(1);
   if (!['mp4', 'webm'].includes(format)) throw Error('video output must be .mp4 or .webm');
+  if (!['srgb', 'p3'].includes(colorSpace)) throw Error(`unsupported colorSpace: ${colorSpace}`);
   if (fps !== undefined && !(Number.isFinite(fps) && fps > 0 && fps <= 120)) throw Error('fps must be between 0 and 120');
   const sequence = /%(?:0\d+)?d/.test(input);
   if (!sequence) await access(input);
   await mkdir(dirname(output), { recursive: true });
   const temporary = join(dirname(output), `.${basename(output)}-${randomUUID()}.${format}`);
   const inputOptions = sequence ? ['-framerate', String(fps ?? 1)] : [];
+  const vf = colorSpace === 'p3'
+    ? 'pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
+    : 'pad=ceil(iw/2)*2:ceil(ih/2)*2';
+  const colorFlags = colorSpace === 'p3'
+    ? ['-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709', '-color_range', 'tv']
+    : [];
   const codec = format === 'mp4'
     ? ['-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-movflags', '+faststart']
     : ['-c:v', 'libvpx-vp9', '-crf', '24', '-b:v', '0', '-deadline', 'good'];
   try {
     await exec('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...inputOptions, '-i', input,
-      '-an', '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-pix_fmt', 'yuv420p',
-      ...(fps && !sequence ? ['-r', String(fps)] : []), ...codec, '-threads', '2', temporary],
+      '-an', '-vf', vf, '-pix_fmt', 'yuv420p',
+      ...(fps && !sequence ? ['-r', String(fps)] : []), ...codec, ...colorFlags, '-threads', '2', temporary],
     { timeout: 300000, maxBuffer: 5e6 });
     const info = await probeVideo(temporary);
     if (!info.frames || !(info.duration > 0)) throw Error('encoder produced an empty video');

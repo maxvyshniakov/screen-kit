@@ -27,3 +27,69 @@ test('a real image sequence exports a silent two-second MP4 and WebM', async () 
     }
   } finally { await rm(out, { recursive: true, force: true }); }
 });
+
+test('Display P3 video preserves CICP metadata and P3 vs sRGB red separation in MP4 and WebM', async () => {
+  const out = await mkdtemp(join(tmpdir(), 'screen-kit-video-p3-'));
+  const width = 128;
+  const height = 64;
+  const p3Red = [255, 0, 0];
+  const srgbRed = [234, 51, 35];
+  const rawFrame = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const off = (y * width + x) * 3;
+      const rgb = x < width / 2 ? p3Red : srgbRed;
+      rawFrame[off] = rgb[0];
+      rawFrame[off + 1] = rgb[1];
+      rawFrame[off + 2] = rgb[2];
+    }
+  }
+  try {
+    for (const index of [0, 1]) {
+      await sharp(rawFrame, { raw: { width, height, channels: 3 } })
+        .png()
+        .toFile(join(out, `${index}.png`));
+    }
+    for (const format of ['mp4', 'webm']) {
+      const result = await renderVideo({
+        input: join(out, '%d.png'),
+        output: join(out, `p3.${format}`),
+        fps: 2,
+        colorSpace: 'p3',
+      });
+      const info = await probeVideo(result.file);
+      for (const meta of [result, info]) {
+        assert.equal(meta.colorPrimaries, 'smpte432', `${format} colorPrimaries`);
+        assert.equal(meta.colorTransfer, 'iec61966-2-1', `${format} colorTransfer`);
+        assert.equal(meta.colorSpace, 'bt709', `${format} colorSpace`);
+        assert.equal(meta.colorRange, 'tv', `${format} colorRange`);
+      }
+
+      const decoded = execFileSync('ffmpeg', [
+        '-v', 'error', '-i', result.file,
+        '-vf', 'scale=in_color_matrix=bt709', '-vframes', '1',
+        '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-',
+      ]);
+      assert.equal(decoded.length, width * height * 3);
+      const pick = (x, y) => {
+        const off = (Math.floor(y) * width + Math.floor(x)) * 3;
+        return [decoded[off], decoded[off + 1], decoded[off + 2]];
+      };
+      const left = pick(width * 0.25, height * 0.5);
+      const right = pick(width * 0.75, height * 0.5);
+      for (let c = 0; c < 3; c++) {
+        assert.ok(Math.abs(left[c] - p3Red[c]) <= 3, `${format} p3Red channel ${c}: got ${left}, expected ${p3Red}`);
+        assert.ok(Math.abs(right[c] - srgbRed[c]) <= 3, `${format} srgbRed channel ${c}: got ${right}, expected ${srgbRed}`);
+      }
+      const dist = Math.hypot(left[0] - right[0], left[1] - right[1], left[2] - right[2]);
+      assert.ok(dist >= 55, `${format} P3 vs sRGB red separation (${dist.toFixed(1)}) must remain distinct`);
+    }
+  } finally { await rm(out, { recursive: true, force: true }); }
+});
+
+test('renderVideo rejects unknown colorSpace values', async () => {
+  await assert.rejects(
+    renderVideo({ input: '/tmp/in.png', output: '/tmp/out.mp4', colorSpace: 'rec2020' }),
+    /unsupported colorSpace/,
+  );
+});
