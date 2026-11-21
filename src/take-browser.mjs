@@ -919,6 +919,12 @@ export async function createBrowserTakeCapture({
             const [tx, ty] = await resolveTargetPoint(page, targetSpec, [pointerX, pointerY]);
             const button = rawStep.button ?? 'left';
             if (!BUTTONS.has(button)) throw Error(`Invalid mouse button: ${button}`);
+            const clickModifiers = [];
+            for (const mod of rawStep.modifiers ?? []) {
+              const canonical = MODIFIER_MAP.get(String(mod).toLowerCase());
+              if (!canonical) throw Error(`Unsupported click modifier: ${mod}`);
+              if (!clickModifiers.includes(canonical)) clickModifiers.push(canonical);
+            }
             const clickCount = rawStep.clickCount ?? (kind === 'dblclick' ? 2 : 1);
             if (rawStep.move !== false) {
               await glideTo(tx, ty, rawStep.moveDuration, rawStep.arc ?? 0.08);
@@ -928,13 +934,18 @@ export async function createBrowserTakeCapture({
               await page.mouse.move(pointerX, pointerY);
               emit({ type: 'pointermove', x: pointerX, y: pointerY });
             }
-            for (let c = 1; c <= clickCount; c++) {
-              await page.mouse.down({ button, clickCount: c });
-              emit({ type: 'pointerdown', x: pointerX, y: pointerY, button });
-              await sleep((rawStep.hold ?? 0.07) * 1000);
-              await page.mouse.up({ button, clickCount: c });
-              emit({ type: 'pointerup', x: pointerX, y: pointerY, button });
-              if (c < clickCount) await sleep(50);
+            for (const mod of clickModifiers) await page.keyboard.down(mod);
+            try {
+              for (let c = 1; c <= clickCount; c++) {
+                await page.mouse.down({ button, clickCount: c });
+                emit({ type: 'pointerdown', x: pointerX, y: pointerY, button });
+                await sleep((rawStep.hold ?? 0.07) * 1000);
+                await page.mouse.up({ button, clickCount: c });
+                emit({ type: 'pointerup', x: pointerX, y: pointerY, button });
+                if (c < clickCount) await sleep(50);
+              }
+            } finally {
+              for (const mod of [...clickModifiers].reverse()) await page.keyboard.up(mod);
             }
             break;
           }
@@ -1023,40 +1034,80 @@ export async function createBrowserTakeCapture({
                 emit({ type: 'pointermove', x: pointerX, y: pointerY });
               }
             }
-            const deltaX = rawStep.deltaX ?? rawStep.xDistance ?? 0;
-            const deltaY = rawStep.deltaY ?? rawStep.yDistance ?? 0;
-            if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
-              throw Error('Scroll gesture requires finite deltaX/deltaY');
-            }
-            const distance = Math.hypot(deltaX, deltaY);
-            const speed = rawStep.speed ?? (
-              rawStep.duration && rawStep.duration > 0 && distance > 0
-                ? Math.max(50, Math.round(distance / rawStep.duration))
-                : 900
-            );
             const gestureStartT = nowT();
             const beforeGestureMs = performance.now();
-            await activeCdp.send('Input.synthesizeScrollGesture', {
-              x: pointerX,
-              y: pointerY,
-              xDistance: deltaX,
-              yDistance: deltaY,
-              gestureSourceType: rawStep.gestureSourceType ?? 'mouse',
-              speed,
-              preventFling: rawStep.preventFling ?? false,
-              ...(rawStep.repeatCount !== undefined ? { repeatCount: rawStep.repeatCount } : {}),
-              ...(rawStep.repeatDelayMs !== undefined ? { repeatDelayMs: rawStep.repeatDelayMs } : {}),
-            });
+            let emittedDeltaX = 0;
+            let emittedDeltaY = 0;
+
+            if (gestureKind === 'pinch') {
+              const scaleFactor = rawStep.scaleFactor ?? 1.25;
+              if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
+                throw Error(`Invalid pinch scaleFactor: ${scaleFactor}`);
+              }
+              const totalDy = rawStep.deltaY ?? roundCoord(-Math.log(scaleFactor) * 240);
+              const totalDx = rawStep.deltaX ?? 0;
+              if (!Number.isFinite(totalDx) || !Number.isFinite(totalDy)) {
+                throw Error('Pinch gesture requires finite deltaX/deltaY or positive scaleFactor');
+              }
+              const pinchSteps = Math.max(1, Math.round(rawStep.steps ?? 8));
+              const plannedDurSec = rawStep.duration ?? 0.28;
+              const stepDelayMs = pinchSteps > 1 ? (plannedDurSec * 1000) / pinchSteps : 0;
+              for (let s = 0; s < pinchSteps; s++) {
+                const stepDx = Number((totalDx / pinchSteps).toFixed(2));
+                const stepDy = Number((totalDy / pinchSteps).toFixed(2));
+                await activeCdp.send('Input.dispatchMouseEvent', {
+                  type: 'mouseWheel',
+                  x: pointerX,
+                  y: pointerY,
+                  deltaX: stepDx,
+                  deltaY: stepDy,
+                  modifiers: 2,
+                });
+                if (stepDelayMs > 0 && s + 1 < pinchSteps) await sleep(stepDelayMs);
+              }
+              emittedDeltaX = totalDx;
+              emittedDeltaY = totalDy;
+            } else {
+              const deltaX = rawStep.deltaX ?? rawStep.xDistance ?? 0;
+              const deltaY = rawStep.deltaY ?? rawStep.yDistance ?? 0;
+              if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
+                throw Error('Scroll gesture requires finite deltaX/deltaY');
+              }
+              const distance = Math.hypot(deltaX, deltaY);
+              const speed = rawStep.speed ?? (
+                rawStep.duration && rawStep.duration > 0 && distance > 0
+                  ? Math.max(50, Math.round(distance / rawStep.duration))
+                  : 900
+              );
+              await activeCdp.send('Input.synthesizeScrollGesture', {
+                x: pointerX,
+                y: pointerY,
+                xDistance: deltaX,
+                yDistance: deltaY,
+                gestureSourceType: rawStep.gestureSourceType ?? 'mouse',
+                speed,
+                preventFling: rawStep.preventFling ?? false,
+                ...(rawStep.repeatCount !== undefined ? { repeatCount: rawStep.repeatCount } : {}),
+                ...(rawStep.repeatDelayMs !== undefined ? { repeatDelayMs: rawStep.repeatDelayMs } : {}),
+              });
+              emittedDeltaX = deltaX;
+              emittedDeltaY = deltaY;
+            }
+
             const measuredGestureDur = roundTime((performance.now() - beforeGestureMs) / 1000);
-            const gestureDuration = rawStep.duration !== undefined ? roundTime(rawStep.duration) : measuredGestureDur;
+            const gestureDuration = Math.max(
+              0.05,
+              rawStep.duration !== undefined ? roundTime(rawStep.duration) : measuredGestureDur,
+            );
             emit({
               t: gestureStartT,
               type: 'gesture',
               kind: gestureKind,
               x: pointerX,
               y: pointerY,
-              deltaX,
-              deltaY,
+              deltaX: emittedDeltaX,
+              deltaY: emittedDeltaY,
+              ...(gestureKind === 'pinch' && rawStep.scaleFactor !== undefined ? { scaleFactor: rawStep.scaleFactor } : {}),
               duration: gestureDuration,
             });
             // Keep timestamp cursor at or after actual completion of the blocking CDP gesture.

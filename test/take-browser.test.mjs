@@ -275,7 +275,11 @@ test('quality mode configures Retina 2x headful occlusion flags, hands back focu
     recipe: {
       url: 'https://example.test/demo',
       duration: 0.05,
-      steps: [{ type: 'key', key: 'Meta+k', label: 'open palette' }],
+      steps: [
+        { type: 'click', x: 300, y: 220, move: false, modifiers: ['Shift', 'Meta'], hold: 0.01, label: 'modified click' },
+        { type: 'gesture', kind: 'pinch', x: 420, y: 300, scaleFactor: 1.3, steps: 2, duration: 0.04, label: 'pinch zoom' },
+        { type: 'key', key: 'Meta+k', label: 'open palette' },
+      ],
     },
   });
 
@@ -300,6 +304,8 @@ test('quality mode configures Retina 2x headful occlusion flags, hands back focu
   assert.equal(result.width, 2880);
   assert.equal(result.height, 1620);
   assert.equal(result.fps, 60);
+  assert.ok(trace.some((e) => e.step === 'cdp:Input.dispatchMouseEvent' && e.params?.modifiers === 2));
+  assert.ok(result.eventTrackData.events.some((e) => e.type === 'gesture' && e.kind === 'pinch' && e.duration >= 0.04));
   assert.equal(closed, true);
   assert.equal(cdpDetached, true);
 });

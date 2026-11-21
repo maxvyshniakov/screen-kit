@@ -557,7 +557,18 @@ function buildCursorFromEventTrack(eventTrack) {
     } else if (event.type === 'drag' && Array.isArray(event.from) && Array.isArray(event.to)) {
       samples.push({ t: event.t, x: event.from[0], y: event.from[1], pressed: true, visible: true });
       if (isFiniteNumber(event.duration)) {
-        samples.push({ t: event.t + event.duration, x: event.to[0], y: event.to[1], pressed: false, visible: true });
+        const endT = event.t + event.duration;
+        const hasInteriorPointer = eventTrack.events.some(
+          (other) =>
+            isObject(other) &&
+            (other.type === 'pointermove' || other.type === 'pointerup') &&
+            isFiniteNumber(other.t) &&
+            other.t > event.t &&
+            other.t <= endT
+        );
+        if (!hasInteriorPointer) {
+          samples.push({ t: endT, x: event.to[0], y: event.to[1], pressed: false, visible: true });
+        }
       }
     }
   }

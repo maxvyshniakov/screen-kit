@@ -290,6 +290,26 @@ test('cursor accuracy check verifies geometric samples and real image-based mark
     assert.equal(failGeo.violations.length, 1);
     assert.ok(failGeo.maxErrorPx > 2);
 
+    // Event-track alignment when drag coexists with interior minimum-jerk pointermove samples
+    const dragEventTrack = {
+      version: 1,
+      captureMode: 'headless',
+      viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+      video: { file: 'drag.mp4', width: 320, height: 180, fps: 30, duration: 1.0, frames: 30 },
+      events: [
+        { t: 0.1, type: 'drag', from: [40, 50], to: [200, 120], duration: 0.35 },
+        { t: 0.11, type: 'pointerdown', x: 40, y: 50, button: 'left' },
+        { t: 0.28, type: 'pointermove', x: 112, y: 84 },
+        { t: 0.48, type: 'pointermove', x: 200, y: 120 },
+        { t: 0.51, type: 'pointerup', x: 200, y: 120, button: 'left' },
+      ],
+    };
+    const dragTimeline = compileTimeline({ eventTrack: dragEventTrack });
+    const dragAlign = verifyCursorAccuracy({ timeline: dragTimeline, eventTrack: dragEventTrack });
+    assert.equal(dragAlign.ok, true);
+    assert.equal(dragAlign.mode, 'event-track-alignment');
+    assert.equal(dragAlign.maxErrorPx, 0);
+
     // 3. End-to-end video cursor marker check (accurate marker passes, 10px drifted marker fails)
     const accurateVideo = join(dir, 'cursor-accurate.mp4');
     const driftedVideo = join(dir, 'cursor-drifted.mp4');
