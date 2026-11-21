@@ -459,6 +459,7 @@ function renderCaptions(captions, hudAnchor, hasKeystrokes) {
             fontSize: 18 * s,
             fontWeight: 500,
             textAlign: 'center',
+            whiteSpace: 'pre-line',
             maxWidth: 720 * s,
           },
         },

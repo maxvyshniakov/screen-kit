@@ -12,6 +12,7 @@ import {
   sampleCursor,
   validateTimeline,
 } from './timeline.mjs';
+import { reviewNarration } from './narration.mjs';
 
 const exec = promisify(execFile);
 
@@ -1298,6 +1299,7 @@ export async function reviewVideo({
   timestamps,
   stillCount = DEFAULT_STILL_COUNT,
   contactSheet: contactSheetOptions = {},
+  narration: narrationOptions,
   multimodal,
 } = {}) {
   if (!video) throw Error('reviewVideo requires a video path');
@@ -1654,6 +1656,42 @@ export async function reviewVideo({
     addCheck('cursor-accuracy', true, `cursor accuracy check skipped (${cursorReport.mode})`, { skipped: true });
   }
 
+  // 6b. Optional narration & caption checks (only when captions/audio tracks are active or explicitly enabled)
+  const hasTimelineCaptions = Boolean(timeline?.overlays?.captions?.enabled);
+  const hasTimelineAudio = Array.isArray(timeline?.audio?.tracks) && timeline.audio.tracks.length > 0;
+  const shouldReviewNarration =
+    narrationOptions?.enabled !== false &&
+    (Boolean(narrationOptions?.enabled) || hasTimelineCaptions || hasTimelineAudio);
+
+  let narrationReport = null;
+  if (shouldReviewNarration) {
+    const narrationBaseDir =
+      narrationOptions?.baseDir ??
+      (typeof timelineInput === 'string' ? dirname(resolve(timelineInput)) : dirname(videoFile));
+    const checkVideoAudio =
+      narrationOptions?.checkVideoAudio ?? (probe.audio || hasTimelineAudio);
+    narrationReport = await reviewNarration({
+      ...(checkVideoAudio ? { video: videoFile } : {}),
+      ...(narrationOptions?.audioFiles ? { audioFiles: narrationOptions.audioFiles } : {}),
+      timeline,
+      ...(narrationOptions?.cues ? { cues: narrationOptions.cues } : {}),
+      ...(narrationOptions?.captionTracks ? { captionTracks: narrationOptions.captionTracks } : {}),
+      ...(narrationOptions?.steps ? { steps: narrationOptions.steps } : {}),
+      ...(narrationOptions?.segments ? { segments: narrationOptions.segments } : {}),
+      totalDuration: probe.duration,
+      baseDir: narrationBaseDir,
+      loudness: narrationOptions?.loudness,
+      captionRules: narrationOptions?.captionRules,
+      stepFit: narrationOptions?.stepFit,
+    });
+    for (const check of narrationReport.checks) {
+      checks.push(check);
+    }
+    for (const finding of narrationReport.findings) {
+      findings.push(finding);
+    }
+  }
+
   const metrics = {
     fileSizeBytes: probe.fileSizeBytes,
     width: probe.width,
@@ -1689,6 +1727,7 @@ export async function reviewVideo({
       maxDiffRatio: baselineReport.maxDiffRatio,
       mismatches: baselineReport.mismatches,
     },
+    ...(narrationReport ? { narration: narrationReport.metrics } : {}),
   };
 
   // 7. Optional multimodal agent review hook (never runs implicitly when disabled or without credentials)
