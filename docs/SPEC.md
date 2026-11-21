@@ -65,13 +65,42 @@ motion or achieved video cadence.
 
 ## Video beyond raw capture
 
-The implemented foundation is real browser recording plus silent MP4/WebM export and reusable
-browser/terminal takes. Edited videos remain a subsequent product increment: a renderer-neutral
-timeline, camera/stage/window composition, cursor/gesture overlays, captions and narration.
-Existing decisions remain: Remotion 4 behind a replaceable renderer, source recipes beside
-consumers, and Straylight's scenario editor as the edited-video benchmark. No hosted publishing,
-YouTube upload, TTS or paid-service activation is implied by a capture command.
+Owner-approved direction, 2026-11-21. Raw browser recording and reusable takes are in place.
+Edited product videos ship in explicit increments behind a replaceable renderer boundary:
 
-Retina timing and P3 video are separate acceptance requirements: the existing research found
-headless 2× capture slower than real background-window capture. Video P3 preservation remains
-unverified. Read the dated research before asserting either property for a new recording.
+### Increment 1: silent edited demo engine
+
+- **Dual capture modes:** `quality` (headful Chromium behind the owner's windows on a Retina
+  display, 2× at 60 fps, with focus handback per [retina-spike.md](research/retina-spike.md))
+  and `headless` (CI and fast checks). Both capture mode and measured duration/frame count/fps
+  are recorded in `run.json`.
+- **Clean takes and event track:** capture the viewport without a baked-in cursor alongside a
+  structured event track (minimum-jerk pointer samples, presses, wheel, CDP trackpad gestures,
+  drag sessions, keys with modifiers, window metadata).
+- **Renderer-neutral timeline:** a versioned JSON timeline describing `stage`, `window` frame
+  (browser chrome, macOS window, device bezel), camera keyframes, screen-space overlay layers
+  (cursor, click ripple, wheel/gesture indicator, finger dots, keystroke pills, captions) and
+  audio track slots.
+- **Renderer:** Remotion 4 invoked headlessly via CLI, reading only the timeline JSON so the
+  renderer can be swapped later without changing recipes or takes. Outputs: web loop
+  (VP9/AV1 WebM, H.264 MP4, poster) and 1440p60 YouTube master.
+- **Automated video review:** deterministic assertions (duration, fps, size, capture gaps,
+  freeze/black detection, cursor within 2 px of event track, camera inside stage, per-step
+  stills, contact sheet and diff against last approved render), plus optional multimodal
+  agent review (Gemini inspecting rendered video and contact sheets for visual/semantic defects).
+- **Benchmarks:** Data Grid (Storybook horizontal rubber-band) as the fast smoke benchmark,
+  followed by Straylight Desktop's scenario editor (palette drag, pan/pinch-zoom, marquee and
+  Shift/⌘ selection, shortcuts, macOS window on stage) as final acceptance.
+
+### Separate and subsequent tracks
+
+- **Display P3 video preservation:** separate spike and acceptance gate; Increment 1 accepts
+  sRGB/BT.709 video first.
+- **Increment 2 — narration and captions:** Gemini TTS via CLI/API as the primary cloud voice
+  provider with local Kokoro as the offline fallback; forced word alignment, Netflix-style
+  captions, `max(action, 0.2 s + speech + 0.4 s)` step timing, and audio/caption review checks.
+- **Non-UI generated assets:** image generation may be used for stage wallpapers, covers and
+  thumbnails. Generative video (e.g., Veo) is excluded from core UI capture; UI footage always
+  comes from real engines.
+- **Publishing:** source recipes stay beside consumers. No hosted publishing, YouTube upload,
+  or paid-service activation is implied by a capture command.
