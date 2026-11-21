@@ -23,3 +23,11 @@ export {
   assertValidTimeline,
   compileTimeline,
 } from './timeline.mjs';
+export {
+  captureBrowserTake,
+  createBrowserTakeCapture,
+  minimumJerk,
+  minimumJerkTrajectory,
+  serializeEventTrack,
+  validateCaptureMode,
+} from './take-browser.mjs';

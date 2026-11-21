@@ -1,0 +1,531 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import test from 'node:test';
+import sharp from 'sharp';
+import { reviewRun } from '../src/review.mjs';
+import { captureRun, hash } from '../src/run.mjs';
+import {
+  CAPTURE_MODES,
+  captureBrowserTake,
+  createMacFocusController,
+  minimumJerk,
+  minimumJerkTrajectory,
+  resolveChromiumExecutable,
+  serializeEventTrack,
+  validateCaptureMode,
+  validateEventTrack,
+} from '../src/take-browser.mjs';
+import { probeVideo } from '../src/video.mjs';
+
+test('validateCaptureMode accepts explicit quality and headless modes and rejects invalid values', () => {
+  assert.deepEqual(CAPTURE_MODES, ['quality', 'headless']);
+  assert.equal(validateCaptureMode('quality'), 'quality');
+  assert.equal(validateCaptureMode('headless'), 'headless');
+
+  for (const invalid of [undefined, null, '', 'auto', 'retina', 'headful', 1, {}]) {
+    assert.throws(() => validateCaptureMode(invalid), /Invalid capture mode/);
+  }
+});
+
+test('minimumJerk profile has zero endpoint speed, midpoint symmetry, and monotonic trajectories', () => {
+  assert.equal(minimumJerk(-0.5), 0);
+  assert.equal(minimumJerk(0), 0);
+  assert.ok(Math.abs(minimumJerk(0.5) - 0.5) < 1e-12);
+  assert.equal(minimumJerk(1), 1);
+  assert.equal(minimumJerk(1.5), 1);
+  assert.throws(() => minimumJerk(Number.NaN), /Invalid minimum-jerk/);
+
+  // Endpoint ease-in / ease-out: first and last steps cover much less distance than middle step.
+  const startStep = minimumJerk(0.05) - minimumJerk(0);
+  const midStep = minimumJerk(0.525) - minimumJerk(0.475);
+  const endStep = minimumJerk(1) - minimumJerk(0.95);
+  assert.ok(midStep > startStep * 10, 'midpoint velocity exceeds ease-in start');
+  assert.ok(midStep > endStep * 10, 'midpoint velocity exceeds ease-out end');
+  assert.ok(Math.abs(startStep - endStep) < 1e-12, 'symmetric ease-in and ease-out');
+
+  const path = minimumJerkTrajectory({
+    from: [100, 200],
+    to: [500, 200],
+    duration: 0.5,
+    sampleRate: 60,
+    startTime: 1.25,
+    arc: 0.1,
+  });
+  assert.equal(path.length, 31); // 0..30 inclusive
+  assert.deepEqual(path[0], { t: 1.25, x: 100, y: 200 });
+  assert.deepEqual(path.at(-1), { t: 1.75, x: 500, y: 200 });
+
+  for (let i = 1; i < path.length; i++) {
+    assert.ok(path[i].t >= path[i - 1].t, 'timestamps are monotonically non-decreasing');
+    assert.ok(path[i].x >= path[i - 1].x, 'x progresses monotonically along horizontal trajectory');
+  }
+  // Positive arc offsets y slightly in the middle before returning to 200.
+  const mid = path[15];
+  assert.ok(mid.y > 205, `expected slight human arc offset, got ${mid.y}`);
+
+  // Straight trajectory (arc: 0) stays strictly on y = 200.
+  const straight = minimumJerkTrajectory({ from: { x: 10, y: 200 }, to: { x: 210, y: 200 }, duration: 0.2, arc: 0 });
+  assert.ok(straight.every((pt) => pt.y === 200));
+
+  // Zero duration returns destination immediately.
+  assert.deepEqual(
+    minimumJerkTrajectory({ from: [10, 20], to: [10, 20], duration: 0, startTime: 0.4 }),
+    [{ t: 0.4, x: 10, y: 20 }],
+  );
+});
+
+test('validateEventTrack and serializeEventTrack enforce Event Track v1 contract', () => {
+  const validTrack = {
+    version: 1,
+    captureMode: 'quality',
+    viewport: { width: 1440, height: 810, deviceScaleFactor: 2 },
+    video: { file: 'take.mp4', width: 2880, height: 1620, fps: 60, duration: 5.2, frames: 312 },
+    startedAt: '2026-11-22T00:00:00.000Z',
+    events: [
+      { t: 0.0, type: 'pointermove', x: 720, y: 405 },
+      { t: 0.5, type: 'pointerdown', x: 400, y: 300, button: 'left' },
+      { t: 0.58, type: 'pointerup', x: 400, y: 300, button: 'left' },
+      { t: 1.2, type: 'wheel', x: 720, y: 405, deltaX: -180, deltaY: 0, phase: 'changed' },
+      { t: 1.4, type: 'gesture', kind: 'scroll', x: 720, y: 405, deltaX: 300, deltaY: 0, duration: 0.35 },
+      { t: 2.0, type: 'drag', from: [200, 300], to: [600, 420], duration: 0.6 },
+      { t: 3.0, type: 'key', key: 'k', modifiers: ['Meta'], action: 'press' },
+      { t: 3.5, type: 'step', index: 0, label: 'drag card' },
+    ],
+  };
+
+  const json = serializeEventTrack(validTrack);
+  assert.ok(json.endsWith('\n'));
+  assert.deepEqual(validateEventTrack(JSON.parse(json)), validTrack);
+
+  // Version & mode checks
+  assert.throws(() => validateEventTrack({ ...validTrack, version: 2 }), /version/);
+  assert.throws(() => validateEventTrack({ ...validTrack, captureMode: 'fast' }), /Invalid capture mode/);
+  assert.throws(() => validateEventTrack({ ...validTrack, startedAt: 'not-a-date' }), /startedAt/);
+
+  // Negative & out-of-order timestamps
+  assert.throws(
+    () => validateEventTrack({ ...validTrack, events: [{ t: -0.01, type: 'pointermove', x: 0, y: 0 }] }),
+    />= 0/,
+  );
+  assert.throws(
+    () => validateEventTrack({
+      ...validTrack,
+      events: [
+        { t: 0.5, type: 'pointermove', x: 10, y: 10 },
+        { t: 0.49, type: 'pointermove', x: 20, y: 20 },
+      ],
+    }),
+    /monotonically non-decreasing/,
+  );
+
+  // Event-specific validation
+  assert.throws(
+    () => validateEventTrack({ ...validTrack, events: [{ t: 0, type: 'pointerdown', x: 1, y: 2, button: 'thumb' }] }),
+    /valid button/,
+  );
+  assert.throws(
+    () => validateEventTrack({ ...validTrack, events: [{ t: 0, type: 'key', key: 'k', modifiers: ['Command'], action: 'press' }] }),
+    /modifiers/,
+  );
+  assert.throws(
+    () => validateEventTrack({ ...validTrack, events: [{ t: 0, type: 'drag', from: [1], to: [2, 3], duration: 0.2 }] }),
+    /drag/,
+  );
+});
+
+test('resolveChromiumExecutable honors overrides and Playwright executable without hardcoded paths', () => {
+  const existing = new Set(['/custom/chrome', '/pw/chrome']);
+  const exists = (p) => existing.has(p);
+
+  assert.equal(
+    resolveChromiumExecutable({
+      executablePath: '/custom/chrome',
+      playwrightChromium: { executablePath: () => '/pw/chrome' },
+      exists,
+    }),
+    '/custom/chrome',
+  );
+
+  assert.equal(
+    resolveChromiumExecutable({
+      env: { SCREEN_KIT_CHROMIUM_PATH: '/custom/chrome' },
+      exists,
+    }),
+    '/custom/chrome',
+  );
+
+  assert.equal(
+    resolveChromiumExecutable({
+      env: {},
+      playwrightChromium: { executablePath: () => '/pw/chrome' },
+      exists,
+    }),
+    '/pw/chrome',
+  );
+
+  assert.throws(
+    () => resolveChromiumExecutable({ executablePath: '/missing/chrome', exists }),
+    /does not exist/,
+  );
+
+  assert.throws(
+    () => resolveChromiumExecutable({
+      env: { PLAYWRIGHT_BROWSERS_PATH: '/nonexistent-pw', AGENT_BROWSER_HOME: '/nonexistent-ab' },
+      playwrightChromium: { executablePath: () => '/missing/pw' },
+      platform: 'linux',
+      exists: () => false,
+    }),
+    /No local Chromium executable found/,
+  );
+});
+
+test('quality mode configures Retina 2x headful occlusion flags, hands back focus, and cleans up', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-quality-unit-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const dummyFrame = await sharp({ create: { width: 8, height: 6, channels: 3, background: '#112233' } }).jpeg().toBuffer();
+  const base64Frame = dummyFrame.toString('base64');
+
+  const trace = [];
+  let closed = false;
+  let cdpDetached = false;
+
+  const focusCalls = [];
+  const focusController = createMacFocusController({
+    platform: 'darwin',
+    runExec: async (cmd, args) => {
+      focusCalls.push([cmd, ...args]);
+      if (args.some((a) => a.includes('frontmostApplication'))) {
+        return { stdout: 'com.mitchellh.ghostty\n' };
+      }
+      return { stdout: 'true\n' };
+    },
+  });
+
+  const mockPlaywright = {
+    chromium: {
+      async launch(opts) {
+        trace.push({ step: 'launch', opts });
+        return {
+          async newContext(ctxOpts) {
+            trace.push({ step: 'newContext', ctxOpts });
+            return {
+              async newPage() {
+                return {
+                  async goto(url) { trace.push({ step: 'goto', url }); },
+                  async evaluate() { return true; },
+                  mouse: {
+                    async move() {},
+                    async down() {},
+                    async up() {},
+                    async wheel() {},
+                  },
+                  keyboard: { async press() {}, async down() {}, async up() {} },
+                };
+              },
+              async newCDPSession() {
+                let listener = null;
+                return {
+                  on(event, fn) { if (event === 'Page.screencastFrame') listener = fn; },
+                  async send(method, params) {
+                    trace.push({ step: `cdp:${method}`, params });
+                    if (method === 'Page.captureScreenshot') return { data: base64Frame };
+                    if (method === 'Page.startScreencast' && listener) {
+                      listener({ data: base64Frame, metadata: { timestamp: 100.0 }, sessionId: 1 });
+                      listener({ data: base64Frame, metadata: { timestamp: 100.0166 }, sessionId: 2 });
+                    }
+                    return {};
+                  },
+                  async detach() { cdpDetached = true; },
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() { closed = true; },
+        };
+      },
+    },
+  };
+
+  const result = await captureBrowserTake({
+    out: join(dir, 'take'),
+    captureMode: 'quality',
+    playwright: mockPlaywright,
+    focusController,
+    encodeFrames: async ({ outputFile, rawFrames }) => {
+      await writeFile(outputFile, Buffer.from('mock-video-bytes'));
+      return {
+        width: 2880,
+        height: 1620,
+        fps: 60,
+        duration: 0.5,
+        frames: 30,
+        measuredFps: 60,
+        capturedFrames: rawFrames.length,
+        codec: 'h264',
+        audio: false,
+      };
+    },
+    recipe: {
+      url: 'https://example.test/demo',
+      duration: 0.05,
+      steps: [{ type: 'key', key: 'Meta+k', label: 'open palette' }],
+    },
+  });
+
+  const launchCall = trace.find((e) => e.step === 'launch');
+  assert.equal(launchCall.opts.headless, false);
+  assert.ok(launchCall.opts.args.includes('--disable-backgrounding-occluded-windows'));
+  assert.ok(launchCall.opts.args.includes('--disable-renderer-backgrounding'));
+
+  const ctxCall = trace.find((e) => e.step === 'newContext');
+  assert.deepEqual(ctxCall.ctxOpts, { viewport: { width: 1440, height: 810 }, deviceScaleFactor: 2 });
+
+  const screencastCall = trace.find((e) => e.step === 'cdp:Page.startScreencast');
+  assert.equal(screencastCall.params.maxWidth, 2880);
+  assert.equal(screencastCall.params.maxHeight, 1620);
+
+  // Focus captured once before launch, then handed back to com.mitchellh.ghostty via JXA argument array.
+  assert.ok(focusCalls.length >= 2);
+  assert.equal(focusCalls[0][0], 'osascript');
+  assert.equal(focusCalls[1].at(-1), 'com.mitchellh.ghostty');
+
+  assert.equal(result.captureMode, 'quality');
+  assert.equal(result.width, 2880);
+  assert.equal(result.height, 1620);
+  assert.equal(result.fps, 60);
+  assert.equal(closed, true);
+  assert.equal(cdpDetached, true);
+});
+
+test('real headless browser captures clean video take, rich event-track.json, and verifiable run.json', {
+  skip: !process.env.SCREEN_KIT_BROWSER_TESTS,
+}, async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'screen-kit-take-browser-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: rgb(18, 28, 45); font: 16px system-ui; overflow: hidden; user-select: none; }
+  #action-btn {
+    position: absolute; left: 40px; top: 30px; width: 160px; height: 70px;
+    background: rgb(180, 40, 40); color: #fff; border: 0; border-radius: 8px; font-size: 16px;
+  }
+  #action-btn:hover { background: rgb(220, 140, 20); }
+  #action-btn:active { transform: scale(0.97); }
+  #card {
+    position: absolute; left: 60px; top: 130px; width: 90px; height: 50px;
+    background: rgb(60, 120, 220); color: #fff; display: flex; align-items: center; justify-content: center; border-radius: 6px;
+  }
+  #scroller {
+    position: absolute; left: 40px; top: 210px; width: 560px; height: 110px;
+    overflow-x: auto; overscroll-behavior-x: contain; background: rgb(35, 45, 65);
+  }
+  #scroller-inner {
+    width: 2200px; height: 100%;
+    background: repeating-linear-gradient(90deg, rgb(50, 70, 100) 0 80px, rgb(90, 130, 180) 80px 160px);
+  }
+</style>
+</head>
+<body>
+  <button id="action-btn">Activate</button>
+  <div id="card">Drag</div>
+  <div id="scroller"><div id="scroller-inner"></div></div>
+  <script>
+    window.__state = { hovered: false, clicked: false, draggedTo: null, wheelEvents: 0, scrolledMax: 0, shortcut: null };
+    const btn = document.getElementById('action-btn');
+    btn.addEventListener('pointerenter', () => { window.__state.hovered = true; });
+    btn.addEventListener('click', () => {
+      window.__state.clicked = true;
+      document.body.style.background = 'rgb(20, 150, 70)';
+    });
+
+    const card = document.getElementById('card');
+    let dragging = false, offsetX = 0, offsetY = 0;
+    card.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      card.setPointerCapture(e.pointerId);
+      const r = card.getBoundingClientRect();
+      offsetX = e.clientX - r.left;
+      offsetY = e.clientY - r.top;
+    });
+    card.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const nx = Math.round(e.clientX - offsetX);
+      const ny = Math.round(e.clientY - offsetY);
+      card.style.left = nx + 'px';
+      card.style.top = ny + 'px';
+      window.__state.draggedTo = [nx, ny];
+    });
+    card.addEventListener('pointerup', () => { dragging = false; });
+
+    const scroller = document.getElementById('scroller');
+    scroller.addEventListener('wheel', () => { window.__state.wheelEvents++; }, { passive: true });
+    scroller.addEventListener('scroll', () => {
+      window.__state.scrolledMax = Math.max(window.__state.scrolledMax, scroller.scrollLeft);
+    }, { passive: true });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.metaKey && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        window.__state.shortcut = 'Meta+k';
+      }
+    });
+  </script>
+</body>
+</html>`;
+
+  const server = createServer((_, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(html);
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  t.after(() => new Promise((done) => server.close(done)));
+  const { port } = server.address();
+  const url = `http://127.0.0.1:${port}/`;
+
+  const out = join(cwd, 'out');
+  const config = {
+    recipes: {
+      demo: {
+        source: 'browser',
+        captureMode: 'headless',
+        format: 'mp4',
+        url,
+        viewport: [640, 360],
+        fps: 30,
+        steps: [
+          { type: 'hover', target: '#action-btn', duration: 0.2, label: 'hover button' },
+          { type: 'click', target: '#action-btn', hold: 0.06, label: 'click button' },
+          { type: 'drag', from: '#card', to: [340, 155], duration: 0.25, label: 'drag card' },
+          { type: 'wheel', target: '#scroller', deltaX: 160, deltaY: 0, phase: 'changed', label: 'wheel scroll' },
+          { type: 'gesture', kind: 'scroll', target: '#scroller', deltaX: -240, deltaY: 0, duration: 0.25, settle: 0.15, label: 'trackpad scroll' },
+          { type: 'key', key: 'k', modifiers: ['Meta'], action: 'press', label: 'command palette' },
+          { type: 'pause', duration: 0.15 },
+          {
+            type: 'eval',
+            eval: `
+              const s = window.__state;
+              if (!s.hovered) throw Error('pointer hover never triggered');
+              if (!s.clicked) throw Error('button click never triggered');
+              if (!s.draggedTo || s.draggedTo[0] < 250) throw Error('card drag did not move card: ' + JSON.stringify(s.draggedTo));
+              if (s.wheelEvents < 1) throw Error('wheel event did not reach scroller');
+              if (s.scrolledMax < 150) throw Error('scroll did not advance scroller: ' + s.scrolledMax);
+              if (s.shortcut !== 'Meta+k') throw Error('Meta+k shortcut did not fire');
+              if (document.getElementById('__demo_cursor')) throw Error('cursor must not be baked into DOM');
+            `,
+          },
+        ],
+      },
+    },
+  };
+
+  const report = await captureRun({ config, cwd, out });
+  assert.equal(report.status, 'complete');
+
+  const entry = report.recipes.demo;
+  assert.equal(entry.status, 'complete');
+  assert.equal(entry.captureMode, 'headless');
+  assert.equal(entry.requestedFps, 30);
+  assert.equal(entry.fps, 30);
+  assert.ok(entry.measuredFps > 0, `expected positive measuredFps, got ${entry.measuredFps}`);
+  assert.ok(entry.capturedFrames >= 2, `expected multiple captured screencast frames, got ${entry.capturedFrames}`);
+  assert.equal(entry.width, 640);
+  assert.equal(entry.height, 360);
+  assert.ok(entry.frames >= 30);
+  assert.ok(entry.duration >= 1.0);
+
+  // Verify video take and event-track.json files and hashes in run.json.
+  const exportedVideo = join(out, entry.file);
+  const takeVideo = join(out, entry.take);
+  const eventTrackFile = join(out, entry.eventTrack);
+
+  assert.equal(entry.sha256, hash(await readFile(exportedVideo)));
+  assert.equal(entry.takeSha256, hash(await readFile(takeVideo)));
+  assert.equal(entry.eventTrackSha256, hash(await readFile(eventTrackFile)));
+  assert.equal(entry.inputs.length, 2);
+
+  const probe = await probeVideo(exportedVideo);
+  assert.deepEqual([probe.width, probe.height], [640, 360]);
+  assert.equal(probe.audio, false);
+
+  // Verify first frame (dark blue background) vs last frame (green background after real click) and no baked cursor.
+  const firstPixel = execFileSync('ffmpeg', [
+    '-v', 'error', '-i', exportedVideo, '-vf', 'crop=10:10:580:20,scale=1:1', '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-',
+  ]);
+  const lastPixel = execFileSync('ffmpeg', [
+    '-v', 'error', '-sseof', '-0.15', '-i', exportedVideo, '-vf', 'crop=10:10:580:20,scale=1:1', '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-',
+  ]);
+  assert.ok(firstPixel[2] > firstPixel[1], `initial background should be dark blue, got rgb(${firstPixel[0]},${firstPixel[1]},${firstPixel[2]})`);
+  assert.ok(lastPixel[1] > 110 && lastPixel[0] < 60, `final background should turn green after click, got rgb(${lastPixel[0]},${lastPixel[1]},${lastPixel[2]})`);
+
+  // Validate Event Track v1 contents.
+  const track = validateEventTrack(JSON.parse(await readFile(eventTrackFile, 'utf8')));
+  assert.equal(track.version, 1);
+  assert.equal(track.captureMode, 'headless');
+  assert.deepEqual(track.viewport, { width: 640, height: 360, deviceScaleFactor: 1 });
+  assert.equal(track.video.file, 'take.mp4');
+  assert.equal(track.video.width, 640);
+  assert.equal(track.video.height, 360);
+
+  const types = new Set(track.events.map((e) => e.type));
+  for (const expectedType of ['pointermove', 'pointerdown', 'pointerup', 'drag', 'wheel', 'gesture', 'key', 'step']) {
+    assert.ok(types.has(expectedType), `event-track missing event type: ${expectedType}`);
+  }
+
+  // Review passes on valid manifest, and fails if event-track.json is tampered with.
+  const manifest = join(out, 'run.json');
+  const reviewOk = await reviewRun({ manifest });
+  assert.equal(reviewOk.ok, true);
+
+  const tampered = { ...track, events: [{ t: 2, type: 'pointermove', x: 0, y: 0 }, { t: 1, type: 'pointermove', x: 1, y: 1 }] };
+  const tamperedText = JSON.stringify(tampered);
+  await writeFile(eventTrackFile, tamperedText);
+  const reviewHashFail = await reviewRun({ manifest });
+  assert.equal(reviewHashFail.ok, false);
+});
+
+test('failed browser take closes Chromium cleanly and leaves an inspectable failed manifest', {
+  skip: !process.env.SCREEN_KIT_BROWSER_TESTS,
+}, async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'screen-kit-take-fail-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+
+  const pageFile = join(cwd, 'page.html');
+  await writeFile(pageFile, '<!doctype html><body><p>ready</p></body>');
+  const out = join(cwd, 'out');
+
+  await assert.rejects(
+    captureRun({
+      cwd,
+      out,
+      config: {
+        recipes: {
+          broken: {
+            source: 'browser',
+            captureMode: 'headless',
+            format: 'mp4',
+            url: pathToFileURL(pageFile).href,
+            viewport: [320, 240],
+            steps: [{ type: 'click', target: '#does-not-exist' }],
+          },
+        },
+      },
+    }),
+    /matched no visible element/,
+  );
+
+  const report = JSON.parse(await readFile(join(out, 'run.json'), 'utf8'));
+  assert.equal(report.status, 'failed');
+  assert.equal(report.recipes.broken.status, 'failed');
+  assert.match(report.recipes.broken.error, /matched no visible element/);
+});

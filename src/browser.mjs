@@ -11,7 +11,7 @@ const exec = promisify(execFile);
 const sleep = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
 
 // Trusted recipe expressions run in the page with these geometric helpers.
-const helpers = String.raw`
+export const helpers = String.raw`
 const $ = {
   one: (selector, root = document) => root.querySelector(selector),
   all: (selector, root = document) => [...root.querySelectorAll(selector)],

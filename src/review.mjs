@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import sharp from 'sharp';
 import { hash } from './run.mjs';
+import { validateEventTrack } from './take-browser.mjs';
 import { probeVideo } from './video.mjs';
 
 function inspectCast(bytes) {
@@ -38,6 +39,16 @@ export async function reviewRun({ manifest } = {}) {
       for (const input of artifact.inputs ?? []) {
         const data = await readFile(resolve(dirname(manifest), input.file));
         check(`${name}:take`, hash(data) === input.sha256, 'source take hash matches the capture manifest');
+      }
+      if (artifact.eventTrack) {
+        const trackBytes = await readFile(resolve(dirname(manifest), artifact.eventTrack));
+        if (artifact.eventTrackSha256) {
+          check(`${name}:eventTrackHash`, hash(trackBytes) === artifact.eventTrackSha256, 'event-track.json hash matches the capture manifest');
+        }
+        const track = validateEventTrack(JSON.parse(trackBytes.toString('utf8')));
+        if (artifact.captureMode) {
+          check(`${name}:captureMode`, track.captureMode === artifact.captureMode, `event-track captureMode ${track.captureMode}; expected ${artifact.captureMode}`);
+        }
       }
       let actual;
       const cast = extname(file) === '.cast';

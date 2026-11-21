@@ -5,10 +5,13 @@
   "type": "module",
   "packageManager": "bun@1.4.4",
   "description": "Reproducible browser and terminal screenshots, animations and recordings.",
-  "bin": { "screen-kit": "src/cli.mjs" },
+  "bin": {
+    "screen-kit": "src/cli.mjs"
+  },
   "exports": {
     ".": "./src/index.mjs",
     "./browser": "./src/browser.mjs",
+    "./take-browser": "./src/take-browser.mjs",
     "./images": "./src/images.mjs",
     "./catalog": "./src/catalog.mjs",
     "./terminal": "./src/terminal.mjs",
@@ -21,10 +24,16 @@
     "prepare": "repo-kit hooks install",
     "test": "node --test test/*.test.mjs",
     "check:kit": "repo-kit check",
-    "check:syntax": "node --check src/cli.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/timeline.mjs && node --check src/video.mjs",
+    "check:syntax": "node --check src/cli.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/timeline.mjs && node --check src/video.mjs && node --check src/browser.mjs && node --check src/take-browser.mjs",
     "verify": "repo-kit verify"
   },
-  "dependencies": { "sharp": "0.35.5", "@xterm/headless": "6.0.0" },
-  "devDependencies": { "@maxvyshniakov/repo-kit": "file:./vendor/repo-kit-0.2.2.tgz" },
+  "dependencies": {
+    "@xterm/headless": "6.0.0",
+    "playwright-core": "1.64.1",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@maxvyshniakov/repo-kit": "file:./vendor/repo-kit-0.2.2.tgz"
+  },
   "license": "MIT"
 }
