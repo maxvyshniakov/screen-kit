@@ -18,6 +18,12 @@ export {
 export { renderVideo, probeVideo } from './video.mjs';
 export { renderTerminalTake } from './terminal.mjs';
 export {
+  RENDER_PROFILES,
+  resolveRenderTargets,
+  renderTimeline,
+  computeFrameScene,
+} from './render-timeline.mjs';
+export {
   TIMELINE_VERSION,
   EVENT_TRACK_VERSION,
   CAPTURE_MODES,

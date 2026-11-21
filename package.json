@@ -15,6 +15,7 @@
     "./images": "./src/images.mjs",
     "./catalog": "./src/catalog.mjs",
     "./review-video": "./src/review-video.mjs",
+    "./render-timeline": "./src/render-timeline.mjs",
     "./terminal": "./src/terminal.mjs",
     "./timeline": "./src/timeline.mjs",
     "./video": "./src/video.mjs",
@@ -25,12 +26,18 @@
     "prepare": "repo-kit hooks install",
     "test": "node --test test/*.test.mjs",
     "check:kit": "repo-kit check",
-    "check:syntax": "node --check src/cli.mjs && node --check src/index.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/review-video.mjs && node --check src/timeline.mjs && node --check src/video.mjs && node --check src/browser.mjs && node --check src/take-browser.mjs",
+    "check:syntax": "node --check src/cli.mjs && node --check src/index.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/review-video.mjs && node --check src/timeline.mjs && node --check src/video.mjs && node --check src/browser.mjs && node --check src/take-browser.mjs && node --check src/render-timeline.mjs && node --check src/remotion/layout.mjs && node --check src/remotion/TimelineComposition.mjs && node --check src/remotion/Root.mjs && node --check src/remotion/index.mjs",
     "verify": "repo-kit verify"
   },
   "dependencies": {
+    "@remotion/bundler": "4.0.545",
+    "@remotion/cli": "4.0.545",
+    "@remotion/renderer": "4.0.545",
     "@xterm/headless": "6.0.0",
     "playwright-core": "1.64.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "remotion": "4.0.545",
     "sharp": "0.35.5"
   },
   "devDependencies": {

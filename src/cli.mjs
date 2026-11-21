@@ -13,15 +13,18 @@ screen-kit review --manifest out/run.json [--out review.json]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--cursor-threshold 2] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30]
+screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master] [--poster-format png]
 
 Recipes live in the consumer repository. Browser and terminal capture use real input.
 Capture writes run.json, original takes and exported files; review verifies their hashes,
-dimensions, frame counts, duration, capture checkpoints and rendered video quality. render exports silent MP4/WebM.
+dimensions, frame counts, duration, capture checkpoints and rendered video quality. render exports silent MP4/WebM
+or renders a timeline.json composition headlessly via Remotion 4.
 `;
 
 const [command = 'help', ...args] = process.argv.slice(2);
 const allowed = new Set([
   'config', 'cwd', 'only', 'out', 'manifest', 'input', 'fps', 'at',
+  'profile', 'profiles', 'poster-format',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir', 'cursor-threshold', 'multimodal', 'provider',
 ]);
 const booleanFlags = new Set(['multimodal']);
@@ -76,7 +79,18 @@ try {
     } else if (command === 'render') {
       if (!flags.input || !flags.out) throw Error('render requires --input and --out');
       let result;
-      if(extname(flags.input)==='.cast') {
+      if (extname(flags.input) === '.json') {
+        const { renderTimeline } = await import('./render-timeline.mjs');
+        const profileArg = flags.profiles ?? flags.profile;
+        result = await renderTimeline({
+          timeline: resolve(flags.input),
+          out: resolve(flags.out),
+          ...(profileArg ? { profiles: profileArg } : {}),
+          ...(flags['poster-format'] ? { posterFormat: flags['poster-format'] } : {}),
+          ...(flags.fps ? { fps: Number(flags.fps) } : {}),
+          ...(flags.at ? { posterTime: Number(flags.at) } : {}),
+        });
+      } else if(extname(flags.input)==='.cast') {
         const {renderTerminalTake}=await import('./terminal.mjs');
         const output=resolve(flags.out),extension=extname(output);
         result=await renderTerminalTake({cast:resolve(flags.input),out:dirname(output),name:basename(output,extension),
