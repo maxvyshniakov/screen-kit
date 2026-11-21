@@ -12,6 +12,7 @@
     "./images": "./src/images.mjs",
     "./catalog": "./src/catalog.mjs",
     "./terminal": "./src/terminal.mjs",
+    "./timeline": "./src/timeline.mjs",
     "./video": "./src/video.mjs",
     "./package.json": "./package.json"
   },
@@ -20,7 +21,7 @@
     "prepare": "repo-kit hooks install",
     "test": "node --test test/*.test.mjs",
     "check:kit": "repo-kit check",
-    "check:syntax": "node --check src/cli.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/video.mjs",
+    "check:syntax": "node --check src/cli.mjs && node --check src/run.mjs && node --check src/review.mjs && node --check src/timeline.mjs && node --check src/video.mjs",
     "verify": "repo-kit verify"
   },
   "dependencies": { "sharp": "0.35.5", "@xterm/headless": "6.0.0" },
