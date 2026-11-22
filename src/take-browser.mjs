@@ -275,7 +275,7 @@ export function resolveChromiumExecutable({
         '/Applications/Chromium.app/Contents/MacOS/Chromium',
       ]
     : platform === 'linux'
-      ? ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+      ? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable']
       : [];
 
   for (const sysPath of systemPaths) {

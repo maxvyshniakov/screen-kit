@@ -188,6 +188,39 @@ test('resolveChromiumExecutable honors overrides and Playwright executable witho
   );
 });
 
+test('Linux Chromium fallback paths and non-darwin focus controller no-op', async () => {
+  const linuxSystemPaths = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+
+  for (const candidate of linuxSystemPaths) {
+    assert.equal(
+      resolveChromiumExecutable({
+        env: { PLAYWRIGHT_BROWSERS_PATH: '/nonexistent-pw', AGENT_BROWSER_HOME: '/nonexistent-ab' },
+        playwrightChromium: { executablePath: () => '/missing/pw' },
+        platform: 'linux',
+        exists: (p) => p === candidate,
+      }),
+      candidate,
+    );
+  }
+
+  let execCalled = false;
+  const focus = createMacFocusController({
+    platform: 'linux',
+    runExec: async () => {
+      execCalled = true;
+      return { stdout: '' };
+    },
+  });
+  assert.equal(await focus.captureFrontmost(), null);
+  assert.equal(await focus.restoreFrontmost('com.example.App'), false);
+  assert.equal(execCalled, false);
+});
+
 test('quality mode configures Retina 2x headful occlusion flags, hands back focus, and cleans up', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'screen-kit-quality-unit-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

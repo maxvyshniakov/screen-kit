@@ -8,7 +8,8 @@ products; screen-kit owns capture, saved takes, export and verification. The pac
 ```sh
 bun install
 bun link
-brew install agg webp ffmpeg   # terminal exports and video; Python 3 is also required
+brew install agg webp ffmpeg   # macOS: terminal exports and video; Python 3 is also required
+# Linux (Debian/Ubuntu): sudo apt-get install -y ffmpeg webp python3, plus agg >= 1.9 from github.com/asciinema/agg/releases
 screen-kit --help
 ```
 

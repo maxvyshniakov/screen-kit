@@ -14,9 +14,11 @@ concurrency:
 
 jobs:
   verify:
-    # macos-latest provides python3 out of the box and installs ffmpeg, webp (gif2webp),
-    # and agg (>= 1.9) cleanly via Homebrew without custom binary downloads.
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -32,9 +34,29 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install system tools
+      - name: Install system tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg webp agg
+
+      - name: Install system tools (Linux)
+        if: runner.os == 'Linux'
         run: |
-          brew install ffmpeg webp agg
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg webp python3
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2t64 || \
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2
+          curl -fsSL https://github.com/asciinema/agg/releases/latest/download/agg-x86_64-unknown-linux-gnu -o /tmp/agg
+          chmod +x /tmp/agg
+          sudo mv /tmp/agg /usr/local/bin/agg
+
+      - name: Verify system tools
+        run: |
           python3 --version
           agg --version
           ffmpeg -version | head -n 1
