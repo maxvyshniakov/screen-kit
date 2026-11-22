@@ -56,10 +56,13 @@
   "files": ["src", "fonts", "tools/build-symbol-font.py", "LICENSE", "README.md"],
   "scripts": {
     "prepare": "repo-kit hooks install",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=4 test/*.test.mjs",
     "check:kit": "repo-kit check",
+    "check:changelogs": "repo-kit check-changelogs",
     "check:syntax": "node --check src/cli.mjs && node --check src/index.mjs && node --check src/run.mjs && node --check src/images.mjs && node --check src/review.mjs && node --check src/review-video.mjs && node --check src/narration.mjs && node --check src/audio-mix.mjs && node --check src/assets.mjs && node --check src/publish.mjs && node --check src/timeline.mjs && node --check src/timeline-scene.mjs && node --check src/video.mjs && node --check src/browser.mjs && node --check src/take-browser.mjs && node --check src/render-timeline.mjs && node --check src/remotion/layout.mjs && node --check src/remotion/TimelineComposition.mjs && node --check src/remotion/Root.mjs && node --check src/remotion/index.mjs && node --check src/internal/media.mjs && node --check src/internal/fs-paths.mjs && node --check src/internal/google-genai.mjs",
-    "verify": "repo-kit verify"
+    "verify": "repo-kit verify",
+    "release": "repo-kit release",
+    "release:publish": "repo-kit publish"
   },
   "dependencies": {
     "@remotion/bundler": "4.0.545",
@@ -73,7 +76,7 @@
     "sharp": "0.35.5"
   },
   "devDependencies": {
-    "@maxvyshniakov/repo-kit": "file:./vendor/repo-kit-0.2.2.tgz"
+    "@maxvyshniakov/repo-kit": "0.6.0"
   },
   "license": "MIT"
 }
