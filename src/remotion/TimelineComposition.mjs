@@ -316,7 +316,7 @@ function renderTopChromeBar(windowChrome) {
 }
 
 function renderCursorOverlay(cursor) {
-  if (!cursor) return null;
+  if (!cursor || cursor.hidden || cursor.color === 'transparent') return null;
   const combinedScale = cursor.scale * cursor.pressScale;
 
   if (cursor.style === 'dot') {
@@ -391,7 +391,7 @@ function renderCursorOverlay(cursor) {
         style: { display: 'block', overflow: 'visible' },
       },
       h('path', {
-        d: 'M1 1L1 23.2L6.6 18.1L10.7 27.4L14.3 25.8L10.2 16.6L17.8 16.6L1 1Z',
+        d: 'M0 0L0 22.2L5.6 17.1L9.7 26.4L13.3 24.8L9.2 15.6L16.8 15.6L0 0Z',
         fill,
         stroke,
         strokeWidth: 1.8,
@@ -399,8 +399,8 @@ function renderCursorOverlay(cursor) {
       }),
       cursor.pressed
         ? h('circle', {
-            cx: 2,
-            cy: 2,
+            cx: 1,
+            cy: 1,
             r: 4.5,
             fill: 'rgba(56, 189, 248, 0.85)',
           })
@@ -493,24 +493,50 @@ function renderGesturePill(gesture) {
   );
 }
 
+function estimatePortraitHudRows(gestures, keystrokes, safeWidth, scale) {
+  const pillWidths = [
+    ...gestures.map((g) => (96 + [...String(g.label ?? '')].length * 16) * scale),
+    ...keystrokes.map((ks) => (64 + [...String(ks.label ?? '')].length * 16) * scale),
+  ];
+  const totalPills = pillWidths.length;
+  if (totalPills === 0) return 0;
+  if (totalPills === 1) return 1;
+
+  const gap = 10 * scale;
+  let simulatedRows = 1;
+  let rowWidth = 0;
+  for (const w of pillWidths) {
+    if (rowWidth > 0 && rowWidth + gap + w > safeWidth) {
+      simulatedRows += 1;
+      rowWidth = w;
+    } else {
+      rowWidth = rowWidth > 0 ? rowWidth + gap + w : w;
+    }
+  }
+  return Math.max(simulatedRows, Math.min(totalPills, Math.ceil((totalPills + 1) / 2)));
+}
+
 function renderBottomHud(gestures, keystrokes, hudAnchor) {
   if (!gestures.length && !keystrokes.length) return null;
   const s = (keystrokes[0] ?? gestures[0]).scale;
+  const safeWidth = hudAnchor.width ?? hudAnchor.maxWidth ?? 720 * s;
+  const safeLeft = hudAnchor.safeMargins?.left ?? hudAnchor.left ?? hudAnchor.centerX - safeWidth / 2;
   return h(
     'div',
     {
       'data-overlay': keystrokes.length ? 'keystrokes' : 'gesture-hud',
       style: {
         position: 'absolute',
-        left: hudAnchor.centerX,
+        left: safeLeft,
         top: hudAnchor.bottomY,
-        transform: 'translate(-50%, -100%)',
+        width: safeWidth,
+        transform: 'translateY(-100%)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         flexWrap: hudAnchor.portrait ? 'wrap' : 'nowrap',
-        ...(hudAnchor.maxWidth ? { maxWidth: hudAnchor.maxWidth } : {}),
         gap: 10 * s,
+        boxSizing: 'border-box',
         pointerEvents: 'none',
       },
     },
@@ -532,25 +558,47 @@ function renderBottomHud(gestures, keystrokes, hudAnchor) {
   );
 }
 
-function renderCaptions(captions, hudAnchor, hasKeystrokes) {
+function renderCaptions(captions, hudAnchor, gestures = [], keystrokes = []) {
   if (!captions.length) return null;
   const s = captions[0].scale;
-  const extraOffset = hasKeystrokes ? (hudAnchor.portrait ? 64 : 54) * s : 0;
-  const maxWidth = hudAnchor.maxWidth ?? 720 * s;
+  const safeWidth = hudAnchor.width ?? hudAnchor.maxWidth ?? 720 * s;
+  const safeLeft = hudAnchor.safeMargins?.left ?? hudAnchor.left ?? hudAnchor.centerX - safeWidth / 2;
+  const gestureList = Array.isArray(gestures) ? gestures : [];
+  const keystrokeList = Array.isArray(keystrokes) ? keystrokes : [];
+  const hasHud = Array.isArray(gestures)
+    ? gestureList.length > 0 || keystrokeList.length > 0
+    : Boolean(gestures);
+
+  let extraOffset = 0;
+  if (hasHud) {
+    if (hudAnchor.portrait) {
+      const hudRows = Array.isArray(gestures)
+        ? estimatePortraitHudRows(gestureList, keystrokeList, safeWidth, s)
+        : 1;
+      const rawOffset = (64 + Math.max(0, hudRows - 1) * 64) * s;
+      const minTopY = (hudAnchor.safeMargins?.top ?? 120) + 80 * s;
+      extraOffset = Math.min(rawOffset, Math.max(64 * s, hudAnchor.bottomY - minTopY));
+    } else {
+      extraOffset = 54 * s;
+    }
+  }
+
   return h(
     'div',
     {
       'data-overlay': 'captions',
       style: {
         position: 'absolute',
-        left: hudAnchor.centerX,
+        left: safeLeft,
         top: hudAnchor.bottomY - extraOffset,
-        transform: 'translate(-50%, -100%)',
+        width: safeWidth,
+        transform: 'translateY(-100%)',
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
-        maxWidth,
+        justifyContent: 'center',
         gap: 6 * s,
+        boxSizing: 'border-box',
         pointerEvents: 'none',
       },
     },
@@ -571,7 +619,7 @@ function renderCaptions(captions, hudAnchor, hasKeystrokes) {
             whiteSpace: 'pre-line',
             overflowWrap: 'break-word',
             boxSizing: 'border-box',
-            maxWidth,
+            maxWidth: '100%',
           },
         },
         caption.text
@@ -777,7 +825,8 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
       renderCaptions(
         overlays.captions,
         overlays.hudAnchor,
-        overlays.keystrokes.length > 0 || overlays.gestures.length > 0
+        overlays.gestures,
+        overlays.keystrokes
       ),
       renderBottomHud(overlays.gestures, overlays.keystrokes, overlays.hudAnchor),
       renderCursorOverlay(overlays.cursor)

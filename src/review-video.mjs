@@ -806,7 +806,12 @@ function selectCursorVerificationTimes({
   renderHeight,
 }) {
   const candidates = [];
-  const kfs = Array.isArray(timeline?.camera?.keyframes) ? timeline.camera.keyframes : [];
+  const kfs =
+    renderHeight > renderWidth && Array.isArray(timeline?.camera?.verticalKeyframes) && timeline.camera.verticalKeyframes.length > 0
+      ? timeline.camera.verticalKeyframes
+      : Array.isArray(timeline?.camera?.keyframes)
+        ? timeline.camera.keyframes
+        : [];
   for (let i = 0; i < kfs.length; i += 1) {
     if (isFiniteNumber(kfs[i]?.t)) candidates.push({ t: kfs[i].t, priority: 3 });
     if (i + 1 < kfs.length && isFiniteNumber(kfs[i + 1]?.t) && kfs[i + 1].t > kfs[i].t) {
@@ -840,7 +845,9 @@ function selectCursorVerificationTimes({
       renderWidth,
       renderHeight
     );
-    const dotRadius = Math.ceil(9 * (renderPt.cameraState?.renderScale || 1)) + 2;
+    const cameraState = renderPt.cameraState;
+    const cursorScale = cameraState?.portrait ? renderWidth / 720 : (cameraState?.outputScale || 1);
+    const dotRadius = Math.ceil(9 * cursorScale) + 2;
     const insideVisibleFrame =
       renderPt.x >= 1 &&
       renderPt.x <= renderWidth - 1 &&
@@ -1041,8 +1048,11 @@ export async function verifyRenderedCursorPixels({
   const baseVerificationTimeline = structuredClone(timeline);
   baseVerificationTimeline.overlays = {
     cursor: {
-      enabled: false,
+      enabled: true,
+      hidden: true,
       style: 'dot',
+      color: 'transparent',
+      shadow: false,
       samples: effectiveSamples,
     },
     ripples: [],
@@ -1530,7 +1540,8 @@ function normalizeMultimodalFinding(item) {
 }
 
 async function callGeminiMultimodalReview({ payload, multimodal }) {
-  const apiKey = multimodal.apiKey ?? process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  const rawApiKey = multimodal.apiKey ?? process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
   if (!apiKey) {
     return {
       ran: false,
@@ -1865,10 +1876,43 @@ export async function reviewVideo({
 
   // 1. ffprobe metadata & file size validation
   const probe = await probeVideoDetails(videoFile);
-  const profileExpected =
-    outputId && Array.isArray(timeline?.outputs)
-      ? timeline.outputs.find((o) => o.id === outputId) ?? {}
-      : {};
+  let profileExpected = {};
+  if (outputId) {
+    const fromTimeline = Array.isArray(timeline?.outputs)
+      ? timeline.outputs.find((o) => o.id === outputId)
+      : null;
+    if (fromTimeline) {
+      profileExpected = { ...fromTimeline };
+    } else if (outputId === 'shorts') {
+      profileExpected = {
+        width: 1080,
+        height: 1920,
+        fps: Math.max(timeline?.take?.fps ?? 60, 60),
+        codec: 'h264',
+      };
+    } else if (outputId === 'youtube-master') {
+      profileExpected = {
+        width: 2560,
+        height: 1440,
+        fps: Math.max(timeline?.take?.fps ?? 60, 60),
+        codec: 'h264',
+      };
+    } else if (outputId === 'web-loop' && timeline?.camera) {
+      profileExpected = {
+        width: Math.round(timeline.camera.outputWidth),
+        height: Math.round(timeline.camera.outputHeight),
+        fps: timeline?.take?.fps,
+      };
+    }
+    const isMp4Video = videoFile.toLowerCase().endsWith('.mp4');
+    if (isMp4Video && profileExpected.format === 'webm') {
+      profileExpected.codec = 'h264';
+    } else if (profileExpected.codec === 'libx264') {
+      profileExpected.codec = 'h264';
+    } else if (profileExpected.codec === 'libvpx-vp9') {
+      profileExpected.codec = 'vp9';
+    }
+  }
   const mergedExpected = { ...profileExpected, ...expected };
 
   const minBytes = mergedExpected.minBytes ?? 1;

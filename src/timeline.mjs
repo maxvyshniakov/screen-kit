@@ -34,6 +34,7 @@ export const CURSOR_STYLES = ['macos', 'pointer', 'dot', 'ring'];
 export const MOUSE_BUTTONS = ['left', 'right', 'middle'];
 export const GESTURE_KINDS = ['wheel', 'scroll', 'pinch', 'pan', 'swipe', 'drag', 'touch'];
 export const OUTPUT_FORMATS = ['mp4', 'webm', 'png', 'webp'];
+export const SAFE_OUTPUT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 export const AUDIO_TRACK_KINDS = ['narration', 'sfx', 'music'];
 export const STEP_CAMERA_FOCUSES = ['target', 'pointer', 'window'];
 export const DEFAULT_STEP_CAMERA_LEAD = 0.85;
@@ -973,6 +974,9 @@ export function validateTimeline(timeline) {
       if (cursor.shadow !== undefined && typeof cursor.shadow !== 'boolean') {
         errors.push('timeline.overlays.cursor.shadow must be a boolean');
       }
+      if (cursor.hidden !== undefined && typeof cursor.hidden !== 'boolean') {
+        errors.push('timeline.overlays.cursor.hidden must be a boolean');
+      }
       if (!Array.isArray(cursor.samples)) {
         errors.push('timeline.overlays.cursor.samples must be an array');
       } else {
@@ -1135,13 +1139,20 @@ export function validateTimeline(timeline) {
   } else if (!Array.isArray(timeline.audio.tracks)) {
     errors.push('timeline.audio.tracks must be an array');
   } else {
+    const seenAudioIds = new Set();
     timeline.audio.tracks.forEach((track, i) => {
       const prefix = `timeline.audio.tracks[${i}]`;
       if (!isObject(track)) {
         errors.push(`${prefix} must be an object`);
         return;
       }
-      if (!isNonEmptyString(track.id)) errors.push(`${prefix}.id must be a non-empty string`);
+      if (!isNonEmptyString(track.id)) {
+        errors.push(`${prefix}.id must be a non-empty string`);
+      } else if (seenAudioIds.has(track.id)) {
+        errors.push(`${prefix}.id (${track.id}) must be unique`);
+      } else {
+        seenAudioIds.add(track.id);
+      }
       if (!AUDIO_TRACK_KINDS.includes(track.kind)) {
         errors.push(`${prefix}.kind must be one of ${AUDIO_TRACK_KINDS.join(', ')}`);
       }
@@ -1166,6 +1177,10 @@ export function validateTimeline(timeline) {
       }
       if (!isNonEmptyString(output.id)) {
         errors.push(`${prefix}.id must be a non-empty string`);
+      } else if (!SAFE_OUTPUT_ID_RE.test(output.id) || output.id.includes('..') || /[/\\\0]/.test(output.id)) {
+        errors.push(
+          `${prefix}.id (${output.id}) must match /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/ and must not contain ".."`
+        );
       } else if (seenIds.has(output.id)) {
         errors.push(`${prefix}.id (${output.id}) must be unique`);
       } else {
@@ -1642,6 +1657,7 @@ function compileOverlays(events, recipeOverlays, duration) {
         style: cursorCfg.style ?? 'macos',
         ...(cursorCfg.color !== undefined ? { color: cursorCfg.color } : {}),
         ...(cursorCfg.shadow !== undefined ? { shadow: cursorCfg.shadow } : {}),
+        ...(cursorCfg.hidden !== undefined ? { hidden: cursorCfg.hidden } : {}),
         samples: cursorSamples,
       },
       ripples,

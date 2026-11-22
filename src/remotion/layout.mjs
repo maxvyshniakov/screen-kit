@@ -603,6 +603,7 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, ca
       style: timeline.overlays.cursor.style ?? 'macos',
       ...(timeline.overlays.cursor.color ? { color: timeline.overlays.cursor.color } : {}),
       ...(timeline.overlays.cursor.shadow !== undefined ? { shadow: timeline.overlays.cursor.shadow } : {}),
+      ...(timeline.overlays.cursor.hidden !== undefined ? { hidden: timeline.overlays.cursor.hidden } : {}),
       viewportX: rawCursor.x,
       viewportY: rawCursor.y,
       screenX: projected.screenX,
@@ -696,7 +697,7 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, ca
   if (timeline.overlays?.captions?.enabled) {
     const primaryTrack = timeline.overlays.captions.tracks?.[0];
     for (const [index, cue] of (primaryTrack?.cues ?? []).entries()) {
-      if (t >= cue.start && t <= cue.end && cue.text.trim().length > 0) {
+      if (t >= cue.start && t < cue.end && cue.text.trim().length > 0) {
         captions.push({
           key: `caption-${index}-${cue.start}`,
           text: cue.text,
@@ -714,6 +715,8 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, ca
     const safeTop = Math.round(effectiveRenderHeight * (120 / 1920));
     const safeWidth = Math.max(120, effectiveRenderWidth - safeLeft - safeRight);
     hudAnchor = {
+      left: safeLeft,
+      width: safeWidth,
       centerX: safeLeft + safeWidth / 2,
       bottomY: effectiveRenderHeight - safeBottom,
       maxWidth: safeWidth,
@@ -726,10 +729,16 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, ca
       portrait: true,
     };
   } else {
+    const centerX = offsetX + logicalWidth / 2;
+    const maxWidth = 720 * overlayScale;
+    const safeWidth = Math.max(120, Math.min(effectiveRenderWidth, maxWidth));
+    const safeLeft = centerX - safeWidth / 2;
     hudAnchor = {
-      centerX: offsetX + logicalWidth / 2,
+      left: safeLeft,
+      width: safeWidth,
+      centerX,
       bottomY: offsetY + logicalHeight - 40 * overlayScale,
-      maxWidth: 720 * overlayScale,
+      maxWidth,
       portrait: false,
     };
   }

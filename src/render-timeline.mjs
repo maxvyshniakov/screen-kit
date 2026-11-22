@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { access, copyFile, link, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import { bundle } from '@remotion/bundler';
@@ -12,7 +12,7 @@ import {
   renderStill,
   selectComposition,
 } from '@remotion/renderer';
-import { assertValidTimeline } from './timeline.mjs';
+import { SAFE_OUTPUT_ID_RE, assertValidTimeline } from './timeline.mjs';
 import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
 import { computeFrameScene, projectViewportToRender, screenToRender } from './remotion/layout.mjs';
@@ -29,6 +29,45 @@ const REMOTION_ENTRY = fileURLToPath(new URL('./remotion/index.mjs', import.meta
 
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 const evenDimension = (value) => Math.max(2, Math.round(value / 2) * 2);
+
+function assertSafeOutputId(id, label = 'output.id') {
+  if (
+    typeof id !== 'string' ||
+    !SAFE_OUTPUT_ID_RE.test(id) ||
+    id.includes('..') ||
+    /[/\\\0]/.test(id)
+  ) {
+    throw Error(
+      `Invalid ${label} "${String(id)}": must match /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/ without ".." or path separators`
+    );
+  }
+  return id;
+}
+
+function assertSafeStillFilename(filename, label = 'filename') {
+  if (typeof filename !== 'string' || filename.trim().length === 0) {
+    throw Error(`${label} must be a non-empty string`);
+  }
+  if (
+    /[/\\\0]/.test(filename) ||
+    filename === '.' ||
+    filename === '..' ||
+    filename.includes('..')
+  ) {
+    throw Error(`${label} must not contain "..", path separators, or null bytes: ${filename}`);
+  }
+  return filename;
+}
+
+function assertPathInsideDir(filePath, baseDir, label = 'output path') {
+  const resolvedBase = resolve(baseDir);
+  const resolvedFile = resolve(filePath);
+  const rel = relative(resolvedBase, resolvedFile);
+  if (!rel || rel === '.' || rel === '..' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw Error(`${label} escapes base directory (${resolvedBase}): ${filePath}`);
+  }
+  return resolvedFile;
+}
 
 function normalizeRemotionCodec(codec, format) {
   if (format === 'webm') {
@@ -157,13 +196,16 @@ export function resolveRenderTargets({
     }
 
     const targetFps = fps ?? baseSpec.fps ?? timeline.take.fps;
+    const singleOutDir = dirname(file);
+    assertPathInsideDir(file, singleOutDir, 'output file');
     if (ext === 'png' || ext === 'webp') {
+      const stillId = assertSafeOutputId(baseSpec.id ?? 'poster', 'output.id');
       return {
         mode: 'file',
-        outDir: dirname(file),
+        outDir: singleOutDir,
         targets: [
           {
-            id: baseSpec.id ?? 'poster',
+            id: stillId,
             role: 'poster',
             kind: 'still',
             format: ext,
@@ -177,14 +219,15 @@ export function resolveRenderTargets({
       };
     }
 
+    const videoId = assertSafeOutputId(baseSpec.id ?? ext, 'output.id');
     const width = evenDimension(baseSpec.width ?? timeline.camera.outputWidth);
     const height = evenDimension(baseSpec.height ?? timeline.camera.outputHeight);
     return {
       mode: 'file',
-      outDir: dirname(file),
+      outDir: singleOutDir,
       targets: [
         {
-          id: baseSpec.id ?? ext,
+          id: videoId,
           role: 'video',
           kind: 'video',
           format: ext,
@@ -215,6 +258,7 @@ export function resolveRenderTargets({
 
   const targets = [];
   for (const spec of specs) {
+    assertSafeOutputId(spec.id, 'output.id');
     const targetFps = fps ?? spec.fps ?? timeline.take.fps;
     if (spec.id === 'web-loop') {
       const width = evenDimension(spec.width ?? timeline.camera.outputWidth);
@@ -366,6 +410,10 @@ export function resolveRenderTargets({
         file: join(targetDir, `${spec.id}-poster.${posterFormat}`),
       });
     }
+  }
+
+  for (const target of targets) {
+    assertPathInsideDir(target.file, targetDir, 'render target file');
   }
 
   return { mode: 'directory', outDir: targetDir, targets };
@@ -594,10 +642,12 @@ export async function renderTimeline({
         logLevel,
       });
 
-      const tempFile = join(
+      const tempFile = assertPathInsideDir(
+        join(tempOutputsDir, `${target.id}-${target.role}-${randomUUID()}.${target.format}`),
         tempOutputsDir,
-        `${target.id}-${target.role}-${randomUUID()}.${target.format}`
+        'temp render output'
       );
+      assertPathInsideDir(target.file, plan.outDir, 'render output file');
 
       if (target.kind === 'still') {
         const maxFrame = Math.max(0, composition.durationInFrames - 1);
@@ -746,7 +796,8 @@ export async function renderTimelineStills({
   const variantEntries = variants && typeof variants === 'object' && !Array.isArray(variants)
     ? Object.entries(variants)
     : [['default', baseTimeline]];
-  for (const [, variantTimeline] of variantEntries) {
+  for (const [variantId, variantTimeline] of variantEntries) {
+    assertSafeOutputId(variantId, 'variant id');
     assertValidTimeline(variantTimeline);
   }
 
@@ -754,6 +805,18 @@ export async function renderTimelineStills({
   const renderHeight = evenDimension(height ?? baseTimeline.camera.outputHeight);
   const renderFps = Math.max(1, Math.round(fps ?? baseTimeline.take.fps ?? 30));
   const targetOutDir = resolve(cwd ?? process.cwd(), outDir);
+
+  for (let i = 0; i < requests.length; i += 1) {
+    const req = requests[i];
+    if (!req || typeof req !== 'object') {
+      throw Error(`requests[${i}] must be an object`);
+    }
+    const reqVariantId = req.variant ?? 'default';
+    assertSafeOutputId(reqVariantId, `requests[${i}].variant`);
+    const candidateFilename = req.filename ?? `${reqVariantId}-${String(i).padStart(3, '0')}.png`;
+    assertSafeStillFilename(candidateFilename, `requests[${i}].filename`);
+    assertPathInsideDir(join(targetOutDir, candidateFilename), targetOutDir, `requests[${i}] output file`);
+  }
 
   const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
   await mkdir(scratchBase, { recursive: true });
@@ -842,8 +905,15 @@ export async function renderTimelineStills({
         ? req.frame
         : Math.floor(Math.max(0, Number(req.t ?? 0)) * composition.fps + 1e-9);
       const frame = Math.min(maxFrame, Math.max(0, requestedFrame));
-      const filename = req.filename ?? `${variantId}-${String(i).padStart(3, '0')}.png`;
-      const tempStillFile = join(tempOutputsDir, `${String(i).padStart(3, '0')}-${filename}`);
+      const filename = assertSafeStillFilename(
+        req.filename ?? `${variantId}-${String(i).padStart(3, '0')}.png`,
+        `requests[${i}].filename`
+      );
+      const tempStillFile = assertPathInsideDir(
+        join(tempOutputsDir, `${String(i).padStart(3, '0')}-${filename}`),
+        tempOutputsDir,
+        `requests[${i}] temp still file`
+      );
 
       await renderStill({
         serveUrl,
@@ -863,7 +933,11 @@ export async function renderTimelineStills({
         throw Error(`Still render produced invalid image for ${filename}`);
       }
       const bytes = await readFile(tempStillFile);
-      const destination = join(targetOutDir, filename);
+      const destination = assertPathInsideDir(
+        join(targetOutDir, filename),
+        targetOutDir,
+        `requests[${i}] still output file`
+      );
       stagedStills.push({
         tempFile: tempStillFile,
         destination,

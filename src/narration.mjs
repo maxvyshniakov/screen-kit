@@ -418,7 +418,7 @@ async function defaultKokoroRunner({
   try {
     await exec(
       cliCommand,
-      ['--text', text, '--voice', voice, '--lang', langCode, '--speed', String(speed), '--output', outputFile],
+      [`--text=${text}`, '--voice', voice, '--lang', langCode, '--speed', String(speed), '--output', outputFile],
       { timeout: timeoutMs, maxBuffer: 10e6, env }
     );
     return { runtime: cliCommand };
@@ -435,7 +435,7 @@ async function defaultKokoroRunner({
     await exec(
       python,
       ['-c', KOKORO_PYTHON_SCRIPT, text, outputFile, voice, langCode, String(speed)],
-      { timeout: timeoutMs, maxBuffer: 10e6 }
+      { timeout: timeoutMs, maxBuffer: 10e6, env }
     );
     return { runtime: `${python}:kokoro` };
   } catch (pyError) {
@@ -1354,7 +1354,24 @@ export async function alignWithGemini({
       : Array.isArray(parsed?.segments)
         ? parsed.segments
         : [];
-  const rawTimings = rawList.map(normalizeRawWordTiming).filter(Boolean);
+  let rawTimings = rawList.map(normalizeRawWordTiming).filter(Boolean);
+
+  if (effectiveDuration > 0 && rawTimings.length > 0) {
+    const maxRawEnd = Math.max(...rawTimings.map((t) => t.end));
+    if (maxRawEnd > effectiveDuration * 2) {
+      const rescaledMs = rawTimings.map((t) => ({
+        ...t,
+        start: t.start / 1000,
+        end: t.end / 1000,
+      }));
+      const maxRescaledEnd = Math.max(...rescaledMs.map((t) => t.end));
+      if (maxRescaledEnd > 0 && maxRescaledEnd <= effectiveDuration * 2) {
+        rawTimings = rescaledMs;
+      } else {
+        rawTimings = [];
+      }
+    }
+  }
 
   if (!(effectiveDuration > 0) && rawTimings.length > 0) {
     effectiveDuration = Math.max(0.05, rawTimings[rawTimings.length - 1].end);
@@ -1398,12 +1415,15 @@ export async function alignAudioWords({
   duration,
   startOffset = 0,
   aligner = 'auto',
+  provider,
+  allowCloudAuto = true,
   language = 'en',
   apiKey,
   fetchImpl,
   runner,
   executable,
   model,
+  geminiModel,
   env = process.env,
   timeoutMs = 120000,
   signal,
@@ -1501,8 +1521,18 @@ export async function alignAudioWords({
     }
   }
 
-  const resolvedKey = apiKey ?? env?.GEMINI_API_KEY ?? env?.GOOGLE_API_KEY;
-  if (isNonEmptyString(resolvedKey) && (Buffer.isBuffer(audioBuffer) || isNonEmptyString(audioFile))) {
+  const canUseCloudInAuto = allowCloudAuto !== false && provider !== 'kokoro';
+  const resolvedKey = canUseCloudInAuto ? (apiKey ?? env?.GEMINI_API_KEY ?? env?.GOOGLE_API_KEY) : null;
+  if (
+    canUseCloudInAuto &&
+    isNonEmptyString(resolvedKey) &&
+    (Buffer.isBuffer(audioBuffer) || isNonEmptyString(audioFile))
+  ) {
+    const autoGeminiModel =
+      geminiModel ??
+      (isNonEmptyString(model) && !model.includes('/') && !model.includes('\\') && !model.endsWith('.bin')
+        ? model
+        : undefined);
     try {
       const geminiRes = await alignWithGemini({
         audioFile,
@@ -1513,7 +1543,7 @@ export async function alignAudioWords({
         startOffset,
         language,
         apiKey: resolvedKey,
-        ...(model ? { model } : {}),
+        ...(autoGeminiModel ? { model: autoGeminiModel } : {}),
         ...(fetchImpl ? { fetchImpl } : {}),
         env,
         signal,
@@ -2073,6 +2103,21 @@ export async function buildNarrationTracks({
     if (!Array.isArray(updatedTimeline.steps) || updatedTimeline.steps.length === 0) {
       updatedTimeline.steps = scheduledSteps.map(({ t, index, label }) => ({ t, index, label }));
     }
+    const maxAudioEnd = primaryAudioTracks.reduce(
+      (maxEnd, track) => Math.max(maxEnd, round(track.start + (track.duration ?? 0), 4)),
+      round(cursor, 4)
+    );
+    if (isObject(updatedTimeline.take) && isFiniteNumber(updatedTimeline.take.duration)) {
+      if (maxAudioEnd > updatedTimeline.take.duration) {
+        updatedTimeline.take.duration = maxAudioEnd;
+        if (isFiniteNumber(updatedTimeline.take.fps) && updatedTimeline.take.fps > 0) {
+          updatedTimeline.take.frames = Math.max(
+            updatedTimeline.take.frames ?? 1,
+            Math.round(maxAudioEnd * updatedTimeline.take.fps)
+          );
+        }
+      }
+    }
     assertValidTimeline(updatedTimeline);
   }
 
@@ -2129,14 +2174,18 @@ async function padTakeVideoWithHolds({
   const minSlice = Math.max(0.02, 1.05 / targetFps);
   const format = extname(outputVideo).toLowerCase() === '.webm' ? 'webm' : 'mp4';
 
-  // Collect internal hold points (0 < cut < srcDuration)
+  // Collect lead hold (cut < minSlice) and internal hold points (minSlice <= cut <= srcDuration - minSlice)
   const internalHolds = [];
+  let leadHold = 0;
   let sumInternalPad = 0;
   for (let i = 0; i < scheduledSteps.length - 1; i += 1) {
     const step = scheduledSteps[i];
     if (!(step.padDuration > 1e-3)) continue;
     const cut = Math.max(0, Math.min(srcDuration, step.origEnd));
-    if (cut >= minSlice && cut <= srcDuration - minSlice) {
+    if (cut < minSlice) {
+      leadHold = round(leadHold + step.padDuration, 6);
+      sumInternalPad += step.padDuration;
+    } else if (cut <= srcDuration - minSlice) {
       const prev = internalHolds[internalHolds.length - 1];
       if (prev && Math.abs(cut - prev.cut) < minSlice) {
         prev.hold = round(prev.hold + step.padDuration, 6);
@@ -2166,8 +2215,12 @@ async function padTakeVideoWithHolds({
 
   try {
     if (internalHolds.length === 0) {
+      const tpadArgs = [
+        ...(leadHold > 1e-4 ? [`start_mode=clone:start_duration=${leadHold.toFixed(6)}`] : []),
+        `stop_mode=clone:stop_duration=${tailHold.toFixed(6)}`,
+      ].join(':');
       const vf = [
-        `tpad=stop_mode=clone:stop_duration=${tailHold.toFixed(6)}`,
+        `tpad=${tpadArgs}`,
         `fps=${targetFps}`,
         'pad=ceil(iw/2)*2:ceil(ih/2)*2',
       ].join(',');
@@ -2200,9 +2253,14 @@ async function padTakeVideoWithHolds({
       const filterParts = [];
       const concatInputs = [];
       slices.forEach((slice, idx) => {
-        const padChain = slice.hold > 1e-4
-          ? `,tpad=stop_mode=clone:stop_duration=${slice.hold.toFixed(6)}`
-          : '';
+        const tpadParts = [];
+        if (idx === 0 && leadHold > 1e-4) {
+          tpadParts.push(`start_mode=clone:start_duration=${leadHold.toFixed(6)}`);
+        }
+        if (slice.hold > 1e-4) {
+          tpadParts.push(`stop_mode=clone:stop_duration=${slice.hold.toFixed(6)}`);
+        }
+        const padChain = tpadParts.length > 0 ? `,tpad=${tpadParts.join(':')}` : '';
         filterParts.push(
           `[0:v]trim=start=${slice.start.toFixed(6)}:end=${slice.end.toFixed(6)},setpts=PTS-STARTPTS${padChain}[v${idx}]`
         );
@@ -2591,24 +2649,27 @@ export async function narrateTimeline({
   }
 
   // Resolve ordered step descriptors with merged narration metadata
+  const hasExplicitRecipe = recipeInput !== undefined && recipeInput !== null;
   let rawStepEntries = [];
   if (Array.isArray(baseTimeline.steps) && baseTimeline.steps.length > 0) {
     rawStepEntries = baseTimeline.steps.map((tlStep, idx) => {
       const stepIndex = Number.isInteger(tlStep.index) ? tlStep.index : idx;
       const evStep = eventStepsByIndex.get(stepIndex);
       const recStep = isObject(recipeSteps[stepIndex]) ? recipeSteps[stepIndex] : null;
-      const narration =
-        tlStep.narration ??
-        evStep?.narration ??
-        recStep?.narration ??
-        recStep?.say;
+      const recNarration = recStep?.narration ?? recStep?.say;
+      const narration = hasExplicitRecipe
+        ? (recNarration ?? tlStep.narration ?? evStep?.narration)
+        : (tlStep.narration ?? evStep?.narration ?? recNarration);
+      const label = hasExplicitRecipe
+        ? (recStep?.label ?? tlStep.label ?? evStep?.label ?? `step-${stepIndex}`)
+        : (tlStep.label ?? evStep?.label ?? recStep?.label ?? `step-${stepIndex}`);
       return {
         index: stepIndex,
         t: tlStep.t,
-        label: tlStep.label ?? evStep?.label ?? recStep?.label ?? `step-${stepIndex}`,
+        label,
         narration,
-        audioFile: tlStep.audioFile ?? recStep?.audioFile,
-        wordTimings: tlStep.wordTimings ?? recStep?.wordTimings,
+        audioFile: hasExplicitRecipe ? (recStep?.audioFile ?? tlStep.audioFile) : (tlStep.audioFile ?? recStep?.audioFile),
+        wordTimings: hasExplicitRecipe ? (recStep?.wordTimings ?? tlStep.wordTimings) : (tlStep.wordTimings ?? recStep?.wordTimings),
       };
     });
   } else if (eventStepsByIndex.size > 0) {
@@ -2617,11 +2678,14 @@ export async function narrateTimeline({
       .map((evStep, idx) => {
         const stepIndex = Number.isInteger(evStep.index) ? evStep.index : idx;
         const recStep = isObject(recipeSteps[stepIndex]) ? recipeSteps[stepIndex] : null;
+        const recNarration = recStep?.narration ?? recStep?.say;
         return {
           index: stepIndex,
           t: evStep.t,
-          label: evStep.label ?? recStep?.label ?? `step-${stepIndex}`,
-          narration: evStep.narration ?? recStep?.narration ?? recStep?.say,
+          label: hasExplicitRecipe
+            ? (recStep?.label ?? evStep.label ?? `step-${stepIndex}`)
+            : (evStep.label ?? recStep?.label ?? `step-${stepIndex}`),
+          narration: hasExplicitRecipe ? (recNarration ?? evStep.narration) : (evStep.narration ?? recNarration),
           audioFile: recStep?.audioFile,
           wordTimings: recStep?.wordTimings,
         };
@@ -2897,11 +2961,14 @@ export async function narrateTimeline({
             duration: info.speechDuration,
             startOffset: speechStart,
             aligner,
+            provider,
+            allowCloudAuto: provider !== 'kokoro',
             language: lang,
             ...(apiKey ? { apiKey } : {}),
             ...(fetchImpl ? { fetchImpl } : {}),
             ...(effectiveAlignRunner ? { runner: effectiveAlignRunner } : {}),
             ...(whisperExecutable !== undefined ? { executable: whisperExecutable } : {}),
+            ...(geminiModel ? { geminiModel } : {}),
             ...(aligner === 'gemini' && geminiModel
               ? { model: geminiModel }
               : whisperModel
@@ -3035,7 +3102,7 @@ export async function narrateTimeline({
         .map((s) => [s.index, s.narration])
     );
     for (const ev of retimedEventTrack.events ?? []) {
-      if (ev?.type === 'step' && ev.narration === undefined && narrByStepIdx.has(ev.index)) {
+      if (ev?.type === 'step' && narrByStepIdx.has(ev.index)) {
         ev.narration = structuredClone(narrByStepIdx.get(ev.index));
       }
     }
@@ -3059,7 +3126,19 @@ export async function narrateTimeline({
   }
 
   if (totalExtraPad > 1e-4) {
-    const hasStepCameraHints = Array.isArray(retimedEventTrack?.events) &&
+    const effectiveRecipeCamera = isObject(recipeInput?.presentation?.camera)
+      ? { ...(isObject(recipeInput?.camera) ? recipeInput.camera : {}), ...recipeInput.presentation.camera }
+      : isObject(recipeInput?.timeline?.camera)
+        ? { ...(isObject(recipeInput?.camera) ? recipeInput.camera : {}), ...recipeInput.timeline.camera }
+        : isObject(recipeInput?.camera)
+          ? recipeInput.camera
+          : null;
+    const allowStepCameraRecompile =
+      effectiveRecipeCamera?.keyframes === undefined &&
+      effectiveRecipeCamera?.fromSteps !== false;
+    const hasStepCameraHints =
+      allowStepCameraRecompile &&
+      Array.isArray(retimedEventTrack?.events) &&
       retimedEventTrack.events.some((ev) => ev?.type === 'step' && ev.camera !== undefined);
     const recompiledKfs = hasStepCameraHints
       ? compileStepCameraKeyframes({
@@ -3078,6 +3157,16 @@ export async function narrateTimeline({
       recompiledKfs && recompiledKfs.length > 0
         ? recompiledKfs
         : retimeCameraKeyframesWithHolds(baseTimeline.camera, scheduledSteps);
+
+    if (
+      Array.isArray(baseTimeline.camera?.verticalKeyframes) &&
+      baseTimeline.camera.verticalKeyframes.length > 0
+    ) {
+      updatedTimeline.camera.verticalKeyframes = retimeCameraKeyframesWithHolds(
+        { keyframes: baseTimeline.camera.verticalKeyframes },
+        scheduledSteps
+      );
+    }
   }
 
   updatedTimeline.steps = scheduledSteps.map((s) => ({
@@ -3574,15 +3663,26 @@ export async function reviewNarration({
     }
   }
 
+  const timelineTracks = Array.isArray(timeline?.audio?.tracks) ? timeline.audio.tracks : [];
+  const isSfxOnlyTimeline =
+    timelineTracks.length > 0 &&
+    timelineTracks.every((t) => t?.kind === 'sfx') &&
+    !timelineTracks.some((t) => t?.kind === 'narration' || t?.kind === 'music');
+
   const loudnessMeasurements = [];
   const loudnessIssues = [];
 
   if (loudness.enabled !== false && audioTargets.length > 0) {
+    const hasExplicitAudioFiles = Array.isArray(audioFiles) && audioFiles.length > 0;
+    let allTargetsTransientSfx = true;
     for (const target of audioTargets) {
       const measurement = await measureLoudness(target.path, {
         silenceThresholdLufs: bounds.silenceThresholdLufs,
       });
-      const entry = { label: target.label, ...measurement };
+      const isSfxTarget =
+        target.track?.kind === 'sfx' || (isSfxOnlyTimeline && !hasExplicitAudioFiles);
+      if (!isSfxTarget) allTargetsTransientSfx = false;
+      const entry = { label: target.label, mode: isSfxTarget ? 'sfx-transient' : 'program-lufs', ...measurement };
       loudnessMeasurements.push(entry);
 
       if (!measurement.hasAudio) {
@@ -3591,6 +3691,20 @@ export async function reviewNarration({
         addFinding('error', 'audio-loudness', msg, { details: entry });
         continue;
       }
+
+      if (isSfxTarget) {
+        if (measurement.truePeakDbfs === null || !Number.isFinite(measurement.truePeakDbfs) || measurement.truePeakDbfs <= -60) {
+          const msg = `${target.label}: SFX audio has no measurable transient signal (true peak ${measurement.truePeakDbfs ?? '-inf'} dBFS <= -60 dBFS)`;
+          loudnessIssues.push(msg);
+          addFinding('error', 'audio-loudness', msg, { details: entry });
+        } else if (measurement.truePeakDbfs > bounds.maxTruePeakDbfs) {
+          const msg = `${target.label}: true peak ${measurement.truePeakDbfs} dBFS exceeds ceiling ${bounds.maxTruePeakDbfs} dBFS (clipping risk)`;
+          loudnessIssues.push(msg);
+          addFinding('error', 'audio-loudness', msg, { details: entry });
+        }
+        continue;
+      }
+
       if (measurement.isSilent) {
         const msg = `${target.label}: audio is silent (I=${measurement.integratedLufs ?? '-inf'} LUFS <= ${bounds.silenceThresholdLufs} LUFS)`;
         loudnessIssues.push(msg);
@@ -3619,7 +3733,9 @@ export async function reviewNarration({
       'audio-loudness',
       loudnessOk,
       loudnessOk
-        ? `audio loudness within [${bounds.minLufs}, ${bounds.maxLufs}] LUFS across ${loudnessMeasurements.length} file(s) (${loudnessMeasurements.map((m) => `${m.integratedLufs} LUFS`).join(', ')})`
+        ? allTargetsTransientSfx
+          ? `SFX transient peak within (-60, ${bounds.maxTruePeakDbfs}] dBFS across ${loudnessMeasurements.length} file(s) (${loudnessMeasurements.map((m) => `${m.truePeakDbfs} dBFS`).join(', ')})`
+          : `audio loudness within [${bounds.minLufs}, ${bounds.maxLufs}] LUFS across ${loudnessMeasurements.length} file(s) (${loudnessMeasurements.map((m) => (m.mode === 'sfx-transient' ? `${m.truePeakDbfs} dBFS peak` : `${m.integratedLufs} LUFS`)).join(', ')})`
         : loudnessIssues.join('; ')
     );
   } else {

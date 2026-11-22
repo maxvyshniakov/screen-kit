@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve, relative, dirname, basename, extname } from 'node:path';
+import { resolve, relative, dirname, basename, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { captureRun, loadConfiguration, runPipeline, selectedRecipes, statusRun, VERSION } from './run.mjs';
 import { reviewRun, reviewVideo } from './review.mjs';
 import { compileTimeline } from './timeline.mjs';
@@ -13,9 +14,10 @@ const help = `screen-kit ${VERSION}
 screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4]
-screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--voice Kore] [--style "..."]
+screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--whisper-model path] [--voice Kore] [--style "..."]
+screen-kit audio-mix --input timeline.json --out out/audio [--music bed.wav] [--sfx] [--duck-mode envelope|sidechain] [--duck-db -10] [--video demo.mp4] [--out-video demo-mixed.mp4]
 screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
-screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--verify-cursor] [--narration en] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
+screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--baseline stills-dir] [--multimodal] [--narration en] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
 screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json] [--verify-cursor]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
@@ -102,27 +104,66 @@ function parseCursorDetectionFlag(rawDetection, rawColor) {
   return options;
 }
 
+function parseBoolFlag(val, flagName) {
+  if (val === undefined) return false;
+  if (typeof val === 'boolean') return val;
+  const normalized = String(val).trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes') return true;
+  if (normalized === 'false' || normalized === '0' || normalized === 'no') return false;
+  throw Error(
+    `Invalid boolean value for --${flagName}: "${val}" (expected true/1/yes or false/0/no)`
+  );
+}
+
+function parseCursorThresholdFlag(raw) {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw Error(`--cursor-threshold must be a positive finite number (received ${raw})`);
+  }
+  return value;
+}
+
+function rebaseLocalMediaRef(ref, fromDir, toDir) {
+  if (typeof ref !== 'string' || ref.length === 0 || /^(?:https?:|data:|blob:)/i.test(ref)) {
+    return ref;
+  }
+  const abs = ref.startsWith('file://') ? fileURLToPath(ref) : resolve(fromDir, ref);
+  return relative(toDir, abs) || basename(abs);
+}
+
 const [command = 'help', ...args] = process.argv.slice(2);
 const allowed = new Set([
   'config', 'cwd', 'only', 'recipe', 'out', 'manifest', 'input', 'take', 'fps', 'at',
   'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir',
   'verify-cursor', 'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
-  'kind', 'prompt', 'aspect-ratio', 'model', 'cache-dir',
+  'kind', 'prompt', 'aspect-ratio', 'model', 'whisper-model', 'cache-dir',
   'target', 'name', 'poster', 'formats', 'color-space',
   'title', 'description', 'privacy', 'captions', 'thumbnail', 'dry-run',
   'lang', 'language', 'narration', 'tts-provider', 'aligner', 'voice', 'style', 'style-prompt', 'speed',
+  'music', 'sfx', 'duck-mode', 'duck-db', 'out-video', 'music-lufs', 'keep-stems',
 ]);
-const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor']);
-const toBoolFlag = (val) => val === true || val === 'true' || val === '1';
+const booleanFlags = new Set([
+  'multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor', 'sfx', 'keep-stems',
+]);
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
   else if (['--version', '-V'].includes(command)) console.log(VERSION);
   else {
     const flags = {};
     for (let i = 0; i < args.length; i++) {
-      if (!args[i].startsWith('--') || !allowed.has(args[i].slice(2))) throw Error(`unknown option: ${args[i]}`);
+      if (!args[i].startsWith('--')) throw Error(`unknown option: ${args[i]}`);
+      const eqIdx = args[i].indexOf('=');
+      if (eqIdx > 2) {
+        const name = args[i].slice(2, eqIdx);
+        if (!allowed.has(name)) throw Error(`unknown option: --${name}`);
+        if (Object.hasOwn(flags, name)) throw Error(`duplicate option: --${name}`);
+        flags[name] = args[i].slice(eqIdx + 1);
+        continue;
+      }
       const name = args[i].slice(2);
+      if (!allowed.has(name)) throw Error(`unknown option: ${args[i]}`);
       if (Object.hasOwn(flags, name)) throw Error(`duplicate option: --${name}`);
       if (booleanFlags.has(name) && (!args[i + 1] || args[i + 1].startsWith('--'))) {
         flags[name] = true;
@@ -196,19 +237,14 @@ try {
         steps: compiled.steps,
       }, null, 2));
     } else if (command === 'review') {
-      let cursorThresholdPx;
-      if (flags['cursor-threshold'] !== undefined) {
-        cursorThresholdPx = Number(flags['cursor-threshold']);
-        if (!Number.isFinite(cursorThresholdPx) || cursorThresholdPx <= 0) {
-          throw Error(`--cursor-threshold must be a positive finite number (received ${flags['cursor-threshold']})`);
-        }
-      }
+      const cursorThresholdPx = parseCursorThresholdFlag(flags['cursor-threshold']);
       const cursorDetection = parseCursorDetectionFlag(flags['cursor-detection'], flags['cursor-color']);
-      const verifyCursor = toBoolFlag(flags['verify-cursor']);
-      const multimodalOpt = flags.multimodal
+      const verifyCursor = parseBoolFlag(flags['verify-cursor'], 'verify-cursor');
+      const multimodalEnabled = parseBoolFlag(flags.multimodal, 'multimodal');
+      const multimodalOpt = multimodalEnabled
         ? {
             enabled: true,
-            provider: flags.provider ?? (flags.multimodal === true ? 'gemini' : flags.multimodal),
+            provider: flags.provider ?? 'gemini',
           }
         : undefined;
 
@@ -313,6 +349,7 @@ try {
         throw Error(`--speed must be a positive finite number (received ${flags.speed})`);
       }
 
+      const alignerModel = flags['whisper-model'] ?? flags.model;
       const { narrateTimeline } = await import('./narration.mjs');
       const narrated = await narrateTimeline({
         ...(timelineArg ? { timeline: resolve(timelineArg) } : {}),
@@ -324,29 +361,135 @@ try {
         ...(langs.length > 1 ? { languages: langs } : {}),
         provider: flags['tts-provider'] ?? flags.provider ?? 'gemini',
         aligner: flags.aligner ?? 'auto',
+        ...(flags['whisper-model'] ? { whisperModel: flags['whisper-model'] } : {}),
+        ...(flags.aligner === 'gemini' && flags.model ? { geminiModel: flags.model } : {}),
+        ...(alignerModel ? { alignerOptions: { model: alignerModel } } : {}),
         ...(flags.voice ? { voice: flags.voice } : {}),
         ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
         ...(speedVal !== undefined ? { speed: speedVal } : {}),
       });
       const { timeline: _fullTimeline, ...summary } = narrated;
       console.log(JSON.stringify(summary, null, 2));
+    } else if (command === 'audio-mix') {
+      const timelineArg = flags.input ?? flags.timeline;
+      const outArg = flags.out ?? flags['out-dir'];
+      if (!timelineArg || !outArg) {
+        throw Error('audio-mix requires --input timeline.json and --out');
+      }
+      const timelinePath = resolve(timelineArg);
+      const resolvedOut = resolve(outArg);
+      const audioExts = new Set(['.wav', '.mp3', '.m4a', '.aac', '.opus', '.ogg', '.flac']);
+      const isAudioFileOut = audioExts.has(extname(resolvedOut).toLowerCase());
+      const outDir = flags['out-dir']
+        ? resolve(flags['out-dir'])
+        : isAudioFileOut
+          ? dirname(resolvedOut)
+          : resolvedOut;
+      const outFile = isAudioFileOut ? resolvedOut : undefined;
+
+      let duckUnderSpeechDb;
+      if (flags['duck-db'] !== undefined) {
+        duckUnderSpeechDb = Number(flags['duck-db']);
+        if (!Number.isFinite(duckUnderSpeechDb)) {
+          throw Error(`--duck-db must be a finite number (received ${flags['duck-db']})`);
+        }
+      }
+      let musicLufs;
+      if (flags['music-lufs'] !== undefined) {
+        musicLufs = Number(flags['music-lufs']);
+        if (!Number.isFinite(musicLufs)) {
+          throw Error(`--music-lufs must be a finite number (received ${flags['music-lufs']})`);
+        }
+      }
+
+      const sfxEnabled = parseBoolFlag(flags.sfx, 'sfx');
+      const keepStems = parseBoolFlag(flags['keep-stems'], 'keep-stems');
+      const videoFile = flags.video ? resolve(flags.video) : undefined;
+      const muxOutFile = flags['out-video']
+        ? resolve(flags['out-video'])
+        : videoFile && !isAudioFileOut
+          ? join(outDir, `${basename(videoFile, extname(videoFile))}-mixed${extname(videoFile) || '.mp4'}`)
+          : undefined;
+
+      const { mixTimelineAudio } = await import('./audio-mix.mjs');
+      const mixed = await mixTimelineAudio({
+        timeline: timelinePath,
+        ...(outFile ? { outFile } : {}),
+        outDir,
+        ...(flags.music ? { music: resolve(flags.music) } : {}),
+        sfx: sfxEnabled,
+        ...(flags['duck-mode'] ? { duckingMode: flags['duck-mode'] } : {}),
+        ...(duckUnderSpeechDb !== undefined ? { duckUnderSpeechDb } : {}),
+        ...(musicLufs !== undefined ? { musicLufs } : {}),
+        ...(keepStems ? { keepStems: true } : {}),
+        ...(videoFile ? { videoFile } : {}),
+        ...(muxOutFile ? { muxOutFile } : {}),
+      });
+
+      let timelineOutFile = null;
+      if (mixed.timeline && !isAudioFileOut) {
+        timelineOutFile = join(outDir, 'timeline.json');
+        const sourceBaseDir = dirname(timelinePath);
+        const rebased = structuredClone(mixed.timeline);
+        if (rebased.take?.video) {
+          rebased.take.video = rebaseLocalMediaRef(rebased.take.video, sourceBaseDir, outDir);
+        }
+        if (rebased.take?.eventTrack) {
+          rebased.take.eventTrack = rebaseLocalMediaRef(rebased.take.eventTrack, sourceBaseDir, outDir);
+        }
+        if (rebased.stage?.background?.type === 'image' && rebased.stage.background.src) {
+          rebased.stage.background.src = rebaseLocalMediaRef(rebased.stage.background.src, sourceBaseDir, outDir);
+        }
+        if (Array.isArray(rebased.audio?.tracks)) {
+          rebased.audio.tracks = rebased.audio.tracks.map((track) => ({
+            ...track,
+            src: rebaseLocalMediaRef(track.src, sourceBaseDir, outDir),
+          }));
+        }
+        await mkdir(outDir, { recursive: true });
+        await writeFile(timelineOutFile, JSON.stringify(rebased, null, 2) + '\n');
+      }
+
+      const { timeline: _mixedTimeline, ...mixSummary } = mixed;
+      console.log(
+        JSON.stringify(
+          {
+            ...mixSummary,
+            ...(timelineOutFile ? { timelineFile: timelineOutFile } : {}),
+          },
+          null,
+          2
+        )
+      );
+      if (!mixed.ok) process.exitCode = 1;
     } else if (command === 'run') {
       const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
       const profileArg = flags.profiles ?? flags.profile;
-      const verifyCursor = toBoolFlag(flags['verify-cursor']);
+      const verifyCursor = parseBoolFlag(flags['verify-cursor'], 'verify-cursor');
+      const cursorThresholdPx = parseCursorThresholdFlag(flags['cursor-threshold']);
+      const cursorDetection = parseCursorDetectionFlag(flags['cursor-detection'], flags['cursor-color']);
+      const multimodalEnabled = parseBoolFlag(flags.multimodal, 'multimodal');
       const speedVal = flags.speed !== undefined ? Number(flags.speed) : undefined;
       if (speedVal !== undefined && (!Number.isFinite(speedVal) || speedVal <= 0)) {
         throw Error(`--speed must be a positive finite number (received ${flags.speed})`);
       }
+      const reviewOptions = {
+        ...(verifyCursor ? { verifyCursor: true } : {}),
+        ...(cursorThresholdPx !== undefined ? { cursorThresholdPx } : {}),
+        ...(cursorDetection ? { cursorDetection } : {}),
+        ...(flags.baseline ? { baseline: resolve(flags.baseline) } : {}),
+        ...(multimodalEnabled ? { multimodal: { enabled: true, provider: 'gemini' } } : {}),
+      };
+      const alignerModel = flags['whisper-model'] ?? flags.model;
       const result = await runPipeline({
         config: loaded.config,
         cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
         ...(flags.only ? { only: flags.only } : {}),
         ...(flags.out ? { out: resolve(flags.out) } : {}),
-        previewOnly: toBoolFlag(flags['preview-only']),
-        reuseTake: toBoolFlag(flags['reuse-take']),
+        previewOnly: parseBoolFlag(flags['preview-only'], 'preview-only'),
+        reuseTake: parseBoolFlag(flags['reuse-take'], 'reuse-take'),
         ...(profileArg ? { profiles: profileArg } : {}),
-        ...(verifyCursor ? { reviewOptions: { verifyCursor: true } } : {}),
+        ...(Object.keys(reviewOptions).length > 0 ? { reviewOptions } : {}),
         ...(flags.narration !== undefined ? { narration: flags.narration } : {}),
         ...((flags['tts-provider'] ?? flags.provider) ? { ttsProvider: flags['tts-provider'] ?? flags.provider } : {}),
         ...(flags.aligner ? { aligner: flags.aligner } : {}),
@@ -354,6 +497,8 @@ try {
           ...(flags.voice ? { voice: flags.voice } : {}),
           ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
           ...(speedVal !== undefined ? { speed: speedVal } : {}),
+          ...(flags['whisper-model'] ? { whisperModel: flags['whisper-model'] } : {}),
+          ...(alignerModel ? { alignerOptions: { model: alignerModel } } : {}),
         },
       });
       console.log(JSON.stringify(result, null, 2));
@@ -394,15 +539,33 @@ try {
         if (!flags.title) throw Error('publish --target youtube requires --title');
         const captions = flags.captions ? parseCaptionsFlag(flags.captions) : undefined;
         const thumbnail = flags.thumbnail ?? flags.poster;
-        const result = await publishYouTube({
-          video: videoArg,
-          title: flags.title,
-          ...(flags.description !== undefined ? { description: flags.description } : {}),
-          ...(flags.privacy ? { privacy: flags.privacy } : {}),
-          ...(captions ? { captions } : {}),
-          ...(thumbnail ? { thumbnail } : {}),
-          dryRun: toBoolFlag(flags['dry-run']),
-        });
+        let result;
+        try {
+          result = await publishYouTube({
+            video: videoArg,
+            title: flags.title,
+            ...(flags.description !== undefined ? { description: flags.description } : {}),
+            ...(flags.privacy ? { privacy: flags.privacy } : {}),
+            ...(captions ? { captions } : {}),
+            ...(thumbnail ? { thumbnail } : {}),
+            dryRun: parseBoolFlag(flags['dry-run'], 'dry-run'),
+          });
+        } catch (ytError) {
+          if (flags.out && ytError?.cause?.videoId) {
+            const outPath = resolve(flags.out);
+            await mkdir(dirname(outPath), { recursive: true });
+            const partial = ytError.partialReport ?? {
+              ok: false,
+              target: 'youtube',
+              uploaded: true,
+              partial: true,
+              ...ytError.cause,
+              error: ytError.message,
+            };
+            await writeFile(outPath, JSON.stringify(partial, null, 2) + '\n');
+          }
+          throw ytError;
+        }
         const text = JSON.stringify(result, null, 2) + '\n';
         if (flags.out) {
           const outPath = resolve(flags.out);

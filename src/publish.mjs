@@ -682,78 +682,121 @@ export async function publishYouTube({
     throw Error('YouTube video upload response did not include a video id');
   }
 
-  // 2. Upload caption tracks (SRT/VTT)
-  const uploadedCaptions = [];
-  for (const track of validatedCaptions) {
-    const captionMultipart = buildMultipartRelatedBody(
-      {
-        snippet: {
-          videoId,
-          language: track.language,
-          name: track.name,
-          isDraft: track.isDraft,
-        },
-      },
-      track.buffer,
-      track.mimeType
-    );
-    const captionResponse = await fetchImpl(YOUTUBE_UPLOAD_CAPTIONS_URL, {
-      method: 'POST',
-      headers: {
-        authorization: authHeader,
-        'content-type': captionMultipart.contentType,
-      },
-      body: captionMultipart.body,
-      ...(signal ? { signal } : {}),
-    });
-    if (!captionResponse.ok) {
-      const errorText = await captionResponse.text().catch(() => '');
-      throw Error(
-        `YouTube caption upload (${track.language}) failed with HTTP ${captionResponse.status}: ${errorText.slice(0, 300)}`
-      );
-    }
-    const captionPayload = await captionResponse.json().catch(() => ({}));
-    uploadedCaptions.push({
-      id: captionPayload?.id ?? null,
-      file: track.file,
-      language: track.language,
-      name: track.name,
-      isDraft: track.isDraft,
-      format: track.format,
-      mimeType: track.mimeType,
-      bytes: track.bytes,
-      sha256: track.sha256,
-    });
-  }
+  const videoUrl = `https://youtu.be/${videoId}`;
 
-  // 3. Upload custom thumbnail (if provided)
+  // 2. Upload caption tracks (SRT/VTT) and 3. Upload custom thumbnail (if provided)
+  const uploadedCaptions = [];
   let uploadedThumbnail = null;
-  if (validatedThumbnail) {
-    const thumbUrl = `${YOUTUBE_UPLOAD_THUMBNAIL_BASE}?videoId=${encodeURIComponent(videoId)}&uploadType=media`;
-    const thumbResponse = await fetchImpl(thumbUrl, {
-      method: 'POST',
-      headers: {
-        authorization: authHeader,
-        'content-type': validatedThumbnail.mimeType,
-      },
-      body: validatedThumbnail.buffer,
-      ...(signal ? { signal } : {}),
-    });
-    if (!thumbResponse.ok) {
-      const errorText = await thumbResponse.text().catch(() => '');
-      throw Error(
-        `YouTube thumbnail upload failed with HTTP ${thumbResponse.status}: ${errorText.slice(0, 300)}`
+  try {
+    for (const track of validatedCaptions) {
+      const captionMultipart = buildMultipartRelatedBody(
+        {
+          snippet: {
+            videoId,
+            language: track.language,
+            name: track.name,
+            isDraft: track.isDraft,
+          },
+        },
+        track.buffer,
+        track.mimeType
       );
+      const captionResponse = await fetchImpl(YOUTUBE_UPLOAD_CAPTIONS_URL, {
+        method: 'POST',
+        headers: {
+          authorization: authHeader,
+          'content-type': captionMultipart.contentType,
+        },
+        body: captionMultipart.body,
+        ...(signal ? { signal } : {}),
+      });
+      if (!captionResponse.ok) {
+        const errorText = await captionResponse.text().catch(() => '');
+        throw Error(
+          `YouTube caption upload (${track.language}) failed with HTTP ${captionResponse.status}: ${errorText.slice(0, 300)}`
+        );
+      }
+      const captionPayload = await captionResponse.json().catch(() => ({}));
+      uploadedCaptions.push({
+        id: captionPayload?.id ?? null,
+        file: track.file,
+        language: track.language,
+        name: track.name,
+        isDraft: track.isDraft,
+        format: track.format,
+        mimeType: track.mimeType,
+        bytes: track.bytes,
+        sha256: track.sha256,
+      });
     }
-    const thumbPayload = await thumbResponse.json().catch(() => ({}));
-    uploadedThumbnail = {
-      file: validatedThumbnail.file,
-      mimeType: validatedThumbnail.mimeType,
-      bytes: validatedThumbnail.bytes,
-      sha256: validatedThumbnail.sha256,
-      uploaded: true,
-      items: thumbPayload?.items ?? null,
+
+    if (validatedThumbnail) {
+      const thumbUrl = `${YOUTUBE_UPLOAD_THUMBNAIL_BASE}?videoId=${encodeURIComponent(videoId)}&uploadType=media`;
+      const thumbResponse = await fetchImpl(thumbUrl, {
+        method: 'POST',
+        headers: {
+          authorization: authHeader,
+          'content-type': validatedThumbnail.mimeType,
+        },
+        body: validatedThumbnail.buffer,
+        ...(signal ? { signal } : {}),
+      });
+      if (!thumbResponse.ok) {
+        const errorText = await thumbResponse.text().catch(() => '');
+        throw Error(
+          `YouTube thumbnail upload failed with HTTP ${thumbResponse.status}: ${errorText.slice(0, 300)}`
+        );
+      }
+      const thumbPayload = await thumbResponse.json().catch(() => ({}));
+      uploadedThumbnail = {
+        file: validatedThumbnail.file,
+        mimeType: validatedThumbnail.mimeType,
+        bytes: validatedThumbnail.bytes,
+        sha256: validatedThumbnail.sha256,
+        uploaded: true,
+        items: thumbPayload?.items ?? null,
+      };
+    }
+  } catch (stepError) {
+    const cause = {
+      videoId,
+      url: videoUrl,
+      captionsUploaded: uploadedCaptions,
+      thumbnailUploaded: Boolean(uploadedThumbnail),
     };
+    const partialReport = {
+      ok: false,
+      target: 'youtube',
+      dryRun: false,
+      uploaded: true,
+      partial: true,
+      videoId,
+      url: videoUrl,
+      privacy,
+      title: trimmedTitle,
+      description,
+      video: {
+        file: loadedVideo.file,
+        mimeType: videoMimeType,
+        bytes: loadedVideo.bytes,
+        sha256: loadedVideo.sha256,
+      },
+      captionsUploaded: uploadedCaptions,
+      thumbnailUploaded: Boolean(uploadedThumbnail),
+      captions: uploadedCaptions,
+      thumbnail: uploadedThumbnail,
+      error: stepError.message,
+      notes: [YOUTUBE_MULTI_AUDIO_NOTE],
+    };
+    const wrapped = new Error(
+      `${stepError.message} (video already uploaded: videoId=${videoId}, url=${videoUrl})`,
+      { cause }
+    );
+    Object.defineProperty(wrapped, 'partialReport', {
+      value: partialReport,
+      enumerable: false,
+    });
+    throw wrapped;
   }
 
   return {
@@ -762,7 +805,7 @@ export async function publishYouTube({
     dryRun: false,
     uploaded: true,
     videoId,
-    url: `https://youtu.be/${videoId}`,
+    url: videoUrl,
     privacy,
     title: trimmedTitle,
     description,

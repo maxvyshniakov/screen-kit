@@ -617,38 +617,84 @@ export async function prepareMusicBed({
   const destFile = resolve(outputFile);
   await mkdir(dirname(destFile), { recursive: true });
 
-  const effFadeIn = Math.max(0, Math.min(isFiniteNumber(fadeIn) ? fadeIn : 0, duration * 0.45));
-  const effFadeOut = Math.max(0, Math.min(isFiniteNumber(fadeOut) ? fadeOut : 0, duration * 0.45));
+  const activeDuration = loop ? duration : Math.min(srcProbed.duration, duration);
+  const effFadeIn = Math.max(0, Math.min(isFiniteNumber(fadeIn) ? fadeIn : 0, activeDuration * 0.45));
+  const effFadeOut = Math.max(0, Math.min(isFiniteNumber(fadeOut) ? fadeOut : 0, activeDuration * 0.45));
 
   const tempDir = await mkdtemp(join(tmpdir(), 'screen-kit-music-bed-'));
   try {
-    const loopedRaw = join(tempDir, 'looped.wav');
-    const loopArgs = loop ? ['-stream_loop', '-1'] : [];
-    await exec(
-      'ffmpeg',
-      [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        ...loopArgs,
-        '-i',
-        srcFile,
-        '-vn',
-        '-af',
-        `aresample=${sampleRate},aformat=sample_fmts=s16:channel_layouts=stereo,apad=whole_dur=${duration},atrim=0:${duration},asetpts=PTS-STARTPTS`,
-        '-c:a',
-        'pcm_s16le',
-        loopedRaw,
-      ],
-      { timeout: 60000, maxBuffer: 10e6 }
-    );
+    const baseRaw = join(tempDir, 'base.wav');
+    if (loop) {
+      await exec(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-y',
+          '-stream_loop',
+          '-1',
+          '-i',
+          srcFile,
+          '-vn',
+          '-af',
+          `aresample=${sampleRate},aformat=sample_fmts=s16:channel_layouts=stereo,apad=whole_dur=${duration},atrim=0:${duration},asetpts=PTS-STARTPTS`,
+          '-c:a',
+          'pcm_s16le',
+          baseRaw,
+        ],
+        { timeout: 60000, maxBuffer: 10e6 }
+      );
+    } else {
+      // Measure unpadded active audio before apad so trailing silence never inflates LUFS gain
+      await exec(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-y',
+          '-i',
+          srcFile,
+          '-vn',
+          '-af',
+          `aresample=${sampleRate},aformat=sample_fmts=s16:channel_layouts=stereo,atrim=0:${activeDuration},asetpts=PTS-STARTPTS`,
+          '-c:a',
+          'pcm_s16le',
+          baseRaw,
+        ],
+        { timeout: 60000, maxBuffer: 10e6 }
+      );
+    }
 
     let gainDb = 0;
     if (normalize && isFiniteNumber(targetLufs)) {
-      const measured = await measureLoudness(loopedRaw);
-      if (measured.integratedLufs !== null && Number.isFinite(measured.integratedLufs)) {
+      const measured = await measureLoudness(baseRaw);
+      if (
+        !measured.isSilent &&
+        duration >= 0.4 &&
+        activeDuration >= 0.4 &&
+        measured.integratedLufs !== null &&
+        Number.isFinite(measured.integratedLufs)
+      ) {
         gainDb = Math.max(-36, Math.min(24, targetLufs - measured.integratedLufs));
+      } else if (
+        measured.truePeakDbfs !== null &&
+        Number.isFinite(measured.truePeakDbfs) &&
+        measured.truePeakDbfs > -60 &&
+        (duration < 0.4 || activeDuration < 0.4)
+      ) {
+        // Short (< 0.4 s) non-silent clip: ebur128 400 ms gating has 0 blocks; use RMS/peak fallback
+        const rmsDb =
+          activeDuration > 0.03
+            ? await measureSegmentRmsDb(baseRaw, 0, activeDuration).catch(() => -Infinity)
+            : -Infinity;
+        if (Number.isFinite(rmsDb) && rmsDb > -60) {
+          const maxSafeGain = -1.0 - measured.truePeakDbfs;
+          gainDb = Math.max(-36, Math.min(12, maxSafeGain, targetLufs - rmsDb));
+        } else if (measured.truePeakDbfs > -1.0) {
+          gainDb = -1.0 - measured.truePeakDbfs;
+        }
       }
     }
     if (isFiniteNumber(volume) && volume > 0) {
@@ -663,15 +709,18 @@ export async function prepareMusicBed({
       filters.push(`afade=t=in:st=0:d=${round(effFadeIn, 4)}:curve=tri`);
     }
     if (effFadeOut > EPS) {
-      const fadeOutStart = Math.max(0, duration - effFadeOut);
+      const fadeOutStart = Math.max(0, activeDuration - effFadeOut);
       filters.push(`afade=t=out:st=${round(fadeOutStart, 4)}:d=${round(effFadeOut, 4)}:curve=tri`);
     }
     if (volume === 0) {
       filters.push('volume=0');
     }
+    if (!loop && activeDuration < duration - EPS) {
+      filters.push(`apad=whole_dur=${duration}`, `atrim=0:${duration}`, 'asetpts=PTS-STARTPTS');
+    }
 
     if (filters.length === 0) {
-      await copyFile(loopedRaw, destFile);
+      await copyFile(baseRaw, destFile);
     } else {
       await exec(
         'ffmpeg',
@@ -681,7 +730,7 @@ export async function prepareMusicBed({
           'error',
           '-y',
           '-i',
-          loopedRaw,
+          baseRaw,
           '-af',
           filters.join(','),
           '-c:a',
@@ -1310,8 +1359,12 @@ export async function mixTimelineAudio({
         (speechWindows.length > 0 || (duckingMode === 'sidechain' && Boolean(narrationStemFile)));
 
       if (shouldDuck && duckingMode === 'sidechain' && narrationStemFile) {
-        const attackMs = Math.max(1, Math.round(duckAttack * 1000));
-        const releaseMs = Math.max(10, Math.round(duckRelease * 1000));
+        const attackMs = Math.min(2000, Math.max(1, Math.round(duckAttack * 1000)));
+        const releaseMs = Math.min(9000, Math.max(10, Math.round(duckRelease * 1000)));
+        const absDuckDb = Math.min(36, Math.max(0, Math.abs(duckUnderSpeechDb)));
+        const thresholdDb = Math.max(-48, Math.min(-6, -12 - absDuckDb * 1.5));
+        const scThreshold = round(Math.min(0.5, Math.max(0.001, 10 ** (thresholdDb / 20))), 6);
+        const scRatio = round(Math.min(20, Math.max(1.5, 1 + absDuckDb * 0.9)), 2);
         await exec(
           'ffmpeg',
           [
@@ -1324,7 +1377,7 @@ export async function mixTimelineAudio({
             '-i',
             narrationStemFile,
             '-filter_complex',
-            `[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[mbed];[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo[vsc];[mbed][vsc]sidechaincompress=threshold=0.015:ratio=12:attack=${attackMs}:release=${releaseMs}:level_sc=2.5:knee=4,aformat=sample_fmts=s16:channel_layouts=stereo[ducked]`,
+            `[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[mbed];[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo[vsc];[mbed][vsc]sidechaincompress=threshold=${scThreshold}:ratio=${scRatio}:attack=${attackMs}:release=${releaseMs}:level_sc=2.5:knee=4,aformat=sample_fmts=s16:channel_layouts=stereo[ducked]`,
             '-map',
             '[ducked]',
             '-c:a',

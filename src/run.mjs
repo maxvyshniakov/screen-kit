@@ -371,32 +371,60 @@ export async function runPipeline({
       const videoOutputs = renderResult.outputs.filter(
         (item) => item.format === 'mp4' || item.format === 'webm'
       );
-      const primaryVideo =
-        videoOutputs.find((item) => item.role === 'video' && item.format === 'mp4') ??
-        videoOutputs.find((item) => item.format === 'mp4') ??
-        videoOutputs[0] ??
-        null;
+      const profileGroups = new Map();
+      for (const item of videoOutputs) {
+        const groupKey = item.id ?? 'default';
+        if (!profileGroups.has(groupKey)) profileGroups.set(groupKey, []);
+        profileGroups.get(groupKey).push(item);
+      }
+
+      const profileTargets = [];
+      for (const [profileId, items] of profileGroups.entries()) {
+        const chosen =
+          items.find((item) => item.role === 'video' && item.format === 'mp4') ??
+          items.find((item) => item.format === 'mp4') ??
+          items[0];
+        if (chosen) profileTargets.push({ profileId, videoOutput: chosen });
+      }
 
       let reviewSummary = null;
+      const profileReviews = {};
       let recipeOk = true;
-      if (primaryVideo) {
-        const reviewDir = join(recipeDir, 'review');
+      for (let pIdx = 0; pIdx < profileTargets.length; pIdx += 1) {
+        const { profileId, videoOutput } = profileTargets[pIdx];
+        const reviewDir =
+          profileTargets.length === 1 || pIdx === 0
+            ? join(recipeDir, 'review')
+            : join(recipeDir, 'review', profileId);
         const fullReview = await reviewVideo({
-          video: primaryVideo.file,
+          video: videoOutput.file,
           timeline: timelinePath,
           eventTrack: activeEventTrackPath,
           outDir: reviewDir,
+          ...(videoOutput.id ? { outputId: videoOutput.id } : {}),
           ...reviewOptions,
         });
-        recipeOk = Boolean(fullReview.ok);
-        reviewSummary = {
+        if (!fullReview.ok) recipeOk = false;
+        const summaryItem = {
           ok: fullReview.ok,
+          ...(videoOutput.id ? { outputId: videoOutput.id } : {}),
           video: fullReview.video,
           report: fullReview.artifacts?.report ?? null,
           contactSheet: fullReview.artifacts?.contactSheet?.file ?? null,
           stills: (fullReview.artifacts?.stills ?? []).map((s) => s.file),
           checks: fullReview.checks,
           findings: fullReview.findings,
+        };
+        profileReviews[profileId] = summaryItem;
+        if (pIdx === 0) {
+          reviewSummary = summaryItem;
+        }
+      }
+      if (profileTargets.length > 1 && reviewSummary) {
+        reviewSummary = {
+          ...reviewSummary,
+          ok: recipeOk,
+          profiles: profileReviews,
         };
       }
 
