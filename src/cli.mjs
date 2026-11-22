@@ -11,14 +11,14 @@ import { publishWebBundle, publishYouTube } from './publish.mjs';
 
 const help = `screen-kit ${VERSION}
 
-screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
+screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir] [--manifest out/run.json] [--changed]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4] [--color-space srgb|p3]
 screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--whisper-model path] [--voice Kore] [--style "..."] [--speed 1.1] [--burn-captions]
 screen-kit audio-mix --input timeline.json --out out/audio [--music bed.wav] [--sfx] [--duck-mode envelope|sidechain] [--duck-db -10] [--video demo.mp4] [--out-video demo-mixed.mp4]
 screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
-screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--color-space srgb|p3] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--baseline stills-dir] [--multimodal] [--narration en] [--burn-captions] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
-screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json] [--verify-cursor]
+screen-kit run --config demo.mjs --out out/demo [--only name] [--changed] [--manifest out/demo/run.json] [--preview-only] [--reuse-take] [--profiles web-loop] [--color-space srgb|p3] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--baseline stills-dir] [--multimodal] [--narration en] [--burn-captions] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
+screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--update-baselines] [--out review.json] [--verify-cursor]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30] [--color-space srgb|p3]
@@ -134,9 +134,9 @@ function rebaseLocalMediaRef(ref, fromDir, toDir) {
 
 const [command = 'help', ...args] = process.argv.slice(2);
 const allowed = new Set([
-  'config', 'cwd', 'only', 'recipe', 'out', 'manifest', 'input', 'take', 'fps', 'at',
+  'config', 'cwd', 'only', 'recipe', 'out', 'manifest', 'changed', 'input', 'take', 'fps', 'at',
   'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
-  'video', 'timeline', 'event-track', 'baseline', 'out-dir',
+  'video', 'timeline', 'event-track', 'baseline', 'update-baselines', 'out-dir',
   'verify-cursor', 'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
   'kind', 'prompt', 'aspect-ratio', 'model', 'tts-model', 'whisper-model', 'cache-dir',
   'target', 'name', 'poster', 'formats', 'color-space',
@@ -145,6 +145,7 @@ const allowed = new Set([
   'music', 'sfx', 'duck-mode', 'duck-db', 'out-video', 'music-lufs', 'keep-stems',
 ]);
 const booleanFlags = new Set([
+  'changed', 'update-baselines',
   'multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor', 'sfx', 'keep-stems', 'burn-captions',
 ]);
 try {
@@ -174,8 +175,15 @@ try {
     }
     if (command === 'capture' || command === 'status') {
       const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
-      const options = { config: loaded.config, cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
-        only: flags.only, ...(flags.out ? { out: flags.out } : {}), manifest: flags.manifest };
+      const changedOnly = parseBoolFlag(flags.changed, 'changed');
+      const options = {
+        config: loaded.config,
+        cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
+        only: flags.only,
+        ...(flags.out ? { out: flags.out } : {}),
+        manifest: flags.manifest,
+        ...(command === 'capture' && flags.changed !== undefined ? { changedOnly } : {}),
+      };
       console.log(JSON.stringify(await (command === 'capture' ? captureRun(options) : statusRun(options)), null, 2));
     } else if (command === 'timeline') {
       const trackArg = flags['event-track'] ?? flags.input ?? flags.take;
@@ -241,6 +249,7 @@ try {
       const cursorThresholdPx = parseCursorThresholdFlag(flags['cursor-threshold']);
       const cursorDetection = parseCursorDetectionFlag(flags['cursor-detection'], flags['cursor-color']);
       const verifyCursor = parseBoolFlag(flags['verify-cursor'], 'verify-cursor');
+      const updateBaselines = parseBoolFlag(flags['update-baselines'], 'update-baselines');
       const multimodalEnabled = parseBoolFlag(flags.multimodal, 'multimodal');
       const multimodalOpt = multimodalEnabled
         ? {
@@ -265,6 +274,7 @@ try {
             manifest: flags.manifest,
             ...(flags['out-dir'] ? { outDir: flags['out-dir'] } : {}),
             ...(flags.baseline ? { baseline: flags.baseline } : {}),
+            ...(flags['update-baselines'] !== undefined ? { updateBaselines } : {}),
             ...(multimodalOpt ? { multimodal: multimodalOpt } : {}),
             ...(verifyCursor || cursorThresholdPx !== undefined || cursorDetection
               ? {
@@ -504,6 +514,8 @@ try {
         cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
         ...(flags.only ? { only: flags.only } : {}),
         ...(flags.out ? { out: resolve(flags.out) } : {}),
+        ...(flags.manifest ? { manifest: resolve(flags.manifest) } : {}),
+        ...(flags.changed !== undefined ? { changedOnly: parseBoolFlag(flags.changed, 'changed') } : {}),
         previewOnly: parseBoolFlag(flags['preview-only'], 'preview-only'),
         reuseTake: parseBoolFlag(flags['reuse-take'], 'reuse-take'),
         ...(profileArg ? { profiles: profileArg } : {}),

@@ -1,6 +1,7 @@
-import { access, readFile } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { access, copyFile, mkdir, readFile } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import sharp from 'sharp';
+import { comparison, difference } from './images.mjs';
 import { hash } from './run.mjs';
 import { validateEventTrack } from './take-browser.mjs';
 import { probeVideo } from './video.mjs';
@@ -33,18 +34,36 @@ function inspectCast(bytes) {
 }
 
 /** Verify exported bytes against the capture manifest; no application is launched. */
-export async function reviewRun({ manifest, videoReview, outDir, baseline, multimodal } = {}) {
+export async function reviewRun({
+  manifest,
+  videoReview,
+  outDir,
+  baseline,
+  updateBaselines = false,
+  multimodal,
+} = {}) {
   if (!manifest) throw Error('review requires a run.json manifest');
+  if (updateBaselines && !baseline) throw Error('updateBaselines requires a baseline directory');
   manifest = resolve(manifest);
   const report = JSON.parse(await readFile(manifest, 'utf8'));
   const checks = [];
+  const recipes = {};
   const videos = {};
+  const baselinesUpdated = [];
   const check = (name, ok, message) => checks.push({ name, ok: Boolean(ok), message });
+
   check('run', report.version === 1 && report.status === 'complete', `run status: ${report.status}`);
   check('recipes', Object.keys(report.recipes ?? {}).length > 0, 'run contains captured recipes');
+
   for (const [name, artifact] of Object.entries(report.recipes ?? {})) {
+    const startCheckIdx = checks.length;
     check(`${name}:capture`, artifact.status === 'complete', artifact.error ?? `capture status: ${artifact.status}`);
-    if (artifact.status !== 'complete') continue;
+    if (artifact.status !== 'complete') {
+      recipes[name] = { ok: false, status: artifact.status, ...(artifact.error ? { error: artifact.error } : {}) };
+      continue;
+    }
+
+    let baselineInfo = null;
     try {
       const file = resolve(dirname(manifest), artifact.file);
       const bytes = await readFile(file);
@@ -63,17 +82,23 @@ export async function reviewRun({ manifest, videoReview, outDir, baseline, multi
           check(`${name}:captureMode`, track.captureMode === artifact.captureMode, `event-track captureMode ${track.captureMode}; expected ${artifact.captureMode}`);
         }
       }
+
       let actual;
-      const cast = extname(file) === '.cast';
-      const isVideo = ['.mp4', '.webm', '.mov'].includes(extname(file));
+      const ext = extname(file).toLowerCase();
+      const cast = ext === '.cast';
+      const isVideo = ['.mp4', '.webm', '.mov'].includes(ext);
       if (cast) actual = inspectCast(bytes);
       else if (isVideo) actual = await probeVideo(file);
       else {
         const metadata = await sharp(bytes, { animated: true }).metadata();
-        actual = { width: metadata.width, height: metadata.pageHeight ?? metadata.height,
+        actual = {
+          width: metadata.width,
+          height: metadata.pageHeight ?? metadata.height,
           frames: metadata.pages ?? 1,
-          duration: metadata.delay?.reduce((sum, delay) => sum + delay, 0) / 1000 };
+          duration: metadata.delay?.reduce((sum, delay) => sum + delay, 0) / 1000,
+        };
       }
+
       check(`${name}:dimensions`, actual.width === artifact.width && actual.height === artifact.height,
         `dimensions ${actual.width}×${actual.height}; expected ${artifact.width}×${artifact.height}`);
       if (artifact.frames !== undefined)
@@ -85,6 +110,86 @@ export async function reviewRun({ manifest, videoReview, outDir, baseline, multi
         check(`${name}:assertion`, assertion.ok, assertion.message ?? assertion.expect ?? 'capture assertion');
       for (const checkpoint of artifact.checkpoints ?? [])
         check(`${name}:checkpoint`, checkpoint.passed, `expected screen content at ${checkpoint.at}s: ${JSON.stringify(checkpoint.expect)}`);
+
+      const isStillImage = ['.png', '.webp'].includes(ext) && (actual.frames ?? 1) === 1;
+      const verifiedSoFar = checks.slice(startCheckIdx).every((c) => c.ok);
+
+      if (baseline && isStillImage) {
+        const baseRoot = resolve(baseline);
+        const relCandidate = join(baseRoot, artifact.file);
+        const flatCandidate = join(baseRoot, basename(artifact.file));
+
+        if (updateBaselines) {
+          if (verifiedSoFar) {
+            const targetBaseline = (await pathExists(relCandidate))
+              ? relCandidate
+              : (await pathExists(flatCandidate))
+                ? flatCandidate
+                : relCandidate;
+            await mkdir(dirname(targetBaseline), { recursive: true });
+            await copyFile(file, targetBaseline);
+            baselinesUpdated.push(targetBaseline);
+            baselineInfo = {
+              baselineFile: targetBaseline,
+              diffRatio: 0,
+              changedPixels: 0,
+              comparisonFile: null,
+              baselineUpdated: true,
+            };
+            check(`${name}:baseline`, true, `baseline updated: ${targetBaseline}`);
+          }
+        } else {
+          const baselineFile = (await pathExists(relCandidate))
+            ? relCandidate
+            : (await pathExists(flatCandidate))
+              ? flatCandidate
+              : null;
+
+          if (!baselineFile) {
+            let comparisonFile = null;
+            if (outDir) {
+              comparisonFile = join(resolve(outDir), 'comparisons', `${name}.png`);
+              await comparison(null, file, comparisonFile);
+            }
+            baselineInfo = {
+              baselineFile: null,
+              diffRatio: null,
+              changedPixels: null,
+              comparisonFile,
+            };
+            check(`${name}:baseline`, false, `missing baseline image for ${artifact.file}`);
+          } else {
+            const rawDiff = await difference(baselineFile, file);
+            const totalPixels = actual.width * actual.height;
+            const changedPixels = rawDiff === null ? null : Math.round(rawDiff * totalPixels);
+            const diffRatio = rawDiff === null ? null : Number(rawDiff.toFixed(6));
+            const hasDiff = rawDiff === null || changedPixels > 0;
+            let comparisonFile = null;
+            if (hasDiff && outDir) {
+              comparisonFile = join(resolve(outDir), 'comparisons', `${name}.png`);
+              await comparison(baselineFile, file, comparisonFile);
+            }
+            baselineInfo = {
+              baselineFile,
+              diffRatio,
+              changedPixels,
+              comparisonFile,
+            };
+            if (rawDiff === null) {
+              check(`${name}:baseline`, false, 'dimensions differ from baseline image');
+            } else if (changedPixels > 0) {
+              check(
+                `${name}:baseline`,
+                false,
+                `visual diff against baseline: ${changedPixels} changed pixels (${(rawDiff * 100).toFixed(2)}%)`
+              );
+            } else {
+              check(`${name}:baseline`, true, 'matches baseline image');
+            }
+          }
+        }
+      }
+
       if (isVideo && videoReview !== false) {
         const extraOpts = typeof videoReview === 'object' && videoReview !== null ? videoReview : {};
         const timelineRef = typeof artifact.timeline === 'string'
@@ -120,13 +225,34 @@ export async function reviewRun({ manifest, videoReview, outDir, baseline, multi
           check(`${name}:video:${videoCheck.name}`, videoCheck.ok, videoCheck.message);
         }
       }
-    } catch (error) { check(`${name}:file`, false, error.message); }
+
+      const recipeOk = checks.slice(startCheckIdx).every((c) => c.ok);
+      recipes[name] = {
+        ok: recipeOk,
+        status: artifact.status,
+        file,
+        width: actual.width,
+        height: actual.height,
+        ...(baselineInfo ?? {}),
+      };
+    } catch (error) {
+      check(`${name}:file`, false, error.message);
+      recipes[name] = {
+        ok: false,
+        status: artifact.status,
+        error: error.message,
+        ...(baselineInfo ?? {}),
+      };
+    }
   }
+
   return {
     version: 1,
     manifest,
     ok: checks.every(check => check.ok),
     checks,
+    recipes,
+    ...(updateBaselines ? { baselinesUpdated } : {}),
     ...(Object.keys(videos).length > 0 ? { videos } : {}),
   };
 }

@@ -1,6 +1,8 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, extname, resolve } from 'node:path';
 import sharp from 'sharp';
+
+const toSharpInput = async (input) => (Buffer.isBuffer(input) ? input : readFile(input));
 
 /** Stack bands or themes without losing their colour space. */
 export async function stack(buffers, file) {
@@ -28,8 +30,8 @@ export async function stack(buffers, file) {
 
 /** Fraction of visibly different pixels, or null for incompatible dimensions. */
 export async function difference(a, b) {
-  const [x, y] = await Promise.all([a, b].map((file) =>
-    sharp(file).toColourspace('srgb').ensureAlpha().raw().toBuffer({ resolveWithObject: true })));
+  const [x, y] = await Promise.all([a, b].map(async (file) =>
+    sharp(await toSharpInput(file)).toColourspace('srgb').ensureAlpha().raw().toBuffer({ resolveWithObject: true })));
   if (x.info.width !== y.info.width || x.info.height !== y.info.height) return null;
   let changed = 0;
   for (let offset = 0; offset < x.data.length; offset += 4) {
@@ -38,16 +40,67 @@ export async function difference(a, b) {
   return changed / (x.data.length / 4);
 }
 
+async function buildDiffBuffer(before, after) {
+  const [x, y] = await Promise.all([before, after].map(async (file) =>
+    sharp(await toSharpInput(file)).toColourspace('srgb').ensureAlpha().raw().toBuffer({ resolveWithObject: true })));
+  if (x.info.width !== y.info.width || x.info.height !== y.info.height) {
+    const out = Buffer.alloc(y.data.length);
+    for (let offset = 0; offset < y.data.length; offset += 4) {
+      out[offset] = Math.min(255, Math.round(y.data[offset] * 0.45 + 130));
+      out[offset + 1] = Math.round(y.data[offset + 1] * 0.25);
+      out[offset + 2] = Math.round(y.data[offset + 2] * 0.25);
+      out[offset + 3] = 255;
+    }
+    return sharp(out, { raw: { width: y.info.width, height: y.info.height, channels: 4 } }).png().toBuffer();
+  }
+  const out = Buffer.alloc(x.data.length);
+  for (let offset = 0; offset < x.data.length; offset += 4) {
+    const changed = [0, 1, 2, 3].some((channel) => Math.abs(x.data[offset + channel] - y.data[offset + channel]) > 8);
+    if (changed) {
+      out[offset] = 239;
+      out[offset + 1] = 68;
+      out[offset + 2] = 68;
+      out[offset + 3] = 255;
+    } else {
+      out[offset] = Math.round(y.data[offset] * 0.35);
+      out[offset + 1] = Math.round(y.data[offset + 1] * 0.35);
+      out[offset + 2] = Math.round(y.data[offset + 2] * 0.35);
+      out[offset + 3] = 255;
+    }
+  }
+  return sharp(out, { raw: { width: x.info.width, height: x.info.height, channels: 4 } }).png().toBuffer();
+}
+
 export async function comparison(before, after, file) {
+  const outPath = resolve(file);
+  await mkdir(dirname(outPath), { recursive: true });
   const height = 900;
-  const side = (path) => path
-    ? sharp(path).resize({ height, width: 1400, fit: 'inside' }).flatten({ background: '#222' }).toBuffer()
+  const gap = 24;
+  const isPng = extname(outPath).toLowerCase() === '.png';
+  const side = async (input) => input
+    ? sharp(await toSharpInput(input)).resize({ height, width: 1400, fit: 'inside' }).flatten({ background: '#222' }).png().toBuffer()
     : sharp({ create: { width: 600, height, channels: 3, background: '#222' } }).png().toBuffer();
-  const [left, right] = await Promise.all([side(before), side(after)]);
-  const [a, b] = await Promise.all([sharp(left).metadata(), sharp(right).metadata()]);
-  await sharp({ create: { width: a.width + b.width + 24, height, channels: 3, background: '#555' } })
-    .composite([{ input: left, left: 0, top: 0 }, { input: right, left: a.width + 24, top: 0 }])
-    .jpeg({ quality: 82 }).toFile(file);
+
+  const panels = before && after
+    ? await Promise.all([side(before), side(after), buildDiffBuffer(before, after).then((buf) => side(buf))])
+    : await Promise.all([side(before), side(after)]);
+  const metas = await Promise.all(panels.map((panel) => sharp(panel).metadata()));
+  const totalWidth = metas.reduce((sum, meta) => sum + meta.width, 0) + gap * (panels.length - 1);
+
+  let leftOffset = 0;
+  const composites = panels.map((panel, index) => {
+    const item = { input: panel, left: leftOffset, top: 0 };
+    leftOffset += metas[index].width + gap;
+    return item;
+  });
+
+  const pipeline = sharp({ create: { width: totalWidth, height, channels: 3, background: '#555' } })
+    .composite(composites);
+  if (isPng) {
+    await pipeline.png().toFile(outPath);
+  } else {
+    await pipeline.jpeg({ quality: 82 }).toFile(outPath);
+  }
 }
 
 const escape = (value) => String(value).replace(/[&<>"']/g, (char) => ({
