@@ -14,6 +14,7 @@ import {
 } from './timeline.mjs';
 import { projectViewportToRender } from './timeline-scene.mjs';
 import { reviewNarration } from './narration.mjs';
+import { postGoogleGenAiJson, stripJsonCodeFence } from './internal/google-genai.mjs';
 
 const exec = promisify(execFile);
 
@@ -1628,25 +1629,17 @@ async function callGeminiMultimodalReview({ payload, multimodal }) {
     });
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
-    body: JSON.stringify({
+  const data = await postGoogleGenAiJson({
+    model,
+    body: {
       contents: [{ role: 'user', parts }],
       generationConfig: { responseMimeType: 'application/json' },
-    }),
+    },
+    apiKey,
+    fetchImpl,
+    signal: multimodal.signal,
+    label: 'Gemini',
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw Error(`Gemini API returned HTTP ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const data = await response.json();
   const text = data?.candidates?.[0]?.content?.parts
     ?.map((part) => part?.text ?? '')
     .join('\n')
@@ -1663,7 +1656,7 @@ async function callGeminiMultimodalReview({ payload, multimodal }) {
 
   let parsed;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(stripJsonCodeFence(text));
   } catch (error) {
     return {
       ran: true,
