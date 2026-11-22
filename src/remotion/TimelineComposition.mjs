@@ -10,7 +10,7 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from 'remotion';
-import { buildSquirclePath, computeFrameScene } from './layout.mjs';
+import { buildSquirclePath, computeFrameScene } from '../timeline-scene.mjs';
 
 const h = React.createElement;
 
@@ -651,7 +651,10 @@ export function TimelineComposition({ timeline, output, renderVideoElement = tru
   const outerH = windowChrome.outerRect.height;
   const outerRadius = windowChrome.borderRadius;
   const hasRoundedCorners = outerRadius > 0.01;
-  const squirclePath = hasRoundedCorners ? buildSquirclePath(outerW, outerH, outerRadius, 0.6) : '';
+  const squirclePath = React.useMemo(
+    () => (hasRoundedCorners ? buildSquirclePath(outerW, outerH, outerRadius, 0.6) : ''),
+    [hasRoundedCorners, outerW, outerH, outerRadius]
+  );
   const squircleClipId = 'screen-kit-window-squircle';
   const rimGradId = 'screen-kit-window-rim-grad';
   const windowShadowFilter = windowChrome.shadow

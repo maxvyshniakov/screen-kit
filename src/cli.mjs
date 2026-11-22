@@ -316,6 +316,7 @@ try {
         outDir: resolve(outArg),
         ...(columns !== undefined ? { columns } : {}),
         ...(width !== undefined ? { width } : {}),
+        ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}),
       });
       console.log(JSON.stringify(result, null, 2));
     } else if (command === 'narrate') {

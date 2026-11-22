@@ -12,7 +12,7 @@ import {
   sampleCursor,
   validateTimeline,
 } from './timeline.mjs';
-import { projectViewportToRender } from './remotion/layout.mjs';
+import { projectViewportToRender } from './timeline-scene.mjs';
 import { reviewNarration } from './narration.mjs';
 
 const exec = promisify(execFile);
@@ -361,14 +361,24 @@ export async function detectFreezeAndBlackFrames(videoPath, options = {}) {
   };
 }
 
+const CAMERA_ISSUE_CODES = new Set([
+  'CAMERA_OUT_OF_BOUNDS',
+  'STAGE_SMALLER_THAN_CAMERA_OUTPUT',
+  'CAMERA_SCHEMA_INVALID',
+]);
+
 /**
- * Verify timeline validity and camera bounds inside the stage using `validateTimeline`.
+ * Verify timeline validity and camera bounds inside the stage using structured `validateTimeline` issue codes.
  */
 export function verifyCameraBounds(timeline) {
   const validation = validateTimeline(timeline);
-  const cameraBoundsPattern = /visible camera rect|leaves stage|timeline\.camera|timeline\.stage .* must be larger/i;
-  const cameraBoundsErrors = validation.errors.filter((err) => cameraBoundsPattern.test(err));
-  const schemaErrors = validation.errors.filter((err) => !cameraBoundsPattern.test(err));
+  const issues = validation.issues ?? [];
+  const cameraBoundsErrors = issues
+    .filter((issue) => CAMERA_ISSUE_CODES.has(issue.code))
+    .map((issue) => issue.message);
+  const schemaErrors = issues
+    .filter((issue) => !CAMERA_ISSUE_CODES.has(issue.code))
+    .map((issue) => issue.message);
 
   let samplesChecked = 0;
   const keyframes = Array.isArray(timeline?.camera?.keyframes) ? timeline.camera.keyframes.length : 0;
@@ -924,12 +934,16 @@ export async function verifyRenderedCursorPixels({
   baseDir,
   browserExecutable,
   scratchDir,
+  renderStills,
 } = {}) {
   if (!isFiniteNumber(thresholdPx) || thresholdPx <= 0) {
     throw Error('thresholdPx must be a positive finite number');
   }
   if (!Number.isInteger(maxSamples) || maxSamples < 1 || maxSamples > 120) {
     throw Error('maxSamples must be an integer between 1 and 120');
+  }
+  if (renderStills !== undefined && typeof renderStills !== 'function') {
+    throw Error('renderStills must be a function when provided');
   }
 
   const parsedPrimaryColor = parseColor(markerColor);
@@ -1080,7 +1094,8 @@ export async function verifyRenderedCursorPixels({
     samples: effectiveSamples,
   };
 
-  const { renderTimelineStills } = await import('./render-timeline.mjs');
+  const renderStillsFn =
+    renderStills ?? (await import('./render-timeline.mjs')).renderTimelineStills;
   const persistentOutDir = outDir ? resolve(outDir) : null;
   const ephemeralDir = persistentOutDir ? null : await mkdtemp(join(tmpdir(), 'screen-kit-verify-cursor-'));
   const targetStillsDir = persistentOutDir ?? ephemeralDir;
@@ -1115,12 +1130,11 @@ export async function verifyRenderedCursorPixels({
       });
     }
 
-    const rendered = await renderTimelineStills({
+    const rendered = await renderStillsFn({
       timeline: markerTimeline,
       variants: {
         clean: baseVerificationTimeline,
         marker: markerTimeline,
-        altMarker: altMarkerTimeline,
       },
       requests,
       outDir: targetStillsDir,
@@ -1133,50 +1147,72 @@ export async function verifyRenderedCursorPixels({
     });
 
     const byKey = new Map(rendered.stills.map((s) => [s.key, s]));
-    const detectedSamples = [];
+    const locatedByIndex = new Map();
+    const missedSpecs = [];
 
     for (const spec of frameSpecs) {
       const cleanStill = byKey.get(`clean-${spec.index}`);
       const markerStill = byKey.get(`marker-${spec.index}`);
 
-      let located = await locateCursorMarker(markerStill.file, {
+      const located = await locateCursorMarker(markerStill.file, {
         color: parsedPrimaryColor,
         cleanImage: cleanStill.file,
         tolerance: 48,
         diffThreshold: 18,
       });
-
-      // Fallback if the background directly behind the cursor matched `markerColor` (e.g. solid #ff00ff UI)
+      locatedByIndex.set(spec.index, located);
       if (!located.found) {
-        const altFilename = `cursor-alt-${padIndex(spec.index)}.png`;
-        const altRendered = await renderTimelineStills({
-          timeline: altMarkerTimeline,
-          variants: { altMarker: altMarkerTimeline },
-          requests: [{ key: `alt-${spec.index}`, variant: 'altMarker', frame: spec.frame, filename: altFilename }],
-          outDir: targetStillsDir,
-          width: renderWidth,
-          height: renderHeight,
-          fps: renderFps,
-          baseDir: resolvedBaseDir,
-          browserExecutable,
-          scratchDir,
-        });
-        located = await locateCursorMarker(altRendered.stills[0].file, {
+        missedSpecs.push(spec);
+      }
+    }
+
+    // Batched fallback if the background directly behind the cursor matched `markerColor` (e.g. solid #ff00ff UI)
+    let altStills = [];
+    if (missedSpecs.length > 0) {
+      const altRequests = missedSpecs.map((spec) => ({
+        key: `alt-${spec.index}`,
+        variant: 'altMarker',
+        frame: spec.frame,
+        filename: `cursor-alt-${padIndex(spec.index)}.png`,
+      }));
+      const altRendered = await renderStillsFn({
+        timeline: altMarkerTimeline,
+        variants: { altMarker: altMarkerTimeline },
+        requests: altRequests,
+        outDir: targetStillsDir,
+        width: renderWidth,
+        height: renderHeight,
+        fps: renderFps,
+        baseDir: resolvedBaseDir,
+        browserExecutable,
+        scratchDir,
+      });
+      altStills = altRendered.stills ?? [];
+      const altByKey = new Map(altStills.map((s) => [s.key, s]));
+      for (const spec of missedSpecs) {
+        const cleanStill = byKey.get(`clean-${spec.index}`);
+        const altStill = altByKey.get(`alt-${spec.index}`);
+        if (!altStill) continue;
+        const altLocated = await locateCursorMarker(altStill.file, {
           color: parsedAltColor,
           cleanImage: cleanStill.file,
           tolerance: 48,
           diffThreshold: 18,
         });
+        locatedByIndex.set(spec.index, altLocated);
       }
+    }
 
-      detectedSamples.push({
+    const detectedSamples = frameSpecs.map((spec) => {
+      const located = locatedByIndex.get(spec.index);
+      return {
         t: spec.frameT,
         requestedT: round(spec.requestedT, 4),
         x: located.x,
         y: located.y,
         found: located.found,
-      });
-    }
+      };
+    });
 
     const accuracy = verifyCursorAccuracy({
       timeline: {
@@ -1207,7 +1243,9 @@ export async function verifyRenderedCursorPixels({
       renderWidth: rendered.width,
       renderHeight: rendered.height,
       fps: rendered.fps,
-      ...(persistentOutDir ? { outDir: persistentOutDir, stills: rendered.stills } : {}),
+      ...(persistentOutDir
+        ? { outDir: persistentOutDir, stills: [...rendered.stills, ...altStills] }
+        : {}),
     };
   } finally {
     if (ephemeralDir) {

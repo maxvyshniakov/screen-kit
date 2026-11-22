@@ -18,7 +18,7 @@ import {
 import { COLOR_SPACES, SAFE_OUTPUT_ID_RE, assertValidTimeline } from './timeline.mjs';
 import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
-import { computeFrameScene, projectViewportToRender, screenToRender } from './remotion/layout.mjs';
+import { computeFrameScene, projectViewportToRender, screenToRender } from './timeline-scene.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
 
 const exec = promisify(execFile);
@@ -721,6 +721,137 @@ async function tagMp4DisplayP3Cicp(filePath, codec, signal) {
   }
 }
 
+const P3_CHROMIUM_OPTIONS = {
+  flags: {
+    'force-color-profile': 'display-p3-d65',
+  },
+};
+
+function assertValidColorSpaceOption(colorSpace) {
+  if (colorSpace !== undefined && !COLOR_SPACES.includes(colorSpace)) {
+    throw Error(`colorSpace must be one of ${COLOR_SPACES.join(', ')} (received ${String(colorSpace)})`);
+  }
+}
+
+/**
+ * Shared Remotion 4 render session lifecycle owning `mkdtemp`, deduplicated media & variant
+ * staging, single Rspack `bundle()`, lazy sRGB / Display P3 browser pool, symmetric `AbortSignal`
+ * listener cleanup, and temporary directory teardown.
+ */
+async function withRemotionSession(
+  {
+    prefix = 'screen-kit-remotion-',
+    variants,
+    baseDir,
+    browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
+    logLevel = 'error',
+    signal,
+    scratchDir,
+    abortMessage = 'Timeline render aborted',
+  },
+  runFn
+) {
+  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
+  await mkdir(scratchBase, { recursive: true });
+  const tempDir = await mkdtemp(join(scratchBase, prefix));
+  const publicDir = join(tempDir, 'public');
+  const bundleOutDir = join(tempDir, 'bundle');
+  const tempOutputsDir = join(tempDir, 'outputs');
+
+  const browsers = new Map();
+  const getBrowserForColorSpace = async (targetColorSpace) => {
+    const key = targetColorSpace === 'p3' ? 'p3' : 'srgb';
+    if (browsers.has(key)) return browsers.get(key);
+    if (key === 'p3') {
+      const p3Executable = browserExecutable ?? findLocalFullChromiumExecutable();
+      const instance = await openBrowser('chrome', {
+        ...(p3Executable
+          ? { browserExecutable: p3Executable, chromeMode: 'chrome-for-testing' }
+          : {}),
+        chromiumOptions: P3_CHROMIUM_OPTIONS,
+        logLevel,
+      });
+      browsers.set(key, instance);
+      return instance;
+    }
+    const instance = await openBrowser('chrome', {
+      ...(browserExecutable ? { browserExecutable } : {}),
+      logLevel,
+    });
+    browsers.set(key, instance);
+    return instance;
+  };
+
+  const getChromiumOptionsForColorSpace = (targetColorSpace) =>
+    targetColorSpace === 'p3' ? P3_CHROMIUM_OPTIONS : undefined;
+
+  const remotionCancel = signal ? makeCancelSignal() : null;
+  const onAbort = remotionCancel ? () => remotionCancel.cancel() : null;
+  if (signal && onAbort) {
+    if (signal.aborted) {
+      remotionCancel.cancel();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw Error(abortMessage);
+    }
+  };
+
+  try {
+    throwIfAborted();
+    await mkdir(publicDir, { recursive: true });
+    await mkdir(tempOutputsDir, { recursive: true });
+
+    const sharedStaging = {
+      counter: 0,
+      stagedMap: new Map(),
+      validatedVideos: new Set(),
+      validatedImages: new Set(),
+    };
+    const stagedVariants = new Map();
+    for (const [variantId, variantTimeline] of variants) {
+      throwIfAborted();
+      const staged = await prepareStagedTimeline(variantTimeline, baseDir, publicDir, sharedStaging);
+      stagedVariants.set(variantId, staged);
+    }
+
+    throwIfAborted();
+    const serveUrl = await bundle({
+      entryPoint: REMOTION_ENTRY,
+      outDir: bundleOutDir,
+      publicDir,
+      symlinkPublicDir: true,
+      enableCaching: false,
+      rspack: true,
+    });
+
+    throwIfAborted();
+
+    return await runFn({
+      serveUrl,
+      tempOutputsDir,
+      stagedVariants,
+      stagedTimeline: stagedVariants.get('default'),
+      getBrowserForColorSpace,
+      getChromiumOptionsForColorSpace,
+      cancelSignal: remotionCancel?.cancelSignal,
+      throwIfAborted,
+    });
+  } finally {
+    if (signal && onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+    for (const instance of browsers.values()) {
+      await instance.close({ silent: true }).catch(() => {});
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 /**
  * Headlessly render a validated `timeline.json` (or timeline object) and its referenced take media
  * via Remotion 4 into `web-loop`, `youtube-master`, or explicit output targets.
@@ -754,227 +885,180 @@ export async function renderTimeline({
     colorSpace,
   });
 
-  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
-  await mkdir(scratchBase, { recursive: true });
-  const tempDir = await mkdtemp(join(scratchBase, 'screen-kit-remotion-'));
-  const publicDir = join(tempDir, 'public');
-  const bundleOutDir = join(tempDir, 'bundle');
-  const tempOutputsDir = join(tempDir, 'outputs');
-
-  const browsers = new Map();
-  const getBrowserForColorSpace = async (targetColorSpace) => {
-    const key = targetColorSpace === 'p3' ? 'p3' : 'srgb';
-    if (browsers.has(key)) return browsers.get(key);
-    if (key === 'p3') {
-      const p3Executable = browserExecutable ?? findLocalFullChromiumExecutable();
-      const p3ChromiumOptions = {
-        flags: {
-          'force-color-profile': 'display-p3-d65',
-        },
-      };
-      const instance = await openBrowser('chrome', {
-        ...(p3Executable ? { browserExecutable: p3Executable, chromeMode: 'chrome-for-testing' } : {}),
-        chromiumOptions: p3ChromiumOptions,
-        logLevel,
-      });
-      browsers.set(key, instance);
-      return instance;
-    }
-    const instance = await openBrowser('chrome', {
-      ...(browserExecutable ? { browserExecutable } : {}),
+  return withRemotionSession(
+    {
+      prefix: 'screen-kit-remotion-',
+      variants: [['default', timeline]],
+      baseDir,
+      browserExecutable,
       logLevel,
-    });
-    browsers.set(key, instance);
-    return instance;
-  };
+      signal,
+      scratchDir,
+      abortMessage: 'Timeline render aborted',
+    },
+    async ({
+      serveUrl,
+      tempOutputsDir,
+      stagedTimeline,
+      getBrowserForColorSpace,
+      getChromiumOptionsForColorSpace,
+      cancelSignal,
+      throwIfAborted,
+    }) => {
+      const hasAudio = stagedTimeline.audio.tracks.length > 0;
+      const stagedOutputs = [];
+      const p3FfmpegOverride = buildDisplayP3FfmpegOverride();
 
-  try {
-    await mkdir(publicDir, { recursive: true });
-    await mkdir(tempOutputsDir, { recursive: true });
+      for (const target of plan.targets) {
+        throwIfAborted();
+        const isP3 = target.colorSpace === 'p3';
+        const browser = await getBrowserForColorSpace(target.colorSpace);
+        const chromiumOptions = getChromiumOptionsForColorSpace(target.colorSpace);
 
-    const stagedTimeline = await prepareStagedTimeline(timeline, baseDir, publicDir);
+        const inputProps = {
+          timeline: stagedTimeline,
+          output: {
+            id: target.id,
+            width: target.width,
+            height: target.height,
+            fps: target.fps,
+            colorSpace: target.colorSpace,
+          },
+        };
 
-    const serveUrl = await bundle({
-      entryPoint: REMOTION_ENTRY,
-      outDir: bundleOutDir,
-      publicDir,
-      symlinkPublicDir: true,
-      enableCaching: false,
-      rspack: true,
-    });
-
-    if (signal?.aborted) {
-      throw Error('Timeline render aborted');
-    }
-    const remotionCancel = signal ? makeCancelSignal() : null;
-    if (signal && remotionCancel) {
-      signal.addEventListener('abort', () => remotionCancel.cancel(), { once: true });
-    }
-
-    const hasAudio = stagedTimeline.audio.tracks.length > 0;
-    const stagedOutputs = [];
-    const p3FfmpegOverride = buildDisplayP3FfmpegOverride();
-
-    for (const target of plan.targets) {
-      if (signal?.aborted) {
-        throw Error('Timeline render aborted');
-      }
-      const isP3 = target.colorSpace === 'p3';
-      const browser = await getBrowserForColorSpace(target.colorSpace);
-      const p3ChromiumOptions = isP3
-        ? { flags: { 'force-color-profile': 'display-p3-d65' } }
-        : undefined;
-
-      const inputProps = {
-        timeline: stagedTimeline,
-        output: {
-          id: target.id,
-          width: target.width,
-          height: target.height,
-          fps: target.fps,
-          colorSpace: target.colorSpace,
-        },
-      };
-
-      const composition = await selectComposition({
-        serveUrl,
-        id: COMPOSITION_ID,
-        inputProps,
-        puppeteerInstance: browser,
-        ...(p3ChromiumOptions ? { chromiumOptions: p3ChromiumOptions } : {}),
-        logLevel,
-      });
-
-      const tempFile = assertPathInsideDir(
-        join(tempOutputsDir, `${target.id}-${target.role}-${randomUUID()}.${target.format}`),
-        tempOutputsDir,
-        'temp render output'
-      );
-      assertPathInsideDir(target.file, plan.outDir, 'render output file');
-
-      if (target.kind === 'still') {
-        const maxFrame = Math.max(0, composition.durationInFrames - 1);
-        const frame = Math.min(maxFrame, Math.max(0, Math.round((target.posterTime ?? 0) * composition.fps)));
-        await renderStill({
+        const composition = await selectComposition({
           serveUrl,
-          composition,
+          id: COMPOSITION_ID,
           inputProps,
-          frame,
-          imageFormat: target.format,
-          output: tempFile,
           puppeteerInstance: browser,
-          ...(p3ChromiumOptions ? { chromiumOptions: p3ChromiumOptions } : {}),
-          ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
-          overwrite: true,
+          ...(chromiumOptions ? { chromiumOptions } : {}),
           logLevel,
         });
 
-        const meta = await sharp(tempFile).metadata();
-        if (!meta.width || !meta.height) {
-          throw Error(`Poster render produced invalid image for ${target.id}`);
-        }
-        const bytes = await readFile(tempFile);
-        stagedOutputs.push({
-          tempFile,
-          destination: target.file,
-          record: {
-            id: target.id,
-            role: target.role,
-            format: target.format,
-            file: target.file,
-            width: meta.width,
-            height: meta.height,
+        const tempFile = assertPathInsideDir(
+          join(tempOutputsDir, `${target.id}-${target.role}-${randomUUID()}.${target.format}`),
+          tempOutputsDir,
+          'temp render output'
+        );
+        assertPathInsideDir(target.file, plan.outDir, 'render output file');
+
+        if (target.kind === 'still') {
+          const maxFrame = Math.max(0, composition.durationInFrames - 1);
+          const frame = Math.min(maxFrame, Math.max(0, Math.round((target.posterTime ?? 0) * composition.fps)));
+          await renderStill({
+            serveUrl,
+            composition,
+            inputProps,
             frame,
-            bytes: bytes.length,
-            sha256: sha256(bytes),
-          },
-        });
-      } else {
-        const crf = target.codec === 'vp9' ? 20 : 15;
-        await renderMedia({
-          serveUrl,
-          composition,
-          inputProps,
-          codec: target.codec,
-          imageFormat: 'png',
-          crf,
-          pixelFormat: 'yuv420p',
-          colorSpace: 'bt709',
-          muted: !hasAudio,
-          outputLocation: tempFile,
-          puppeteerInstance: browser,
-          ...(isP3
-            ? {
-                disableSharedMemoryCapture: true,
-                chromiumOptions: p3ChromiumOptions,
-                ffmpegOverride: p3FfmpegOverride,
-              }
-            : {}),
-          ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
-          overwrite: true,
-          ...(concurrency !== undefined ? { concurrency } : {}),
-          logLevel,
-        });
+            imageFormat: target.format,
+            output: tempFile,
+            puppeteerInstance: browser,
+            ...(chromiumOptions ? { chromiumOptions } : {}),
+            ...(cancelSignal ? { cancelSignal } : {}),
+            overwrite: true,
+            logLevel,
+          });
 
-        if (isP3 && target.format === 'mp4') {
-          await tagMp4DisplayP3Cicp(tempFile, target.codec, signal);
-        }
+          const meta = await sharp(tempFile).metadata();
+          if (!meta.width || !meta.height) {
+            throw Error(`Poster render produced invalid image for ${target.id}`);
+          }
+          const bytes = await readFile(tempFile);
+          stagedOutputs.push({
+            tempFile,
+            destination: target.file,
+            record: {
+              id: target.id,
+              role: target.role,
+              format: target.format,
+              file: target.file,
+              width: meta.width,
+              height: meta.height,
+              frame,
+              bytes: bytes.length,
+              sha256: sha256(bytes),
+            },
+          });
+        } else {
+          const crf = target.codec === 'vp9' ? 20 : 15;
+          await renderMedia({
+            serveUrl,
+            composition,
+            inputProps,
+            codec: target.codec,
+            imageFormat: 'png',
+            crf,
+            pixelFormat: 'yuv420p',
+            colorSpace: 'bt709',
+            muted: !hasAudio,
+            outputLocation: tempFile,
+            puppeteerInstance: browser,
+            ...(isP3
+              ? {
+                  disableSharedMemoryCapture: true,
+                  chromiumOptions,
+                  ffmpegOverride: p3FfmpegOverride,
+                }
+              : {}),
+            ...(cancelSignal ? { cancelSignal } : {}),
+            overwrite: true,
+            ...(concurrency !== undefined ? { concurrency } : {}),
+            logLevel,
+          });
 
-        const info = await probeVideo(tempFile);
-        if (!info.frames || !(info.duration > 0)) {
-          throw Error(`Remotion produced an empty video for ${target.id} (${target.format})`);
+          if (isP3 && target.format === 'mp4') {
+            await tagMp4DisplayP3Cicp(tempFile, target.codec, signal);
+          }
+
+          const info = await probeVideo(tempFile);
+          if (!info.frames || !(info.duration > 0)) {
+            throw Error(`Remotion produced an empty video for ${target.id} (${target.format})`);
+          }
+          const bytes = await readFile(tempFile);
+          stagedOutputs.push({
+            tempFile,
+            destination: target.file,
+            record: {
+              id: target.id,
+              role: target.role,
+              format: target.format,
+              file: target.file,
+              codec: info.codec,
+              width: info.width,
+              height: info.height,
+              frames: info.frames,
+              duration: info.duration,
+              fps: info.fps,
+              audio: info.audio,
+              colorSpace: info.colorSpace,
+              colorPrimaries: info.colorPrimaries,
+              colorTransfer: info.colorTransfer,
+              colorRange: info.colorRange,
+              loop: target.loop,
+              bytes: bytes.length,
+              sha256: sha256(bytes),
+            },
+          });
         }
-        const bytes = await readFile(tempFile);
-        stagedOutputs.push({
-          tempFile,
-          destination: target.file,
-          record: {
-            id: target.id,
-            role: target.role,
-            format: target.format,
-            file: target.file,
-            codec: info.codec,
-            width: info.width,
-            height: info.height,
-            frames: info.frames,
-            duration: info.duration,
-            fps: info.fps,
-            audio: info.audio,
-            colorSpace: info.colorSpace,
-            colorPrimaries: info.colorPrimaries,
-            colorTransfer: info.colorTransfer,
-            colorRange: info.colorRange,
-            loop: target.loop,
-            bytes: bytes.length,
-            sha256: sha256(bytes),
-          },
-        });
       }
-    }
 
-    if (signal?.aborted) {
-      throw Error('Timeline render aborted');
-    }
+      throwIfAborted();
 
-    const renderedOutputs = [];
-    for (const item of stagedOutputs) {
-      await moveFileAtomic(item.tempFile, item.destination);
-      renderedOutputs.push(item.record);
-    }
+      const renderedOutputs = [];
+      for (const item of stagedOutputs) {
+        await moveFileAtomic(item.tempFile, item.destination);
+        renderedOutputs.push(item.record);
+      }
 
-    return {
-      renderer: 'remotion-4',
-      ...(timelineFile ? { timelineFile } : {}),
-      mode: plan.mode,
-      outDir: plan.outDir,
-      outputs: renderedOutputs,
-    };
-  } finally {
-    for (const instance of browsers.values()) {
-      await instance.close({ silent: true }).catch(() => {});
+      return {
+        renderer: 'remotion-4',
+        ...(timelineFile ? { timelineFile } : {}),
+        mode: plan.mode,
+        outDir: plan.outDir,
+        outputs: renderedOutputs,
+      };
     }
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  );
 }
 
 /**
@@ -989,6 +1073,7 @@ export async function renderTimelineStills({
   width,
   height,
   fps,
+  colorSpace,
   cwd,
   baseDir: explicitBaseDir,
   browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
@@ -1002,6 +1087,7 @@ export async function renderTimelineStills({
   if (!Array.isArray(requests) || requests.length === 0) {
     throw Error('renderTimelineStills requires a non-empty requests array');
   }
+  assertValidColorSpaceOption(colorSpace);
 
   const loaded = await loadTimelineInput(timelineInput, cwd);
   const baseTimeline = loaded.timeline;
@@ -1033,169 +1119,142 @@ export async function renderTimelineStills({
     assertPathInsideDir(join(targetOutDir, candidateFilename), targetOutDir, `requests[${i}] output file`);
   }
 
-  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
-  await mkdir(scratchBase, { recursive: true });
-  const tempDir = await mkdtemp(join(scratchBase, 'screen-kit-stills-'));
-  const publicDir = join(tempDir, 'public');
-  const bundleOutDir = join(tempDir, 'bundle');
-  const tempOutputsDir = join(tempDir, 'outputs');
-
-  let browser = null;
-  try {
-    await mkdir(publicDir, { recursive: true });
-    await mkdir(tempOutputsDir, { recursive: true });
-
-    const sharedStaging = {
-      counter: 0,
-      stagedMap: new Map(),
-      validatedVideos: new Set(),
-      validatedImages: new Set(),
-    };
-    const stagedVariants = new Map();
-    for (const [variantId, variantTimeline] of variantEntries) {
-      const staged = await prepareStagedTimeline(variantTimeline, baseDir, publicDir, sharedStaging);
-      stagedVariants.set(variantId, staged);
-    }
-
-    const serveUrl = await bundle({
-      entryPoint: REMOTION_ENTRY,
-      outDir: bundleOutDir,
-      publicDir,
-      symlinkPublicDir: true,
-      enableCaching: false,
-      rspack: true,
-    });
-
-    browser = await openBrowser('chrome', {
-      ...(browserExecutable ? { browserExecutable } : {}),
+  return withRemotionSession(
+    {
+      prefix: 'screen-kit-stills-',
+      variants: variantEntries,
+      baseDir,
+      browserExecutable,
       logLevel,
-    });
-
-    if (signal?.aborted) {
-      throw Error('Timeline still render aborted');
-    }
-    const remotionCancel = signal ? makeCancelSignal() : null;
-    if (signal && remotionCancel) {
-      signal.addEventListener('abort', () => remotionCancel.cancel(), { once: true });
-    }
-
-    const compositionCache = new Map();
-    const getVariantContext = async (variantId) => {
-      if (compositionCache.has(variantId)) return compositionCache.get(variantId);
-      const stagedTimeline = stagedVariants.get(variantId);
-      if (!stagedTimeline) {
-        throw Error(`Unknown timeline variant in renderTimelineStills: ${variantId}`);
-      }
-      const inputProps = {
-        timeline: stagedTimeline,
-        output: {
-          id: `still-${variantId}`,
-          width: renderWidth,
-          height: renderHeight,
-          fps: renderFps,
-        },
+      signal,
+      scratchDir,
+      abortMessage: 'Timeline still render aborted',
+    },
+    async ({
+      serveUrl,
+      tempOutputsDir,
+      stagedVariants,
+      getBrowserForColorSpace,
+      getChromiumOptionsForColorSpace,
+      cancelSignal,
+      throwIfAborted,
+    }) => {
+      const compositionCache = new Map();
+      const getVariantContext = async (variantId) => {
+        if (compositionCache.has(variantId)) return compositionCache.get(variantId);
+        const stagedTimeline = stagedVariants.get(variantId);
+        if (!stagedTimeline) {
+          throw Error(`Unknown timeline variant in renderTimelineStills: ${variantId}`);
+        }
+        const resolvedColorSpace =
+          colorSpace ?? stagedTimeline.take?.colorSpace ?? baseTimeline.take?.colorSpace ?? 'srgb';
+        const browser = await getBrowserForColorSpace(resolvedColorSpace);
+        const chromiumOptions = getChromiumOptionsForColorSpace(resolvedColorSpace);
+        const inputProps = {
+          timeline: stagedTimeline,
+          output: {
+            id: `still-${variantId}`,
+            width: renderWidth,
+            height: renderHeight,
+            fps: renderFps,
+            colorSpace: resolvedColorSpace,
+          },
+        };
+        const composition = await selectComposition({
+          serveUrl,
+          id: COMPOSITION_ID,
+          inputProps,
+          puppeteerInstance: browser,
+          ...(chromiumOptions ? { chromiumOptions } : {}),
+          logLevel,
+        });
+        const ctx = { inputProps, composition, browser, chromiumOptions };
+        compositionCache.set(variantId, ctx);
+        return ctx;
       };
-      const composition = await selectComposition({
-        serveUrl,
-        id: COMPOSITION_ID,
-        inputProps,
-        puppeteerInstance: browser,
-        logLevel,
-      });
-      const ctx = { inputProps, composition };
-      compositionCache.set(variantId, ctx);
-      return ctx;
-    };
 
-    const stagedStills = [];
-    for (let i = 0; i < requests.length; i += 1) {
-      if (signal?.aborted) {
-        throw Error('Timeline still render aborted');
-      }
-      const req = requests[i];
-      const variantId = req.variant ?? 'default';
-      const { inputProps, composition } = await getVariantContext(variantId);
-      const maxFrame = Math.max(0, composition.durationInFrames - 1);
-      const requestedFrame = Number.isInteger(req.frame)
-        ? req.frame
-        : Math.floor(Math.max(0, Number(req.t ?? 0)) * composition.fps + 1e-9);
-      const frame = Math.min(maxFrame, Math.max(0, requestedFrame));
-      const filename = assertSafeStillFilename(
-        req.filename ?? `${variantId}-${String(i).padStart(3, '0')}.png`,
-        `requests[${i}].filename`
-      );
-      const tempStillFile = assertPathInsideDir(
-        join(tempOutputsDir, `${String(i).padStart(3, '0')}-${filename}`),
-        tempOutputsDir,
-        `requests[${i}] temp still file`
-      );
+      const stagedStills = [];
+      for (let i = 0; i < requests.length; i += 1) {
+        throwIfAborted();
+        const req = requests[i];
+        const variantId = req.variant ?? 'default';
+        const { inputProps, composition, browser, chromiumOptions } = await getVariantContext(variantId);
+        const maxFrame = Math.max(0, composition.durationInFrames - 1);
+        const requestedFrame = Number.isInteger(req.frame)
+          ? req.frame
+          : Math.floor(Math.max(0, Number(req.t ?? 0)) * composition.fps + 1e-9);
+        const frame = Math.min(maxFrame, Math.max(0, requestedFrame));
+        const filename = assertSafeStillFilename(
+          req.filename ?? `${variantId}-${String(i).padStart(3, '0')}.png`,
+          `requests[${i}].filename`
+        );
+        const tempStillFile = assertPathInsideDir(
+          join(tempOutputsDir, `${String(i).padStart(3, '0')}-${filename}`),
+          tempOutputsDir,
+          `requests[${i}] temp still file`
+        );
 
-      await renderStill({
-        serveUrl,
-        composition,
-        inputProps,
-        frame,
-        imageFormat: 'png',
-        output: tempStillFile,
-        puppeteerInstance: browser,
-        ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
-        overwrite: true,
-        logLevel,
-      });
-
-      const meta = await sharp(tempStillFile).metadata();
-      if (!meta.width || !meta.height) {
-        throw Error(`Still render produced invalid image for ${filename}`);
-      }
-      const bytes = await readFile(tempStillFile);
-      const destination = assertPathInsideDir(
-        join(targetOutDir, filename),
-        targetOutDir,
-        `requests[${i}] still output file`
-      );
-      stagedStills.push({
-        tempFile: tempStillFile,
-        destination,
-        record: {
-          key: req.key ?? `${variantId}:${frame}`,
-          variant: variantId,
+        await renderStill({
+          serveUrl,
+          composition,
+          inputProps,
           frame,
-          t: frame / composition.fps,
-          filename,
-          file: destination,
-          width: meta.width,
-          height: meta.height,
-          bytes: bytes.length,
-          sha256: sha256(bytes),
-        },
-      });
-    }
+          imageFormat: 'png',
+          output: tempStillFile,
+          puppeteerInstance: browser,
+          ...(chromiumOptions ? { chromiumOptions } : {}),
+          ...(cancelSignal ? { cancelSignal } : {}),
+          overwrite: true,
+          logLevel,
+        });
 
-    if (signal?.aborted) {
-      throw Error('Timeline still render aborted');
-    }
+        const meta = await sharp(tempStillFile).metadata();
+        if (!meta.width || !meta.height) {
+          throw Error(`Still render produced invalid image for ${filename}`);
+        }
+        const bytes = await readFile(tempStillFile);
+        const destination = assertPathInsideDir(
+          join(targetOutDir, filename),
+          targetOutDir,
+          `requests[${i}] still output file`
+        );
+        stagedStills.push({
+          tempFile: tempStillFile,
+          destination,
+          record: {
+            key: req.key ?? `${variantId}:${frame}`,
+            variant: variantId,
+            frame,
+            t: frame / composition.fps,
+            filename,
+            file: destination,
+            width: meta.width,
+            height: meta.height,
+            bytes: bytes.length,
+            sha256: sha256(bytes),
+          },
+        });
+      }
 
-    const stills = [];
-    for (const item of stagedStills) {
-      await moveFileAtomic(item.tempFile, item.destination);
-      stills.push(item.record);
-    }
+      throwIfAborted();
 
-    return {
-      renderer: 'remotion-4',
-      ...(loaded.timelineFile ? { timelineFile: loaded.timelineFile } : {}),
-      outDir: targetOutDir,
-      width: renderWidth,
-      height: renderHeight,
-      fps: renderFps,
-      stills,
-    };
-  } finally {
-    if (browser) {
-      await browser.close({ silent: true }).catch(() => {});
+      const stills = [];
+      for (const item of stagedStills) {
+        await moveFileAtomic(item.tempFile, item.destination);
+        stills.push(item.record);
+      }
+
+      return {
+        renderer: 'remotion-4',
+        ...(loaded.timelineFile ? { timelineFile: loaded.timelineFile } : {}),
+        outDir: targetOutDir,
+        width: renderWidth,
+        height: renderHeight,
+        fps: renderFps,
+        stills,
+      };
     }
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  );
 }
 
 function slugifyPreviewLabel(label) {
@@ -1308,6 +1367,7 @@ export async function renderTimelinePreview({
   maxFrames = 12,
   width,
   columns = 3,
+  colorSpace,
   cwd,
   browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
   logLevel = 'error',
@@ -1324,6 +1384,7 @@ export async function renderTimelinePreview({
   if (width !== undefined && (!(typeof width === 'number' && Number.isFinite(width)) || width < 2 || width > 7680)) {
     throw Error('width must be a finite number between 2 and 7680');
   }
+  assertValidColorSpaceOption(colorSpace);
 
   const { timeline, timelineFile, baseDir } = await loadTimelineInput(timelineInput, cwd);
   assertValidTimeline(timeline);
@@ -1355,153 +1416,136 @@ export async function renderTimelinePreview({
   const previewWidth = evenDimension(width ?? Math.min(1280, timeline.camera.outputWidth));
   const previewHeight = evenDimension(previewWidth * aspect);
   const previewFps = timeline.take.fps;
+  const previewColorSpace = colorSpace ?? timeline.take?.colorSpace ?? 'srgb';
   const targetOutDir = resolve(cwd ?? process.cwd(), destArg);
 
-  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
-  await mkdir(scratchBase, { recursive: true });
-  const tempDir = await mkdtemp(join(scratchBase, 'screen-kit-preview-'));
-  const publicDir = join(tempDir, 'public');
-  const bundleOutDir = join(tempDir, 'bundle');
-  const tempOutputsDir = join(tempDir, 'outputs');
-
-  let browser = null;
-  try {
-    await mkdir(publicDir, { recursive: true });
-    await mkdir(tempOutputsDir, { recursive: true });
-
-    const stagedTimeline = await prepareStagedTimeline(timeline, baseDir, publicDir);
-
-    const serveUrl = await bundle({
-      entryPoint: REMOTION_ENTRY,
-      outDir: bundleOutDir,
-      publicDir,
-      symlinkPublicDir: true,
-      enableCaching: false,
-      rspack: true,
-    });
-
-    browser = await openBrowser('chrome', {
-      ...(browserExecutable ? { browserExecutable } : {}),
+  return withRemotionSession(
+    {
+      prefix: 'screen-kit-preview-',
+      variants: [['default', timeline]],
+      baseDir,
+      browserExecutable,
       logLevel,
-    });
-
-    if (signal?.aborted) {
-      throw Error('Timeline preview aborted');
-    }
-    const remotionCancel = signal ? makeCancelSignal() : null;
-    if (signal && remotionCancel) {
-      signal.addEventListener('abort', () => remotionCancel.cancel(), { once: true });
-    }
-
-    const inputProps = {
-      timeline: stagedTimeline,
-      output: {
-        id: 'preview',
-        width: previewWidth,
-        height: previewHeight,
-        fps: previewFps,
-      },
-    };
-
-    const composition = await selectComposition({
+      signal,
+      scratchDir,
+      abortMessage: 'Timeline preview aborted',
+    },
+    async ({
       serveUrl,
-      id: COMPOSITION_ID,
-      inputProps,
-      puppeteerInstance: browser,
-      logLevel,
-    });
+      tempOutputsDir,
+      stagedTimeline,
+      getBrowserForColorSpace,
+      getChromiumOptionsForColorSpace,
+      cancelSignal,
+      throwIfAborted,
+    }) => {
+      const browser = await getBrowserForColorSpace(previewColorSpace);
+      const chromiumOptions = getChromiumOptionsForColorSpace(previewColorSpace);
 
-    const maxFrame = Math.max(0, composition.durationInFrames - 1);
-    const stagedStills = [];
+      const inputProps = {
+        timeline: stagedTimeline,
+        output: {
+          id: 'preview',
+          width: previewWidth,
+          height: previewHeight,
+          fps: previewFps,
+          colorSpace: previewColorSpace,
+        },
+      };
 
-    for (const target of targets) {
-      if (signal?.aborted) {
-        throw Error('Timeline preview aborted');
-      }
-      const frame = Math.min(maxFrame, Math.max(0, Math.round(target.t * composition.fps)));
-      const tempStillFile = join(tempOutputsDir, target.filename);
-      await renderStill({
+      const composition = await selectComposition({
         serveUrl,
-        composition,
+        id: COMPOSITION_ID,
         inputProps,
-        frame,
-        imageFormat: 'png',
-        output: tempStillFile,
         puppeteerInstance: browser,
-        ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
-        overwrite: true,
+        ...(chromiumOptions ? { chromiumOptions } : {}),
         logLevel,
       });
 
-      const meta = await sharp(tempStillFile).metadata();
-      if (!meta.width || !meta.height) {
-        throw Error(`Preview render produced invalid image for ${target.filename}`);
-      }
-      const bytes = await readFile(tempStillFile);
-      const destination = join(targetOutDir, 'stills', target.filename);
-      stagedStills.push({
-        tempFile: tempStillFile,
-        destination,
-        record: {
-          index: target.index,
-          t: target.t,
-          requestedT: target.requestedT,
+      const maxFrame = Math.max(0, composition.durationInFrames - 1);
+      const stagedStills = [];
+
+      for (const target of targets) {
+        throwIfAborted();
+        const frame = Math.min(maxFrame, Math.max(0, Math.round(target.t * composition.fps)));
+        const tempStillFile = join(tempOutputsDir, target.filename);
+        await renderStill({
+          serveUrl,
+          composition,
+          inputProps,
           frame,
-          label: target.label,
-          filename: target.filename,
-          file: destination,
-          width: meta.width,
-          height: meta.height,
-          bytes: bytes.length,
-          sha256: sha256(bytes),
-        },
+          imageFormat: 'png',
+          output: tempStillFile,
+          puppeteerInstance: browser,
+          ...(chromiumOptions ? { chromiumOptions } : {}),
+          ...(cancelSignal ? { cancelSignal } : {}),
+          overwrite: true,
+          logLevel,
+        });
+
+        const meta = await sharp(tempStillFile).metadata();
+        if (!meta.width || !meta.height) {
+          throw Error(`Preview render produced invalid image for ${target.filename}`);
+        }
+        const bytes = await readFile(tempStillFile);
+        const destination = join(targetOutDir, 'stills', target.filename);
+        stagedStills.push({
+          tempFile: tempStillFile,
+          destination,
+          record: {
+            index: target.index,
+            t: target.t,
+            requestedT: target.requestedT,
+            frame,
+            label: target.label,
+            filename: target.filename,
+            file: destination,
+            width: meta.width,
+            height: meta.height,
+            bytes: bytes.length,
+            sha256: sha256(bytes),
+          },
+        });
+      }
+
+      const tempContactSheet = join(tempOutputsDir, 'contact-sheet.png');
+      const rawSheet = await generateContactSheet({
+        stills: stagedStills.map((item) => ({
+          index: item.record.index,
+          t: item.record.t,
+          label: item.record.label,
+          file: item.tempFile,
+        })),
+        outputFile: tempContactSheet,
+        columns,
       });
-    }
+      const sheetBytes = await readFile(tempContactSheet);
+      const finalSheetPath = join(targetOutDir, 'contact-sheet.png');
 
-    const tempContactSheet = join(tempOutputsDir, 'contact-sheet.png');
-    const rawSheet = await generateContactSheet({
-      stills: stagedStills.map((item) => ({
-        index: item.record.index,
-        t: item.record.t,
-        label: item.record.label,
-        file: item.tempFile,
-      })),
-      outputFile: tempContactSheet,
-      columns,
-    });
-    const sheetBytes = await readFile(tempContactSheet);
-    const finalSheetPath = join(targetOutDir, 'contact-sheet.png');
+      throwIfAborted();
 
-    if (signal?.aborted) {
-      throw Error('Timeline preview aborted');
-    }
+      const stills = [];
+      for (const item of stagedStills) {
+        await moveFileAtomic(item.tempFile, item.destination);
+        stills.push(item.record);
+      }
+      await moveFileAtomic(tempContactSheet, finalSheetPath);
 
-    const stills = [];
-    for (const item of stagedStills) {
-      await moveFileAtomic(item.tempFile, item.destination);
-      stills.push(item.record);
+      return {
+        renderer: 'remotion-4',
+        ...(timelineFile ? { timelineFile } : {}),
+        outDir: targetOutDir,
+        width: previewWidth,
+        height: previewHeight,
+        fps: previewFps,
+        contactSheet: {
+          ...rawSheet,
+          file: finalSheetPath,
+          bytes: sheetBytes.length,
+          sha256: sha256(sheetBytes),
+        },
+        stills,
+      };
     }
-    await moveFileAtomic(tempContactSheet, finalSheetPath);
-
-    return {
-      renderer: 'remotion-4',
-      ...(timelineFile ? { timelineFile } : {}),
-      outDir: targetOutDir,
-      width: previewWidth,
-      height: previewHeight,
-      fps: previewFps,
-      contactSheet: {
-        ...rawSheet,
-        file: finalSheetPath,
-        bytes: sheetBytes.length,
-        sha256: sha256(sheetBytes),
-      },
-      stills,
-    };
-  } finally {
-    if (browser) {
-      await browser.close({ silent: true }).catch(() => {});
-    }
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  );
 }

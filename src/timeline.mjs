@@ -153,6 +153,27 @@ export function applyEasing(easing, u) {
 }
 
 /**
+ * Binary-search a sorted array of timed records (`item.t` monotonically non-decreasing)
+ * and return the rightmost index `i` where `items[i].t <= t` (or `-1` if `items` is empty
+ * or `t < items[0].t`). Preserves exact right-continuous cut behavior on duplicate timestamps.
+ */
+export function findUpperBoundIndex(items, t) {
+  if (!Array.isArray(items) || items.length === 0) return -1;
+  if (t < items[0].t) return -1;
+  let lo = 0;
+  let hi = items.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    if (items[mid].t <= t) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+/**
  * Sample the camera state `{ x, y, zoom }` at timestamp `t` (seconds).
  * For segment `[keyframes[i], keyframes[i + 1]]`, `keyframes[i + 1].easing` governs the
  * transition arriving at `keyframes[i + 1]`. Coincident timestamps act as right-continuous cuts.
@@ -180,11 +201,7 @@ export function sampleCamera(camera, t) {
     };
   }
 
-  let index = 0;
-  while (index + 1 < keyframes.length && keyframes[index + 1].t <= t) {
-    index += 1;
-  }
-
+  const index = findUpperBoundIndex(keyframes, t);
   const from = keyframes[index];
   const to = keyframes[index + 1];
   if (!to || from.t === t || to.t === from.t) {
@@ -257,11 +274,7 @@ export function sampleCursor(cursor, t) {
     return { x: normalizeZero(last.x), y: normalizeZero(last.y), pressed: last.pressed, visible: last.visible };
   }
 
-  let index = 0;
-  while (index + 1 < samples.length && samples[index + 1].t <= t) {
-    index += 1;
-  }
-
+  const index = findUpperBoundIndex(samples, t);
   const from = samples[index];
   const to = samples[index + 1];
   if (!to || from.t === t || to.t === from.t) {
@@ -313,7 +326,7 @@ export function projectViewportToScreen(x, y, timeline, t) {
   };
 }
 
-function checkCameraBounds(errors, label, camera, stage, sample) {
+function checkCameraBounds(pushIssue, path, label, camera, stage, sample) {
   const rect = cameraViewportRect(camera, sample);
   if (
     rect.left < -EPS ||
@@ -321,7 +334,9 @@ function checkCameraBounds(errors, label, camera, stage, sample) {
     rect.right > stage.width + EPS ||
     rect.bottom > stage.height + EPS
   ) {
-    errors.push(
+    pushIssue(
+      'CAMERA_OUT_OF_BOUNDS',
+      path,
       `${label}: visible camera rect [${rect.left.toFixed(2)}..${rect.right.toFixed(2)}, ${rect.top.toFixed(2)}..${rect.bottom.toFixed(2)}] leaves stage [0..${stage.width}, 0..${stage.height}]`
     );
   }
@@ -677,45 +692,63 @@ export function validateEventTrack(eventTrack) {
   return { ok: errors.length === 0, errors };
 }
 
+function attachNonEnumerableIssues(result, issues) {
+  Object.defineProperty(result, 'issues', {
+    value: issues,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+  return result;
+}
+
 /**
  * Validate a `timeline.json` v1 structure, timestamps, dimensions, frame types, and strict
  * camera bounds inside the stage across both keyframes and interpolated samples.
- * Never throws; returns `{ ok, errors }`.
+ * Never throws; returns `{ ok, errors }` with structured `issues: [{ code, path, message }]`
+ * attached as a non-enumerable property (preserving `{ ok, errors }` `deepEqual` compatibility).
  */
 export function validateTimeline(timeline) {
   const errors = [];
+  const issues = [];
+  const pushIssue = (code, path, message) => {
+    errors.push(message);
+    issues.push({ code, path, message });
+  };
+
   if (!isObject(timeline)) {
-    return { ok: false, errors: ['timeline must be an object'] };
+    pushIssue('SCHEMA_INVALID', 'timeline', 'timeline must be an object');
+    return attachNonEnumerableIssues({ ok: false, errors }, issues);
   }
   if (timeline.version !== TIMELINE_VERSION) {
-    errors.push(`timeline.version must be ${TIMELINE_VERSION}`);
+    pushIssue('SCHEMA_INVALID', 'timeline.version', `timeline.version must be ${TIMELINE_VERSION}`);
   }
 
   // take
   if (!isObject(timeline.take)) {
-    errors.push('timeline.take must be an object');
+    pushIssue('SCHEMA_INVALID', 'timeline.take', 'timeline.take must be an object');
   } else {
     const { take } = timeline;
-    if (!isNonEmptyString(take.video)) errors.push('timeline.take.video must be a non-empty string');
-    if (!isNonEmptyString(take.eventTrack)) errors.push('timeline.take.eventTrack must be a non-empty string');
-    if (!isPositiveInteger(take.width)) errors.push('timeline.take.width must be a positive integer');
-    if (!isPositiveInteger(take.height)) errors.push('timeline.take.height must be a positive integer');
-    if (!isPositiveNumber(take.fps)) errors.push('timeline.take.fps must be a positive number');
-    if (!isPositiveNumber(take.duration)) errors.push('timeline.take.duration must be a positive number');
-    if (!isPositiveInteger(take.frames)) errors.push('timeline.take.frames must be a positive integer');
+    if (!isNonEmptyString(take.video)) pushIssue('SCHEMA_INVALID', 'timeline.take.video', 'timeline.take.video must be a non-empty string');
+    if (!isNonEmptyString(take.eventTrack)) pushIssue('SCHEMA_INVALID', 'timeline.take.eventTrack', 'timeline.take.eventTrack must be a non-empty string');
+    if (!isPositiveInteger(take.width)) pushIssue('SCHEMA_INVALID', 'timeline.take.width', 'timeline.take.width must be a positive integer');
+    if (!isPositiveInteger(take.height)) pushIssue('SCHEMA_INVALID', 'timeline.take.height', 'timeline.take.height must be a positive integer');
+    if (!isPositiveNumber(take.fps)) pushIssue('SCHEMA_INVALID', 'timeline.take.fps', 'timeline.take.fps must be a positive number');
+    if (!isPositiveNumber(take.duration)) pushIssue('SCHEMA_INVALID', 'timeline.take.duration', 'timeline.take.duration must be a positive number');
+    if (!isPositiveInteger(take.frames)) pushIssue('SCHEMA_INVALID', 'timeline.take.frames', 'timeline.take.frames must be a positive integer');
     if (!CAPTURE_MODES.includes(take.captureMode)) {
-      errors.push(`timeline.take.captureMode must be one of ${CAPTURE_MODES.join(', ')}`);
+      pushIssue('SCHEMA_INVALID', 'timeline.take.captureMode', `timeline.take.captureMode must be one of ${CAPTURE_MODES.join(', ')}`);
     }
     if (take.colorSpace !== undefined && !COLOR_SPACES.includes(take.colorSpace)) {
-      errors.push(`timeline.take.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
+      pushIssue('SCHEMA_INVALID', 'timeline.take.colorSpace', `timeline.take.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
     }
     if (!isObject(take.viewport)) {
-      errors.push('timeline.take.viewport must be an object');
+      pushIssue('SCHEMA_INVALID', 'timeline.take.viewport', 'timeline.take.viewport must be an object');
     } else {
-      if (!isPositiveNumber(take.viewport.width)) errors.push('timeline.take.viewport.width must be a positive number');
-      if (!isPositiveNumber(take.viewport.height)) errors.push('timeline.take.viewport.height must be a positive number');
+      if (!isPositiveNumber(take.viewport.width)) pushIssue('SCHEMA_INVALID', 'timeline.take.viewport.width', 'timeline.take.viewport.width must be a positive number');
+      if (!isPositiveNumber(take.viewport.height)) pushIssue('SCHEMA_INVALID', 'timeline.take.viewport.height', 'timeline.take.viewport.height must be a positive number');
       if (!isPositiveNumber(take.viewport.deviceScaleFactor)) {
-        errors.push('timeline.take.viewport.deviceScaleFactor must be a positive number');
+        pushIssue('SCHEMA_INVALID', 'timeline.take.viewport.deviceScaleFactor', 'timeline.take.viewport.deviceScaleFactor must be a positive number');
       }
     }
   }
@@ -723,56 +756,57 @@ export function validateTimeline(timeline) {
   // stage
   let stageValidDimensions = false;
   if (!isObject(timeline.stage)) {
-    errors.push('timeline.stage must be an object');
+    pushIssue('SCHEMA_INVALID', 'timeline.stage', 'timeline.stage must be an object');
   } else {
     const { stage } = timeline;
     const widthOk = isPositiveNumber(stage.width);
     const heightOk = isPositiveNumber(stage.height);
-    if (!widthOk) errors.push('timeline.stage.width must be a positive number');
-    if (!heightOk) errors.push('timeline.stage.height must be a positive number');
+    if (!widthOk) pushIssue('SCHEMA_INVALID', 'timeline.stage.width', 'timeline.stage.width must be a positive number');
+    if (!heightOk) pushIssue('SCHEMA_INVALID', 'timeline.stage.height', 'timeline.stage.height must be a positive number');
     stageValidDimensions = widthOk && heightOk;
 
     if (!isNonNegativeNumber(stage.padding)) {
-      errors.push('timeline.stage.padding must be a non-negative number');
+      pushIssue('SCHEMA_INVALID', 'timeline.stage.padding', 'timeline.stage.padding must be a non-negative number');
     }
     if (!isObject(stage.background)) {
-      errors.push('timeline.stage.background must be an object');
+      pushIssue('SCHEMA_INVALID', 'timeline.stage.background', 'timeline.stage.background must be an object');
     } else {
       const bg = stage.background;
       if (!BACKGROUND_TYPES.includes(bg.type)) {
-        errors.push(`timeline.stage.background.type must be one of ${BACKGROUND_TYPES.join(', ')}`);
+        pushIssue('SCHEMA_INVALID', 'timeline.stage.background.type', `timeline.stage.background.type must be one of ${BACKGROUND_TYPES.join(', ')}`);
       } else if (bg.type === 'solid') {
-        if (!isNonEmptyString(bg.color)) errors.push('timeline.stage.background.color must be a non-empty string');
+        if (!isNonEmptyString(bg.color)) pushIssue('SCHEMA_INVALID', 'timeline.stage.background.color', 'timeline.stage.background.color must be a non-empty string');
       } else if (bg.type === 'gradient') {
         if (bg.angle !== undefined && !isFiniteNumber(bg.angle)) {
-          errors.push('timeline.stage.background.angle must be a finite number');
+          pushIssue('SCHEMA_INVALID', 'timeline.stage.background.angle', 'timeline.stage.background.angle must be a finite number');
         }
         if (!Array.isArray(bg.stops) || bg.stops.length < 2) {
-          errors.push('timeline.stage.background.stops must be an array of at least 2 color stops');
+          pushIssue('SCHEMA_INVALID', 'timeline.stage.background.stops', 'timeline.stage.background.stops must be an array of at least 2 color stops');
         } else {
           let prevOffset = 0;
           bg.stops.forEach((stop, i) => {
+            const stopPrefix = `timeline.stage.background.stops[${i}]`;
             if (!isObject(stop)) {
-              errors.push(`timeline.stage.background.stops[${i}] must be an object`);
+              pushIssue('SCHEMA_INVALID', stopPrefix, `${stopPrefix} must be an object`);
               return;
             }
             if (!isNonEmptyString(stop.color)) {
-              errors.push(`timeline.stage.background.stops[${i}].color must be a non-empty string`);
+              pushIssue('SCHEMA_INVALID', `${stopPrefix}.color`, `${stopPrefix}.color must be a non-empty string`);
             }
             if (!isFiniteNumber(stop.offset) || stop.offset < 0 || stop.offset > 1) {
-              errors.push(`timeline.stage.background.stops[${i}].offset must be between 0 and 1`);
+              pushIssue('SCHEMA_INVALID', `${stopPrefix}.offset`, `${stopPrefix}.offset must be between 0 and 1`);
             } else {
               if (i > 0 && stop.offset < prevOffset) {
-                errors.push(`timeline.stage.background.stops[${i}].offset must be monotonically non-decreasing`);
+                pushIssue('SCHEMA_INVALID', `${stopPrefix}.offset`, `${stopPrefix}.offset must be monotonically non-decreasing`);
               }
               prevOffset = stop.offset;
             }
           });
         }
       } else if (bg.type === 'image') {
-        if (!isNonEmptyString(bg.src)) errors.push('timeline.stage.background.src must be a non-empty string');
+        if (!isNonEmptyString(bg.src)) pushIssue('SCHEMA_INVALID', 'timeline.stage.background.src', 'timeline.stage.background.src must be a non-empty string');
         if (bg.fit !== undefined && !IMAGE_FITS.includes(bg.fit)) {
-          errors.push(`timeline.stage.background.fit must be one of ${IMAGE_FITS.join(', ')}`);
+          pushIssue('SCHEMA_INVALID', 'timeline.stage.background.fit', `timeline.stage.background.fit must be one of ${IMAGE_FITS.join(', ')}`);
         }
       }
     }
@@ -780,45 +814,47 @@ export function validateTimeline(timeline) {
 
   // window
   if (!isObject(timeline.window)) {
-    errors.push('timeline.window must be an object');
+    pushIssue('SCHEMA_INVALID', 'timeline.window', 'timeline.window must be an object');
   } else {
     const win = timeline.window;
     if (!WINDOW_FRAMES.includes(win.frame)) {
-      errors.push(`timeline.window.frame must be one of ${WINDOW_FRAMES.join(', ')}`);
+      pushIssue('SCHEMA_INVALID', 'timeline.window.frame', `timeline.window.frame must be one of ${WINDOW_FRAMES.join(', ')}`);
     }
     if (win.title !== undefined && typeof win.title !== 'string') {
-      errors.push('timeline.window.title must be a string');
+      pushIssue('SCHEMA_INVALID', 'timeline.window.title', 'timeline.window.title must be a string');
     }
     const xOk = isNonNegativeNumber(win.x);
     const yOk = isNonNegativeNumber(win.y);
     const wOk = isPositiveNumber(win.width);
     const hOk = isPositiveNumber(win.height);
-    if (!xOk) errors.push('timeline.window.x must be a non-negative number');
-    if (!yOk) errors.push('timeline.window.y must be a non-negative number');
-    if (!wOk) errors.push('timeline.window.width must be a positive number');
-    if (!hOk) errors.push('timeline.window.height must be a positive number');
+    if (!xOk) pushIssue('SCHEMA_INVALID', 'timeline.window.x', 'timeline.window.x must be a non-negative number');
+    if (!yOk) pushIssue('SCHEMA_INVALID', 'timeline.window.y', 'timeline.window.y must be a non-negative number');
+    if (!wOk) pushIssue('SCHEMA_INVALID', 'timeline.window.width', 'timeline.window.width must be a positive number');
+    if (!hOk) pushIssue('SCHEMA_INVALID', 'timeline.window.height', 'timeline.window.height must be a positive number');
     if (stageValidDimensions && xOk && yOk && wOk && hOk) {
       if (win.x + win.width > timeline.stage.width + EPS || win.y + win.height > timeline.stage.height + EPS) {
-        errors.push(
+        pushIssue(
+          'WINDOW_OUT_OF_BOUNDS',
+          'timeline.window',
           `timeline.window [${win.x}..${win.x + win.width}, ${win.y}..${win.y + win.height}] exceeds stage [0..${timeline.stage.width}, 0..${timeline.stage.height}]`
         );
       }
     }
     if (win.borderRadius !== undefined && !isNonNegativeNumber(win.borderRadius)) {
-      errors.push('timeline.window.borderRadius must be a non-negative number');
+      pushIssue('SCHEMA_INVALID', 'timeline.window.borderRadius', 'timeline.window.borderRadius must be a non-negative number');
     }
     if (win.shadow !== undefined && typeof win.shadow !== 'boolean') {
-      errors.push('timeline.window.shadow must be a boolean');
+      pushIssue('SCHEMA_INVALID', 'timeline.window.shadow', 'timeline.window.shadow must be a boolean');
     }
     if (win.trafficLights !== undefined && typeof win.trafficLights !== 'boolean') {
       if (!isObject(win.trafficLights)) {
-        errors.push('timeline.window.trafficLights must be a boolean or { x, y } object');
+        pushIssue('SCHEMA_INVALID', 'timeline.window.trafficLights', 'timeline.window.trafficLights must be a boolean or { x, y } object');
       } else {
         if (win.trafficLights.x !== undefined && !isNonNegativeNumber(win.trafficLights.x)) {
-          errors.push('timeline.window.trafficLights.x must be a non-negative number');
+          pushIssue('SCHEMA_INVALID', 'timeline.window.trafficLights.x', 'timeline.window.trafficLights.x must be a non-negative number');
         }
         if (win.trafficLights.y !== undefined && !isNonNegativeNumber(win.trafficLights.y)) {
-          errors.push('timeline.window.trafficLights.y must be a non-negative number');
+          pushIssue('SCHEMA_INVALID', 'timeline.window.trafficLights.y', 'timeline.window.trafficLights.y must be a non-negative number');
         }
       }
     }
@@ -826,30 +862,32 @@ export function validateTimeline(timeline) {
 
   // camera
   if (!isObject(timeline.camera)) {
-    errors.push('timeline.camera must be an object');
+    pushIssue('CAMERA_SCHEMA_INVALID', 'timeline.camera', 'timeline.camera must be an object');
   } else {
     const { camera } = timeline;
     const outWOk = isPositiveNumber(camera.outputWidth);
     const outHOk = isPositiveNumber(camera.outputHeight);
-    if (!outWOk) errors.push('timeline.camera.outputWidth must be a positive number');
-    if (!outHOk) errors.push('timeline.camera.outputHeight must be a positive number');
+    if (!outWOk) pushIssue('CAMERA_SCHEMA_INVALID', 'timeline.camera.outputWidth', 'timeline.camera.outputWidth must be a positive number');
+    if (!outHOk) pushIssue('CAMERA_SCHEMA_INVALID', 'timeline.camera.outputHeight', 'timeline.camera.outputHeight must be a positive number');
     if (stageValidDimensions && outWOk && outHOk) {
       if (timeline.stage.width + EPS < camera.outputWidth || timeline.stage.height + EPS < camera.outputHeight) {
-        errors.push(
+        pushIssue(
+          'STAGE_SMALLER_THAN_CAMERA_OUTPUT',
+          'timeline.camera',
           `timeline.stage (${timeline.stage.width}x${timeline.stage.height}) must be larger than or equal to camera output (${camera.outputWidth}x${camera.outputHeight})`
         );
       }
     }
 
     if (!Array.isArray(camera.keyframes) || camera.keyframes.length === 0) {
-      errors.push('timeline.camera.keyframes must be a non-empty array');
+      pushIssue('CAMERA_SCHEMA_INVALID', 'timeline.camera.keyframes', 'timeline.camera.keyframes must be a non-empty array');
     } else {
       let keyframesStructurallyValid = true;
       let prevT = 0;
       camera.keyframes.forEach((kf, index) => {
         const prefix = `timeline.camera.keyframes[${index}]`;
         if (!isObject(kf)) {
-          errors.push(`${prefix} must be an object`);
+          pushIssue('CAMERA_SCHEMA_INVALID', prefix, `${prefix} must be an object`);
           keyframesStructurallyValid = false;
           return;
         }
@@ -859,18 +897,18 @@ export function validateTimeline(timeline) {
         const zoomOk = isPositiveNumber(kf.zoom);
         const easingOk = CAMERA_EASINGS.includes(kf.easing);
 
-        if (!tOk) errors.push(`${prefix}.t must be a non-negative finite number`);
+        if (!tOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
         else {
           if (index > 0 && kf.t < prevT) {
-            errors.push(`${prefix}.t (${kf.t}) must be monotonically non-decreasing (previous ${prevT})`);
+            pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${kf.t}) must be monotonically non-decreasing (previous ${prevT})`);
             keyframesStructurallyValid = false;
           }
           prevT = kf.t;
         }
-        if (!xOk) errors.push(`${prefix}.x must be a finite number`);
-        if (!yOk) errors.push(`${prefix}.y must be a finite number`);
-        if (!zoomOk) errors.push(`${prefix}.zoom must be a positive finite number`);
-        if (!easingOk) errors.push(`${prefix}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
+        if (!xOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.x`, `${prefix}.x must be a finite number`);
+        if (!yOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.y`, `${prefix}.y must be a finite number`);
+        if (!zoomOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.zoom`, `${prefix}.zoom must be a positive finite number`);
+        if (!easingOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.easing`, `${prefix}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
 
         if (!(tOk && xOk && yOk && zoomOk && easingOk)) {
           keyframesStructurallyValid = false;
@@ -878,7 +916,7 @@ export function validateTimeline(timeline) {
         }
 
         if (stageValidDimensions && outWOk && outHOk) {
-          checkCameraBounds(errors, `${prefix} (t=${kf.t})`, camera, timeline.stage, kf);
+          checkCameraBounds(pushIssue, prefix, `${prefix} (t=${kf.t})`, camera, timeline.stage, kf);
         }
       });
 
@@ -891,7 +929,8 @@ export function validateTimeline(timeline) {
             const t = from.t + ((to.t - from.t) * step) / BOUND_SAMPLE_SUBDIVISIONS;
             const sample = sampleCamera(camera, t);
             checkCameraBounds(
-              errors,
+              pushIssue,
+              `timeline.camera.keyframes[${i}]`,
               `timeline.camera segment ${i}->${i + 1} (t=${t.toFixed(4)})`,
               camera,
               timeline.stage,
@@ -904,7 +943,7 @@ export function validateTimeline(timeline) {
 
     if (camera.verticalKeyframes !== undefined) {
       if (!Array.isArray(camera.verticalKeyframes) || camera.verticalKeyframes.length === 0) {
-        errors.push('timeline.camera.verticalKeyframes must be a non-empty array when provided');
+        pushIssue('CAMERA_SCHEMA_INVALID', 'timeline.camera.verticalKeyframes', 'timeline.camera.verticalKeyframes must be a non-empty array when provided');
       } else {
         const portraitOut = Array.isArray(timeline.outputs)
           ? timeline.outputs.find(
@@ -930,7 +969,7 @@ export function validateTimeline(timeline) {
         camera.verticalKeyframes.forEach((kf, index) => {
           const prefix = `timeline.camera.verticalKeyframes[${index}]`;
           if (!isObject(kf)) {
-            errors.push(`${prefix} must be an object`);
+            pushIssue('CAMERA_SCHEMA_INVALID', prefix, `${prefix} must be an object`);
             verticalStructurallyValid = false;
             return;
           }
@@ -940,18 +979,18 @@ export function validateTimeline(timeline) {
           const zoomOk = isPositiveNumber(kf.zoom);
           const easingOk = CAMERA_EASINGS.includes(kf.easing);
 
-          if (!tOk) errors.push(`${prefix}.t must be a non-negative finite number`);
+          if (!tOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
           else {
             if (index > 0 && kf.t < prevVT) {
-              errors.push(`${prefix}.t (${kf.t}) must be monotonically non-decreasing (previous ${prevVT})`);
+              pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${kf.t}) must be monotonically non-decreasing (previous ${prevVT})`);
               verticalStructurallyValid = false;
             }
             prevVT = kf.t;
           }
-          if (!xOk) errors.push(`${prefix}.x must be a finite number`);
-          if (!yOk) errors.push(`${prefix}.y must be a finite number`);
-          if (!zoomOk) errors.push(`${prefix}.zoom must be a positive finite number`);
-          if (!easingOk) errors.push(`${prefix}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
+          if (!xOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.x`, `${prefix}.x must be a finite number`);
+          if (!yOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.y`, `${prefix}.y must be a finite number`);
+          if (!zoomOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.zoom`, `${prefix}.zoom must be a positive finite number`);
+          if (!easingOk) pushIssue('CAMERA_SCHEMA_INVALID', `${prefix}.easing`, `${prefix}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
 
           if (!(tOk && xOk && yOk && zoomOk && easingOk)) {
             verticalStructurallyValid = false;
@@ -959,7 +998,7 @@ export function validateTimeline(timeline) {
           }
 
           if (verticalCamera) {
-            checkCameraBounds(errors, `${prefix} (t=${kf.t})`, verticalCamera, timeline.stage, kf);
+            checkCameraBounds(pushIssue, prefix, `${prefix} (t=${kf.t})`, verticalCamera, timeline.stage, kf);
           }
         });
 
@@ -972,7 +1011,8 @@ export function validateTimeline(timeline) {
               const t = from.t + ((to.t - from.t) * step) / BOUND_SAMPLE_SUBDIVISIONS;
               const sample = sampleCamera(verticalCamera, t);
               checkCameraBounds(
-                errors,
+                pushIssue,
+                `timeline.camera.verticalKeyframes[${i}]`,
                 `timeline.camera.verticalKeyframes segment ${i}->${i + 1} (t=${t.toFixed(4)})`,
                 verticalCamera,
                 timeline.stage,
@@ -987,177 +1027,177 @@ export function validateTimeline(timeline) {
 
   // overlays
   if (!isObject(timeline.overlays)) {
-    errors.push('timeline.overlays must be an object');
+    pushIssue('SCHEMA_INVALID', 'timeline.overlays', 'timeline.overlays must be an object');
   } else {
     const { overlays } = timeline;
 
     // cursor
     if (!isObject(overlays.cursor)) {
-      errors.push('timeline.overlays.cursor must be an object');
+      pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor', 'timeline.overlays.cursor must be an object');
     } else {
       const { cursor } = overlays;
-      if (typeof cursor.enabled !== 'boolean') errors.push('timeline.overlays.cursor.enabled must be a boolean');
+      if (typeof cursor.enabled !== 'boolean') pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.enabled', 'timeline.overlays.cursor.enabled must be a boolean');
       if (!CURSOR_STYLES.includes(cursor.style)) {
-        errors.push(`timeline.overlays.cursor.style must be one of ${CURSOR_STYLES.join(', ')}`);
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.style', `timeline.overlays.cursor.style must be one of ${CURSOR_STYLES.join(', ')}`);
       }
       if (cursor.color !== undefined && !isNonEmptyString(cursor.color)) {
-        errors.push('timeline.overlays.cursor.color must be a non-empty string');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.color', 'timeline.overlays.cursor.color must be a non-empty string');
       }
       if (cursor.shadow !== undefined && typeof cursor.shadow !== 'boolean') {
-        errors.push('timeline.overlays.cursor.shadow must be a boolean');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.shadow', 'timeline.overlays.cursor.shadow must be a boolean');
       }
       if (cursor.hidden !== undefined && typeof cursor.hidden !== 'boolean') {
-        errors.push('timeline.overlays.cursor.hidden must be a boolean');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.hidden', 'timeline.overlays.cursor.hidden must be a boolean');
       }
       if (!Array.isArray(cursor.samples)) {
-        errors.push('timeline.overlays.cursor.samples must be an array');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.cursor.samples', 'timeline.overlays.cursor.samples must be an array');
       } else {
         let prevT = 0;
         cursor.samples.forEach((sample, i) => {
           const prefix = `timeline.overlays.cursor.samples[${i}]`;
           if (!isObject(sample)) {
-            errors.push(`${prefix} must be an object`);
+            pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
             return;
           }
-          if (!isNonNegativeNumber(sample.t)) errors.push(`${prefix}.t must be a non-negative finite number`);
+          if (!isNonNegativeNumber(sample.t)) pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
           else {
             if (i > 0 && sample.t < prevT) {
-              errors.push(`${prefix}.t (${sample.t}) must be monotonically non-decreasing (previous ${prevT})`);
+              pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${sample.t}) must be monotonically non-decreasing (previous ${prevT})`);
             }
             prevT = sample.t;
           }
           if (!isFiniteNumber(sample.x) || !isFiniteNumber(sample.y)) {
-            errors.push(`${prefix} requires finite x and y`);
+            pushIssue('SCHEMA_INVALID', prefix, `${prefix} requires finite x and y`);
           }
-          if (typeof sample.pressed !== 'boolean') errors.push(`${prefix}.pressed must be a boolean`);
-          if (typeof sample.visible !== 'boolean') errors.push(`${prefix}.visible must be a boolean`);
+          if (typeof sample.pressed !== 'boolean') pushIssue('SCHEMA_INVALID', `${prefix}.pressed`, `${prefix}.pressed must be a boolean`);
+          if (typeof sample.visible !== 'boolean') pushIssue('SCHEMA_INVALID', `${prefix}.visible`, `${prefix}.visible must be a boolean`);
         });
       }
     }
 
     // ripples
     if (!Array.isArray(overlays.ripples)) {
-      errors.push('timeline.overlays.ripples must be an array');
+      pushIssue('SCHEMA_INVALID', 'timeline.overlays.ripples', 'timeline.overlays.ripples must be an array');
     } else {
       let prevT = 0;
       overlays.ripples.forEach((ripple, i) => {
         const prefix = `timeline.overlays.ripples[${i}]`;
         if (!isObject(ripple)) {
-          errors.push(`${prefix} must be an object`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
           return;
         }
-        if (!isNonNegativeNumber(ripple.t)) errors.push(`${prefix}.t must be a non-negative finite number`);
+        if (!isNonNegativeNumber(ripple.t)) pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
         else {
           if (i > 0 && ripple.t < prevT) {
-            errors.push(`${prefix}.t (${ripple.t}) must be monotonically non-decreasing (previous ${prevT})`);
+            pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${ripple.t}) must be monotonically non-decreasing (previous ${prevT})`);
           }
           prevT = ripple.t;
         }
         if (!isFiniteNumber(ripple.x) || !isFiniteNumber(ripple.y)) {
-          errors.push(`${prefix} requires finite x and y`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} requires finite x and y`);
         }
         if (!MOUSE_BUTTONS.includes(ripple.button)) {
-          errors.push(`${prefix}.button must be one of ${MOUSE_BUTTONS.join(', ')}`);
+          pushIssue('SCHEMA_INVALID', `${prefix}.button`, `${prefix}.button must be one of ${MOUSE_BUTTONS.join(', ')}`);
         }
-        if (!isPositiveNumber(ripple.duration)) errors.push(`${prefix}.duration must be a positive number`);
+        if (!isPositiveNumber(ripple.duration)) pushIssue('SCHEMA_INVALID', `${prefix}.duration`, `${prefix}.duration must be a positive number`);
       });
     }
 
     // gestures
     if (!Array.isArray(overlays.gestures)) {
-      errors.push('timeline.overlays.gestures must be an array');
+      pushIssue('SCHEMA_INVALID', 'timeline.overlays.gestures', 'timeline.overlays.gestures must be an array');
     } else {
       let prevT = 0;
       overlays.gestures.forEach((gesture, i) => {
         const prefix = `timeline.overlays.gestures[${i}]`;
         if (!isObject(gesture)) {
-          errors.push(`${prefix} must be an object`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
           return;
         }
-        if (!isNonNegativeNumber(gesture.t)) errors.push(`${prefix}.t must be a non-negative finite number`);
+        if (!isNonNegativeNumber(gesture.t)) pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
         else {
           if (i > 0 && gesture.t < prevT) {
-            errors.push(`${prefix}.t (${gesture.t}) must be monotonically non-decreasing (previous ${prevT})`);
+            pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${gesture.t}) must be monotonically non-decreasing (previous ${prevT})`);
           }
           prevT = gesture.t;
         }
         if (!GESTURE_KINDS.includes(gesture.kind)) {
-          errors.push(`${prefix}.kind must be one of ${GESTURE_KINDS.join(', ')}`);
+          pushIssue('SCHEMA_INVALID', `${prefix}.kind`, `${prefix}.kind must be one of ${GESTURE_KINDS.join(', ')}`);
         }
         if (!isFiniteNumber(gesture.x) || !isFiniteNumber(gesture.y)) {
-          errors.push(`${prefix} requires finite x and y`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} requires finite x and y`);
         }
         if (!isFiniteNumber(gesture.deltaX) || !isFiniteNumber(gesture.deltaY)) {
-          errors.push(`${prefix} requires finite deltaX and deltaY`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} requires finite deltaX and deltaY`);
         }
-        if (!isPositiveNumber(gesture.duration)) errors.push(`${prefix}.duration must be a positive number`);
+        if (!isPositiveNumber(gesture.duration)) pushIssue('SCHEMA_INVALID', `${prefix}.duration`, `${prefix}.duration must be a positive number`);
       });
     }
 
     // keystrokes
     if (!Array.isArray(overlays.keystrokes)) {
-      errors.push('timeline.overlays.keystrokes must be an array');
+      pushIssue('SCHEMA_INVALID', 'timeline.overlays.keystrokes', 'timeline.overlays.keystrokes must be an array');
     } else {
       let prevT = 0;
       overlays.keystrokes.forEach((ks, i) => {
         const prefix = `timeline.overlays.keystrokes[${i}]`;
         if (!isObject(ks)) {
-          errors.push(`${prefix} must be an object`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
           return;
         }
-        if (!isNonNegativeNumber(ks.t)) errors.push(`${prefix}.t must be a non-negative finite number`);
+        if (!isNonNegativeNumber(ks.t)) pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
         else {
           if (i > 0 && ks.t < prevT) {
-            errors.push(`${prefix}.t (${ks.t}) must be monotonically non-decreasing (previous ${prevT})`);
+            pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${ks.t}) must be monotonically non-decreasing (previous ${prevT})`);
           }
           prevT = ks.t;
         }
-        if (!isNonEmptyString(ks.label)) errors.push(`${prefix}.label must be a non-empty string`);
+        if (!isNonEmptyString(ks.label)) pushIssue('SCHEMA_INVALID', `${prefix}.label`, `${prefix}.label must be a non-empty string`);
         if (!Array.isArray(ks.keys) || ks.keys.length === 0 || !ks.keys.every(isNonEmptyString)) {
-          errors.push(`${prefix}.keys must be a non-empty array of non-empty strings`);
+          pushIssue('SCHEMA_INVALID', `${prefix}.keys`, `${prefix}.keys must be a non-empty array of non-empty strings`);
         }
-        if (!isPositiveNumber(ks.duration)) errors.push(`${prefix}.duration must be a positive number`);
+        if (!isPositiveNumber(ks.duration)) pushIssue('SCHEMA_INVALID', `${prefix}.duration`, `${prefix}.duration must be a positive number`);
       });
     }
 
     // captions
     if (!isObject(overlays.captions)) {
-      errors.push('timeline.overlays.captions must be an object');
+      pushIssue('SCHEMA_INVALID', 'timeline.overlays.captions', 'timeline.overlays.captions must be an object');
     } else {
       if (typeof overlays.captions.enabled !== 'boolean') {
-        errors.push('timeline.overlays.captions.enabled must be a boolean');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.captions.enabled', 'timeline.overlays.captions.enabled must be a boolean');
       }
       if (!Array.isArray(overlays.captions.tracks)) {
-        errors.push('timeline.overlays.captions.tracks must be an array');
+        pushIssue('SCHEMA_INVALID', 'timeline.overlays.captions.tracks', 'timeline.overlays.captions.tracks must be an array');
       } else {
         overlays.captions.tracks.forEach((track, i) => {
           const prefix = `timeline.overlays.captions.tracks[${i}]`;
           if (!isObject(track)) {
-            errors.push(`${prefix} must be an object`);
+            pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
             return;
           }
-          if (!isNonEmptyString(track.language)) errors.push(`${prefix}.language must be a non-empty string`);
+          if (!isNonEmptyString(track.language)) pushIssue('SCHEMA_INVALID', `${prefix}.language`, `${prefix}.language must be a non-empty string`);
           if (!Array.isArray(track.cues)) {
-            errors.push(`${prefix}.cues must be an array`);
+            pushIssue('SCHEMA_INVALID', `${prefix}.cues`, `${prefix}.cues must be an array`);
           } else {
             let prevStart = 0;
             track.cues.forEach((cue, j) => {
               const cuePrefix = `${prefix}.cues[${j}]`;
               if (!isObject(cue)) {
-                errors.push(`${cuePrefix} must be an object`);
+                pushIssue('SCHEMA_INVALID', cuePrefix, `${cuePrefix} must be an object`);
                 return;
               }
-              if (!isNonNegativeNumber(cue.start)) errors.push(`${cuePrefix}.start must be a non-negative number`);
+              if (!isNonNegativeNumber(cue.start)) pushIssue('SCHEMA_INVALID', `${cuePrefix}.start`, `${cuePrefix}.start must be a non-negative number`);
               else {
                 if (j > 0 && cue.start < prevStart) {
-                  errors.push(`${cuePrefix}.start must be monotonically non-decreasing`);
+                  pushIssue('SCHEMA_INVALID', `${cuePrefix}.start`, `${cuePrefix}.start must be monotonically non-decreasing`);
                 }
                 prevStart = cue.start;
               }
               if (!isNonNegativeNumber(cue.end) || (isNonNegativeNumber(cue.start) && cue.end < cue.start)) {
-                errors.push(`${cuePrefix}.end must be >= start`);
+                pushIssue('SCHEMA_INVALID', `${cuePrefix}.end`, `${cuePrefix}.end must be >= start`);
               }
-              if (typeof cue.text !== 'string') errors.push(`${cuePrefix}.text must be a string`);
+              if (typeof cue.text !== 'string') pushIssue('SCHEMA_INVALID', `${cuePrefix}.text`, `${cuePrefix}.text must be a string`);
             });
           }
         });
@@ -1167,74 +1207,76 @@ export function validateTimeline(timeline) {
 
   // audio
   if (!isObject(timeline.audio)) {
-    errors.push('timeline.audio must be an object');
+    pushIssue('SCHEMA_INVALID', 'timeline.audio', 'timeline.audio must be an object');
   } else if (!Array.isArray(timeline.audio.tracks)) {
-    errors.push('timeline.audio.tracks must be an array');
+    pushIssue('SCHEMA_INVALID', 'timeline.audio.tracks', 'timeline.audio.tracks must be an array');
   } else {
     const seenAudioIds = new Set();
     timeline.audio.tracks.forEach((track, i) => {
       const prefix = `timeline.audio.tracks[${i}]`;
       if (!isObject(track)) {
-        errors.push(`${prefix} must be an object`);
+        pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
         return;
       }
       if (!isNonEmptyString(track.id)) {
-        errors.push(`${prefix}.id must be a non-empty string`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.id`, `${prefix}.id must be a non-empty string`);
       } else if (seenAudioIds.has(track.id)) {
-        errors.push(`${prefix}.id (${track.id}) must be unique`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.id`, `${prefix}.id (${track.id}) must be unique`);
       } else {
         seenAudioIds.add(track.id);
       }
       if (!AUDIO_TRACK_KINDS.includes(track.kind)) {
-        errors.push(`${prefix}.kind must be one of ${AUDIO_TRACK_KINDS.join(', ')}`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.kind`, `${prefix}.kind must be one of ${AUDIO_TRACK_KINDS.join(', ')}`);
       }
-      if (!isNonEmptyString(track.src)) errors.push(`${prefix}.src must be a non-empty string`);
-      if (!isNonNegativeNumber(track.start)) errors.push(`${prefix}.start must be a non-negative number`);
+      if (!isNonEmptyString(track.src)) pushIssue('SCHEMA_INVALID', `${prefix}.src`, `${prefix}.src must be a non-empty string`);
+      if (!isNonNegativeNumber(track.start)) pushIssue('SCHEMA_INVALID', `${prefix}.start`, `${prefix}.start must be a non-negative number`);
       if (track.volume !== undefined && (!isNonNegativeNumber(track.volume) || track.volume > 2)) {
-        errors.push(`${prefix}.volume must be between 0 and 2`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.volume`, `${prefix}.volume must be between 0 and 2`);
       }
     });
   }
 
   // outputs
   if (!Array.isArray(timeline.outputs) || timeline.outputs.length === 0) {
-    errors.push('timeline.outputs must be a non-empty array');
+    pushIssue('SCHEMA_INVALID', 'timeline.outputs', 'timeline.outputs must be a non-empty array');
   } else {
     const seenIds = new Set();
     timeline.outputs.forEach((output, i) => {
       const prefix = `timeline.outputs[${i}]`;
       if (!isObject(output)) {
-        errors.push(`${prefix} must be an object`);
+        pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
         return;
       }
       if (!isNonEmptyString(output.id)) {
-        errors.push(`${prefix}.id must be a non-empty string`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.id`, `${prefix}.id must be a non-empty string`);
       } else if (!SAFE_OUTPUT_ID_RE.test(output.id) || output.id.includes('..') || /[/\\\0]/.test(output.id)) {
-        errors.push(
+        pushIssue(
+          'SCHEMA_INVALID',
+          `${prefix}.id`,
           `${prefix}.id (${output.id}) must match /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/ and must not contain ".."`
         );
       } else if (seenIds.has(output.id)) {
-        errors.push(`${prefix}.id (${output.id}) must be unique`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.id`, `${prefix}.id (${output.id}) must be unique`);
       } else {
         seenIds.add(output.id);
       }
       if (!OUTPUT_FORMATS.includes(output.format)) {
-        errors.push(`${prefix}.format must be one of ${OUTPUT_FORMATS.join(', ')}`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.format`, `${prefix}.format must be one of ${OUTPUT_FORMATS.join(', ')}`);
       }
-      if (!isPositiveInteger(output.width)) errors.push(`${prefix}.width must be a positive integer`);
-      if (!isPositiveInteger(output.height)) errors.push(`${prefix}.height must be a positive integer`);
-      if (!isPositiveNumber(output.fps)) errors.push(`${prefix}.fps must be a positive number`);
+      if (!isPositiveInteger(output.width)) pushIssue('SCHEMA_INVALID', `${prefix}.width`, `${prefix}.width must be a positive integer`);
+      if (!isPositiveInteger(output.height)) pushIssue('SCHEMA_INVALID', `${prefix}.height`, `${prefix}.height must be a positive integer`);
+      if (!isPositiveNumber(output.fps)) pushIssue('SCHEMA_INVALID', `${prefix}.fps`, `${prefix}.fps must be a positive number`);
       if (output.codec !== undefined && !isNonEmptyString(output.codec)) {
-        errors.push(`${prefix}.codec must be a non-empty string`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.codec`, `${prefix}.codec must be a non-empty string`);
       }
       if (output.loop !== undefined && typeof output.loop !== 'boolean') {
-        errors.push(`${prefix}.loop must be a boolean`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.loop`, `${prefix}.loop must be a boolean`);
       }
       if (output.poster !== undefined && typeof output.poster !== 'boolean') {
-        errors.push(`${prefix}.poster must be a boolean`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.poster`, `${prefix}.poster must be a boolean`);
       }
       if (output.colorSpace !== undefined && !COLOR_SPACES.includes(output.colorSpace)) {
-        errors.push(`${prefix}.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
+        pushIssue('SCHEMA_INVALID', `${prefix}.colorSpace`, `${prefix}.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
       }
     });
   }
@@ -1242,39 +1284,49 @@ export function validateTimeline(timeline) {
   // optional steps
   if (timeline.steps !== undefined) {
     if (!Array.isArray(timeline.steps)) {
-      errors.push('timeline.steps must be an array');
+      pushIssue('SCHEMA_INVALID', 'timeline.steps', 'timeline.steps must be an array');
     } else {
       let prevT = 0;
       timeline.steps.forEach((step, i) => {
         const prefix = `timeline.steps[${i}]`;
         if (!isObject(step)) {
-          errors.push(`${prefix} must be an object`);
+          pushIssue('SCHEMA_INVALID', prefix, `${prefix} must be an object`);
           return;
         }
-        if (!isNonNegativeNumber(step.t)) errors.push(`${prefix}.t must be a non-negative finite number`);
+        if (!isNonNegativeNumber(step.t)) pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t must be a non-negative finite number`);
         else {
           if (i > 0 && step.t < prevT) {
-            errors.push(`${prefix}.t (${step.t}) must be monotonically non-decreasing (previous ${prevT})`);
+            pushIssue('SCHEMA_INVALID', `${prefix}.t`, `${prefix}.t (${step.t}) must be monotonically non-decreasing (previous ${prevT})`);
           }
           prevT = step.t;
         }
-        if (!isNonNegativeInteger(step.index)) errors.push(`${prefix}.index must be a non-negative integer`);
-        if (!isNonEmptyString(step.label)) errors.push(`${prefix}.label must be a non-empty string`);
+        if (!isNonNegativeInteger(step.index)) pushIssue('SCHEMA_INVALID', `${prefix}.index`, `${prefix}.index must be a non-negative integer`);
+        if (!isNonEmptyString(step.label)) pushIssue('SCHEMA_INVALID', `${prefix}.label`, `${prefix}.label must be a non-empty string`);
         if (step.duration !== undefined && !isNonNegativeNumber(step.duration)) {
-          errors.push(`${prefix}.duration must be a non-negative finite number`);
+          pushIssue('SCHEMA_INVALID', `${prefix}.duration`, `${prefix}.duration must be a non-negative finite number`);
         }
         if (step.end !== undefined && (!isNonNegativeNumber(step.end) || (isNonNegativeNumber(step.t) && step.end < step.t))) {
-          errors.push(`${prefix}.end must be a finite number >= t`);
+          pushIssue('SCHEMA_INVALID', `${prefix}.end`, `${prefix}.end must be a finite number >= t`);
         }
         if (step.narration !== undefined) {
           const narrCheck = validateStepNarration(step.narration, `${prefix}.narration`);
-          for (const err of narrCheck.errors) errors.push(err);
+          for (const err of narrCheck.errors) pushIssue('SCHEMA_INVALID', `${prefix}.narration`, err);
         }
       });
     }
   }
 
-  return { ok: errors.length === 0, errors };
+  return attachNonEnumerableIssues({ ok: errors.length === 0, errors }, issues);
+}
+
+/** Return `{ ok, errors, issues }` with enumerable structured validation issues. */
+export function validateTimelineDetailed(timeline) {
+  const result = validateTimeline(timeline);
+  return {
+    ok: result.ok,
+    errors: result.errors,
+    issues: result.issues,
+  };
 }
 
 /** Assert that `timeline` passes `validateTimeline`; throws a clear Error listing all violations. */

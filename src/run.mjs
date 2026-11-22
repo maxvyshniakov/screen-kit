@@ -366,6 +366,7 @@ export async function runPipeline({
       const preview = await renderTimelinePreview({
         timeline: timelinePath,
         outDir: previewDir,
+        ...(colorSpace ? { colorSpace } : {}),
         ...renderOptions,
       });
       recipeResults[name] = {

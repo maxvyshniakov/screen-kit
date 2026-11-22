@@ -26,11 +26,13 @@ export {
   renderTimeline,
   renderTimelinePreview,
   renderTimelineStills,
+  moveFileAtomic,
+} from './render-timeline.mjs';
+export {
   computeFrameScene,
   projectViewportToRender,
   screenToRender,
-  moveFileAtomic,
-} from './render-timeline.mjs';
+} from './timeline-scene.mjs';
 export {
   TIMELINE_VERSION,
   EVENT_TRACK_VERSION,
@@ -49,6 +51,7 @@ export {
   DEFAULT_STEP_CAMERA_EASING,
   DEFAULT_PORTRAIT_ASPECT_RATIO,
   applyEasing,
+  findUpperBoundIndex,
   sampleCamera,
   cameraViewportRect,
   portraitBaseDimensions,
@@ -61,6 +64,7 @@ export {
   validateStepNarration,
   validateEventTrack,
   validateTimeline,
+  validateTimelineDetailed,
   assertValidTimeline,
   compileTimeline,
 } from './timeline.mjs';
