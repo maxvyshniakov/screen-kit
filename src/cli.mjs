@@ -5,6 +5,8 @@ import { captureRun, loadConfiguration, runPipeline, selectedRecipes, statusRun,
 import { reviewRun, reviewVideo } from './review.mjs';
 import { compileTimeline } from './timeline.mjs';
 import { renderVideo } from './video.mjs';
+import { generateAsset } from './assets.mjs';
+import { publishWebBundle, publishYouTube } from './publish.mjs';
 
 const help = `screen-kit ${VERSION}
 
@@ -18,14 +20,54 @@ screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track eve
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30]
 screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master] [--poster-format png]
+screen-kit publish --target web --input demo.mp4 --out out/web [--name demo] [--poster poster.png] [--formats vp9,h264] [--fps 30] [--color-space srgb|p3]
+screen-kit publish --target youtube --input demo.mp4 --title "..." [--description "..."] [--privacy unlisted|private|public] [--captions en:subs.srt] [--thumbnail thumb.png] [--dry-run] [--out report.json]
+screen-kit asset --kind thumbnail|wallpaper --prompt "..." --out out/thumb.png [--aspect-ratio 16:9] [--model imagen-3.0-generate-002] [--cache-dir dir]
 
 Recipes live in the consumer repository. Browser and terminal capture use real input.
 Capture writes run.json, original takes and exported files; timeline compiles event-track.json into
 timeline.json; preview renders key step frames into a contact sheet; run executes the unified
 capture -> timeline -> preview/render -> review pipeline; review verifies hashes, dimensions, frame
 counts, duration, capture checkpoints and rendered video quality; render exports silent MP4/WebM or
-renders timeline.json headlessly via Remotion 4.
+renders timeline.json headlessly via Remotion 4; publish exports opt-in web clip bundles or uploads
+to YouTube when explicitly authorized (extra audio-language tracks are added in YouTube Studio);
+asset generates opt-in non-UI assets only (stage wallpapers, YouTube thumbnails, covers) via
+Imagen / Gemini Image API and never synthesizes UI frames.
 `;
+
+function parseCaptionsFlag(raw) {
+  const trimmed = String(raw).trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw Error(`Invalid --captions JSON: ${error.message}`);
+    }
+    if (!Array.isArray(parsed)) {
+      throw Error('--captions JSON must be an array');
+    }
+    return parsed.map((entry) => ({
+      ...entry,
+      ...(typeof entry?.file === 'string' ? { file: resolve(entry.file) } : {}),
+    }));
+  }
+  return trimmed
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const sep = item.indexOf(':');
+      if (sep <= 0 || sep === item.length - 1) {
+        throw Error(`Invalid --captions entry "${item}"; expected <lang>:<file> (e.g. en:subs.srt)`);
+      }
+      return {
+        language: item.slice(0, sep).trim(),
+        file: resolve(item.slice(sep + 1).trim()),
+      };
+    });
+}
 
 function parseCursorDetectionFlag(rawDetection, rawColor) {
   let options = null;
@@ -65,8 +107,11 @@ const allowed = new Set([
   'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir',
   'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
+  'kind', 'prompt', 'aspect-ratio', 'model', 'cache-dir',
+  'target', 'name', 'poster', 'formats', 'color-space',
+  'title', 'description', 'privacy', 'captions', 'thumbnail', 'dry-run',
 ]);
-const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take']);
+const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take', 'dry-run']);
 const toBoolFlag = (val) => val === true || val === 'true' || val === '1';
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
@@ -243,6 +288,61 @@ try {
       });
       console.log(JSON.stringify(result, null, 2));
       if (!result.ok) process.exitCode = 1;
+    } else if (command === 'asset') {
+      if (!flags.kind || !flags.prompt || !flags.out) {
+        throw Error('asset requires --kind, --prompt, and --out');
+      }
+      const result = await generateAsset({
+        kind: flags.kind,
+        prompt: flags.prompt,
+        out: flags.out,
+        ...(flags['aspect-ratio'] ? { aspectRatio: flags['aspect-ratio'] } : {}),
+        ...(flags.model ? { model: flags.model } : {}),
+        ...(flags['cache-dir'] ? { cacheDir: flags['cache-dir'] } : {}),
+      });
+      console.log(JSON.stringify(result, null, 2));
+    } else if (command === 'publish') {
+      if (!flags.target) throw Error('publish requires --target web|youtube');
+      if (flags.target === 'web') {
+        const inputArg = flags.input ?? flags.video;
+        const outArg = flags.out ?? flags['out-dir'];
+        if (!inputArg || !outArg) throw Error('publish --target web requires --input and --out');
+        const result = await publishWebBundle({
+          input: inputArg,
+          outDir: outArg,
+          ...(flags.name ? { name: flags.name } : {}),
+          ...(flags.poster ? { poster: flags.poster } : {}),
+          ...(flags.formats ? { formats: flags.formats } : {}),
+          ...(flags.fps ? { fps: Number(flags.fps) } : {}),
+          ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}),
+          ...(flags.at ? { posterTime: Number(flags.at) } : {}),
+        });
+        console.log(JSON.stringify(result, null, 2));
+      } else if (flags.target === 'youtube') {
+        const videoArg = flags.input ?? flags.video;
+        if (!videoArg) throw Error('publish --target youtube requires --input (or --video)');
+        if (!flags.title) throw Error('publish --target youtube requires --title');
+        const captions = flags.captions ? parseCaptionsFlag(flags.captions) : undefined;
+        const thumbnail = flags.thumbnail ?? flags.poster;
+        const result = await publishYouTube({
+          video: videoArg,
+          title: flags.title,
+          ...(flags.description !== undefined ? { description: flags.description } : {}),
+          ...(flags.privacy ? { privacy: flags.privacy } : {}),
+          ...(captions ? { captions } : {}),
+          ...(thumbnail ? { thumbnail } : {}),
+          dryRun: toBoolFlag(flags['dry-run']),
+        });
+        const text = JSON.stringify(result, null, 2) + '\n';
+        if (flags.out) {
+          const outPath = resolve(flags.out);
+          await mkdir(dirname(outPath), { recursive: true });
+          await writeFile(outPath, text);
+        }
+        console.log(text.trimEnd());
+      } else {
+        throw Error(`unknown publish target: ${flags.target} (expected web or youtube)`);
+      }
     } else throw Error(`unknown command: ${command}`);
   }
 } catch (error) {

@@ -13,3 +13,16 @@ and Linux (`ubuntu-latest`) on pushes to `dev` and `main` and on pull requests.
 
 Local unpublished tarballs may be vendored by consumers with source digest and archive
 hash. Package registry publication and media uploads require separate explicit authorization.
+
+## Media publishing & non-UI assets
+
+- `screen-kit publish --target web` exports a local, self-contained web bundle (VP9/AV1 WebM,
+  H.264 MP4, WebP poster, `embed.html`, and `bundle.json` provenance manifest).
+- `screen-kit publish --target youtube` is strictly opt-in and never invoked implicitly by
+  `capture`, `render`, or `run`. Use `--dry-run` to validate metadata, captions, and thumbnail
+  locally; live uploads require explicit owner authorization and an OAuth token
+  (`YOUTUBE_ACCESS_TOKEN`). Extra audio-language tracks cannot be uploaded through the YouTube
+  Data API v3 and must be added manually in YouTube Studio.
+- `screen-kit asset --kind thumbnail|wallpaper` is opt-in (Imagen / Gemini Image API via
+  `x-goog-api-key`) for non-UI assets only (stage wallpapers, YouTube thumbnails, covers) and
+  must never be used to synthesize UI frames.

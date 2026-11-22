@@ -92,3 +92,19 @@ export {
   verifyStepSpeechFit,
   reviewNarration,
 } from './narration.mjs';
+export {
+  ASSET_KINDS,
+  DEFAULT_IMAGE_MODEL,
+  DEFAULT_ASPECT_RATIO,
+  ASSET_NON_UI_POLICY,
+  computeAssetCacheKey,
+  generateAsset,
+} from './assets.mjs';
+export {
+  WEB_BUNDLE_FORMATS,
+  YOUTUBE_PRIVACY_VALUES,
+  YOUTUBE_MULTI_AUDIO_NOTE,
+  buildWebEmbedHtml,
+  publishWebBundle,
+  publishYouTube,
+} from './publish.mjs';
