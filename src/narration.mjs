@@ -1,13 +1,28 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import { promisify } from 'node:util';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
-import { assertValidTimeline } from './timeline.mjs';
+import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { basename, delimiter, dirname, extname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  assertValidTimeline,
+  compileStepCameraKeyframes,
+  compileTimeline,
+  sampleCamera,
+  sampleCursor,
+  validateEventTrack,
+} from './timeline.mjs';
+import { probeVideo } from './video.mjs';
 
 const exec = promisify(execFile);
 
 export const TTS_PROVIDERS = ['gemini', 'kokoro'];
+export const WORD_ALIGNERS = ['auto', 'whisper', 'gemini', 'proportional'];
 export const DEFAULT_GEMINI_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+export const DEFAULT_GEMINI_ALIGN_MODEL = 'gemini-2.5-flash';
+export const DEFAULT_MLX_WHISPER_MODEL = 'mlx-community/whisper-tiny';
 export const DEFAULT_GEMINI_VOICE = 'Kore';
 export const DEFAULT_KOKORO_VOICE = 'af_heart';
 export const DEFAULT_STEP_LEAD_IN = 0.2;
@@ -230,18 +245,20 @@ export async function synthesizeWithGemini({
   voice = DEFAULT_GEMINI_VOICE,
   language,
   style,
+  stylePrompt,
   tone,
   pacing,
   instructions,
   sampleRate,
   fetchImpl = globalThis.fetch,
+  env = process.env,
   signal,
 } = {}) {
   if (!isNonEmptyString(text)) {
     throw Error('synthesizeWithGemini requires non-empty text');
   }
 
-  const resolvedKey = apiKey ?? process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  const resolvedKey = apiKey ?? env.GEMINI_API_KEY ?? env.GOOGLE_API_KEY;
   if (!isNonEmptyString(resolvedKey)) {
     throw Error(
       'Gemini TTS requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use provider="kokoro" for offline synthesis.'
@@ -252,8 +269,16 @@ export async function synthesizeWithGemini({
   }
 
   const languageCode = language ? normalizeLanguageCode(language) : undefined;
-  const promptText = buildGeminiTtsPrompt({ text, language: languageCode, style, tone, pacing, instructions });
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(resolvedKey.trim())}`;
+  const effectiveStyle = stylePrompt ?? style;
+  const promptText = buildGeminiTtsPrompt({
+    text,
+    language: languageCode,
+    style: effectiveStyle,
+    tone,
+    pacing,
+    instructions,
+  });
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
   const requestBody = {
     contents: [{ role: 'user', parts: [{ text: promptText }] }],
@@ -272,7 +297,10 @@ export async function synthesizeWithGemini({
 
   const response = await fetchImpl(endpoint, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-goog-api-key': resolvedKey.trim(),
+    },
     body: JSON.stringify(requestBody),
     ...(signal ? { signal } : {}),
   });
@@ -379,26 +407,26 @@ async function defaultKokoroRunner({
   speed,
   executable,
   python = 'python3',
+  env = process.env,
   timeoutMs = 120000,
 }) {
   const langCode = resolveKokoroLangCode(language);
-  const cliCommand = executable ?? 'kokoro-tts';
+  const explicitBin = executable ?? env.SCREEN_KIT_KOKORO_BIN;
+  const cliCommand = explicitBin ?? 'kokoro-tts';
 
   // 1. Try local kokoro-tts CLI if present
   try {
     await exec(
       cliCommand,
       ['--text', text, '--voice', voice, '--lang', langCode, '--speed', String(speed), '--output', outputFile],
-      { timeout: timeoutMs, maxBuffer: 10e6 }
+      { timeout: timeoutMs, maxBuffer: 10e6, env }
     );
     return { runtime: cliCommand };
   } catch (cliError) {
-    if (executable || cliError?.code !== 'ENOENT') {
-      if (executable) {
-        throw Error(
-          `Kokoro CLI '${cliCommand}' failed: ${cliError.stderr?.trim() || cliError.message}`
-        );
-      }
+    if (explicitBin) {
+      throw Error(
+        `Kokoro CLI '${cliCommand}' failed: ${cliError.stderr?.trim() || cliError.message}`
+      );
     }
   }
 
@@ -435,6 +463,7 @@ export async function synthesizeWithKokoro({
   executable,
   python = 'python3',
   runner,
+  env = process.env,
   timeoutMs = 120000,
 } = {}) {
   if (!isNonEmptyString(text)) {
@@ -461,6 +490,7 @@ export async function synthesizeWithKokoro({
           speed,
           executable,
           python,
+          env,
           timeoutMs,
         });
 
@@ -565,20 +595,229 @@ function normalizeRawWordTiming(entry) {
     ? entry.start
     : isFiniteNumber(entry.startMs)
       ? entry.startMs / 1000
-      : null;
+      : isFiniteNumber(entry.start_ms)
+        ? entry.start_ms / 1000
+        : null;
   const end = isFiniteNumber(entry.end)
     ? entry.end
     : isFiniteNumber(entry.endMs)
       ? entry.endMs / 1000
-      : null;
+      : isFiniteNumber(entry.end_ms)
+        ? entry.end_ms / 1000
+        : null;
   if (start === null || end === null) return null;
   return { word: word.trim(), start, end: Math.max(start, end) };
 }
 
+function cleanAlignToken(word) {
+  return String(word ?? '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+function scoreAlignPair(scriptClean, recClean) {
+  if (!scriptClean || !recClean) return 0;
+  if (scriptClean === recClean) return 6;
+  if (
+    scriptClean.length >= 2 &&
+    recClean.length >= 2 &&
+    (scriptClean.startsWith(recClean) || recClean.startsWith(scriptClean))
+  ) {
+    return 3;
+  }
+  if (
+    scriptClean.length >= 3 &&
+    recClean.length >= 3 &&
+    (scriptClean.includes(recClean) || recClean.includes(scriptClean))
+  ) {
+    return 2;
+  }
+  return -1;
+}
+
+function mapExternalTimingsToScript(tokens, normalizedExternal, startOffset, maxEnd) {
+  const n = tokens.length;
+  const m = normalizedExternal.length;
+  const allWordsBlank = normalizedExternal.every((item) => !item.word);
+
+  if (n === m && allWordsBlank) {
+    return tokens.map((token, i) => ({
+      token,
+      rawStart: startOffset + normalizedExternal[i].start,
+      rawEnd: startOffset + normalizedExternal[i].end,
+    }));
+  }
+
+  const sClean = tokens.map(cleanAlignToken);
+  const rClean = normalizedExternal.map((item) => cleanAlignToken(item.word));
+  const gapPenalty = -1.5;
+
+  const dp = Array.from({ length: n + 1 }, () => new Float64Array(m + 1).fill(-Infinity));
+  const back = Array.from({ length: n + 1 }, () => new Int32Array(m + 1).fill(0));
+  // Op codes: 1 = (i-1, j-1), 2 = (i-1, j) script gap, 3 = (i, j-1) rec gap, 4 = (i-1, j-2) 1-to-2 compound, 5 = (i-2, j-1) 2-to-1 compound
+  dp[0][0] = 0;
+  for (let i = 1; i <= n; i += 1) {
+    dp[i][0] = i * gapPenalty;
+    back[i][0] = 2;
+  }
+  for (let j = 1; j <= m; j += 1) {
+    dp[0][j] = j * gapPenalty;
+    back[0][j] = 3;
+  }
+
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      let best = dp[i - 1][j - 1] + scoreAlignPair(sClean[i - 1], rClean[j - 1]);
+      let op = 1;
+
+      const skipScript = dp[i - 1][j] + gapPenalty;
+      if (skipScript > best) {
+        best = skipScript;
+        op = 2;
+      }
+
+      const skipRec = dp[i][j - 1] + gapPenalty;
+      if (skipRec > best) {
+        best = skipRec;
+        op = 3;
+      }
+
+      if (
+        j >= 2 &&
+        sClean[i - 1] &&
+        rClean[j - 2] &&
+        rClean[j - 1] &&
+        sClean[i - 1] === rClean[j - 2] + rClean[j - 1]
+      ) {
+        const compound12 = dp[i - 1][j - 2] + 8;
+        if (compound12 >= best) {
+          best = compound12;
+          op = 4;
+        }
+      }
+
+      if (
+        i >= 2 &&
+        rClean[j - 1] &&
+        sClean[i - 2] &&
+        sClean[i - 1] &&
+        sClean[i - 2] + sClean[i - 1] === rClean[j - 1]
+      ) {
+        const compound21 = dp[i - 2][j - 1] + 8;
+        if (compound21 >= best) {
+          best = compound21;
+          op = 5;
+        }
+      }
+
+      dp[i][j] = best;
+      back[i][j] = op;
+    }
+  }
+
+  // Backtrack anchors: each anchor maps script range [sFrom..sTo] to recognized range [rFrom..rTo]
+  const anchors = [];
+  let ci = n;
+  let cj = m;
+  while (ci > 0 || cj > 0) {
+    const op = back[ci][cj];
+    if (op === 4) {
+      anchors.push({ sFrom: ci - 1, sTo: ci - 1, rFrom: cj - 2, rTo: cj - 1 });
+      ci -= 1;
+      cj -= 2;
+    } else if (op === 5) {
+      anchors.push({ sFrom: ci - 2, sTo: ci - 1, rFrom: cj - 1, rTo: cj - 1 });
+      ci -= 2;
+      cj -= 1;
+    } else if (op === 1) {
+      const pairScore = scoreAlignPair(sClean[ci - 1], rClean[cj - 1]);
+      if (pairScore > 0 || n === m) {
+        anchors.push({ sFrom: ci - 1, sTo: ci - 1, rFrom: cj - 1, rTo: cj - 1 });
+      }
+      ci -= 1;
+      cj -= 1;
+    } else if (op === 2) {
+      ci -= 1;
+    } else {
+      cj -= 1;
+    }
+  }
+  anchors.reverse();
+
+  const rawMapped = new Array(n).fill(null);
+
+  const assignProportionalSpan = (sStart, sEnd, winStart, winEnd) => {
+    const count = sEnd - sStart + 1;
+    if (count <= 0) return;
+    const span = Math.max(0, winEnd - winStart);
+    const sliceWeights = [];
+    let wTotal = 0;
+    for (let k = sStart; k <= sEnd; k += 1) {
+      const w = estimateWordWeight(tokens[k]);
+      sliceWeights.push(w);
+      wTotal += w;
+    }
+    let acc = 0;
+    for (let idx = 0; idx < count; idx += 1) {
+      const st = winStart + (wTotal > 0 ? (acc / wTotal) * span : 0);
+      acc += sliceWeights[idx];
+      const en = idx === count - 1 ? winEnd : winStart + (wTotal > 0 ? (acc / wTotal) * span : 0);
+      rawMapped[sStart + idx] = {
+        token: tokens[sStart + idx],
+        rawStart: st,
+        rawEnd: Math.max(st, en),
+      };
+    }
+  };
+
+  let prevS = -1;
+  let prevR = -1;
+  let prevTimeEnd = startOffset + Math.max(0, normalizedExternal[0].start);
+
+  for (const anchor of anchors) {
+    if (anchor.sFrom > prevS + 1) {
+      const gapRStart = prevR + 1;
+      const gapREnd = anchor.rFrom - 1;
+      const winStart = gapRStart <= gapREnd
+        ? startOffset + normalizedExternal[gapRStart].start
+        : prevTimeEnd;
+      const winEnd = gapRStart <= gapREnd
+        ? startOffset + normalizedExternal[gapREnd].end
+        : Math.max(winStart, startOffset + normalizedExternal[anchor.rFrom].start);
+      assignProportionalSpan(prevS + 1, anchor.sFrom - 1, winStart, winEnd);
+    }
+
+    const anchorWinStart = startOffset + normalizedExternal[anchor.rFrom].start;
+    const anchorWinEnd = startOffset + normalizedExternal[anchor.rTo].end;
+    assignProportionalSpan(anchor.sFrom, anchor.sTo, anchorWinStart, anchorWinEnd);
+
+    prevS = anchor.sTo;
+    prevR = anchor.rTo;
+    prevTimeEnd = anchorWinEnd;
+  }
+
+  if (prevS < n - 1) {
+    const gapRStart = prevR + 1;
+    const gapREnd = m - 1;
+    const winStart = prevS === -1
+      ? startOffset + normalizedExternal[0].start
+      : gapRStart <= gapREnd
+        ? startOffset + normalizedExternal[gapRStart].start
+        : prevTimeEnd;
+    const winEnd = gapRStart <= gapREnd
+      ? startOffset + normalizedExternal[gapREnd].end
+      : maxEnd;
+    assignProportionalSpan(prevS + 1, n - 1, winStart, Math.max(winStart, winEnd));
+  }
+
+  return rawMapped;
+}
+
 /**
  * Align known script text to monotonic word-level timestamps.
- * Uses provided forced-alignment `wordTimings` (e.g. Whisper/MFA/provider alignment) when present,
- * falling back to deterministic proportional syllable/character weighting.
+ * Uses provided forced-alignment `wordTimings` (e.g. Whisper/Gemini/provider alignment) when present,
+ * preserving exact script spelling/punctuation via sequence alignment, and falling back to
+ * deterministic proportional syllable/character weighting.
  */
 export function alignWords({
   text,
@@ -605,33 +844,15 @@ export function alignWords({
       ? duration
       : Math.max(0.01, normalizedExternal[normalizedExternal.length - 1].end);
     const maxEnd = startOffset + inferredDuration;
+    const mapped = mapExternalTimingsToScript(tokens, normalizedExternal, startOffset, maxEnd);
 
     const aligned = [];
     let cursorTime = startOffset;
 
     for (let i = 0; i < tokens.length; i += 1) {
-      let rawStart;
-      let rawEnd;
-      if (normalizedExternal.length === tokens.length) {
-        rawStart = startOffset + normalizedExternal[i].start;
-        rawEnd = startOffset + normalizedExternal[i].end;
-      } else {
-        const mappedIndex = Math.min(
-          normalizedExternal.length - 1,
-          Math.floor((i * normalizedExternal.length) / tokens.length)
-        );
-        const mappedNext = Math.min(
-          normalizedExternal.length - 1,
-          Math.floor(((i + 1) * normalizedExternal.length) / tokens.length)
-        );
-        const seg = normalizedExternal[mappedIndex];
-        const nextSeg = normalizedExternal[mappedNext];
-        rawStart = startOffset + seg.start;
-        rawEnd = startOffset + Math.max(seg.end, mappedNext > mappedIndex ? nextSeg.start : seg.end);
-      }
-
-      const clampedStart = Math.max(cursorTime, Math.min(rawStart, maxEnd));
-      const clampedEnd = Math.max(clampedStart, Math.min(rawEnd, maxEnd));
+      const entry = mapped[i];
+      const clampedStart = Math.max(cursorTime, Math.min(entry.rawStart, maxEnd));
+      const clampedEnd = Math.max(clampedStart, Math.min(entry.rawEnd, maxEnd));
       aligned.push({
         index: i,
         word: tokens[i],
@@ -670,6 +891,652 @@ export function alignWords({
   }
 
   return result;
+}
+
+function inferWhisperKind(binaryPath) {
+  const base = basename(String(binaryPath)).toLowerCase();
+  if (base.includes('mlx_whisper') || base.includes('mlx-whisper')) return 'mlx-whisper';
+  return 'whisper-cpp';
+}
+
+async function isExecutableFile(candidatePath) {
+  try {
+    await access(candidatePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect a local Whisper forced-alignment CLI (`mlx_whisper` or `whisper-cli` / `whisper-cpp`).
+ * Uses filesystem permission checks only (zero shell or network calls).
+ */
+export async function detectLocalWhisper({ executable, env = process.env } = {}) {
+  if (executable === false || executable === null) return null;
+  const envOverride = env?.SCREEN_KIT_WHISPER_BIN;
+  if (executable === undefined && typeof envOverride === 'string') {
+    const trimmedEnv = envOverride.trim();
+    if (!trimmedEnv || trimmedEnv === 'none' || trimmedEnv === '0' || trimmedEnv === 'false') {
+      return null;
+    }
+    executable = trimmedEnv;
+  }
+
+  const rawPath = typeof env?.PATH === 'string' ? env.PATH : '';
+  const pathDirs = rawPath.split(delimiter).map((d) => d.trim()).filter(Boolean);
+  if (env === process.env) {
+    const extraDirs = [
+      join(homedir(), '.local', 'bin'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+    ];
+    for (const dir of extraDirs) {
+      if (!pathDirs.includes(dir)) pathDirs.push(dir);
+    }
+  }
+
+  if (isNonEmptyString(executable)) {
+    const trimmed = executable.trim();
+    if (trimmed.includes('/') || trimmed.includes('\\')) {
+      const resolved = resolve(trimmed);
+      if (await isExecutableFile(resolved)) {
+        return { kind: inferWhisperKind(resolved), executable: resolved };
+      }
+      throw Error(`Configured Whisper executable is not found or not executable: ${resolved}`);
+    }
+    for (const dir of pathDirs) {
+      const candidate = join(dir, trimmed);
+      if (await isExecutableFile(candidate)) {
+        return { kind: inferWhisperKind(candidate), executable: candidate };
+      }
+    }
+    throw Error(`Configured Whisper executable '${trimmed}' was not found in PATH`);
+  }
+
+  const candidates = ['mlx_whisper', 'whisper-cli', 'whisper-cpp'];
+  for (const name of candidates) {
+    for (const dir of pathDirs) {
+      const candidate = join(dir, name);
+      if (await isExecutableFile(candidate)) {
+        return { kind: inferWhisperKind(candidate), executable: candidate };
+      }
+    }
+  }
+  return null;
+}
+
+function parseTimestampStringToSeconds(ts) {
+  if (typeof ts !== 'string') return null;
+  const m = ts.trim().match(/^(\d+):(\d{2}):(\d{2})[,.](\d{1,3})$/);
+  if (!m) return null;
+  const hours = Number(m[1]);
+  const minutes = Number(m[2]);
+  const seconds = Number(m[3]);
+  const ms = Number(m[4].padEnd(3, '0'));
+  return hours * 3600 + minutes * 60 + seconds + ms / 1000;
+}
+
+function extractWhisperCppEntryTiming(entry) {
+  if (!isObject(entry)) return null;
+  if (isObject(entry.offsets) && isFiniteNumber(entry.offsets.from) && isFiniteNumber(entry.offsets.to)) {
+    return {
+      start: entry.offsets.from / 1000,
+      end: Math.max(entry.offsets.from / 1000, entry.offsets.to / 1000),
+    };
+  }
+  if (isObject(entry.timestamps)) {
+    const fromSec = parseTimestampStringToSeconds(entry.timestamps.from);
+    const toSec = parseTimestampStringToSeconds(entry.timestamps.to);
+    if (fromSec !== null && toSec !== null) {
+      return { start: fromSec, end: Math.max(fromSec, toSec) };
+    }
+  }
+  if (isFiniteNumber(entry.t0) && isFiniteNumber(entry.t1)) {
+    return { start: entry.t0 * 0.01, end: Math.max(entry.t0 * 0.01, entry.t1 * 0.01) };
+  }
+  return null;
+}
+
+/**
+ * Parse word-level timestamps from `mlx_whisper`, `openai-whisper`, or `whisper.cpp` JSON output.
+ */
+export function parseWhisperWordTimings(input) {
+  const payload = typeof input === 'string' ? JSON.parse(input) : input;
+  if (Array.isArray(payload)) {
+    return payload.map(normalizeRawWordTiming).filter((w) => w && w.word.length > 0);
+  }
+  if (!isObject(payload)) return [];
+
+  if (Array.isArray(payload.words) && payload.words.length > 0) {
+    return payload.words.map(normalizeRawWordTiming).filter((w) => w && w.word.length > 0);
+  }
+
+  // mlx_whisper / openai-whisper: segments[].words[]
+  if (Array.isArray(payload.segments) && payload.segments.length > 0) {
+    const words = [];
+    for (const seg of payload.segments) {
+      if (!isObject(seg)) continue;
+      if (Array.isArray(seg.words) && seg.words.length > 0) {
+        for (const rawW of seg.words) {
+          const parsed = normalizeRawWordTiming(rawW);
+          if (parsed && parsed.word.length > 0) words.push(parsed);
+        }
+      } else if (typeof seg.text === 'string' && isFiniteNumber(seg.start) && isFiniteNumber(seg.end)) {
+        const segWords = seg.text.trim().split(/\s+/).filter(Boolean);
+        const span = Math.max(0, seg.end - seg.start);
+        segWords.forEach((tok, idx) => {
+          const st = seg.start + (span * idx) / segWords.length;
+          const en = seg.start + (span * (idx + 1)) / segWords.length;
+          words.push({ word: tok, start: st, end: en });
+        });
+      }
+    }
+    return words;
+  }
+
+  // whisper.cpp (-ojf / -oj): transcription[] with optional subword tokens[]
+  if (Array.isArray(payload.transcription) && payload.transcription.length > 0) {
+    const words = [];
+    for (const item of payload.transcription) {
+      if (!isObject(item)) continue;
+      if (Array.isArray(item.tokens) && item.tokens.length > 0) {
+        for (const tok of item.tokens) {
+          if (!isObject(tok) || typeof tok.text !== 'string') continue;
+          const rawText = tok.text;
+          if (/^\[_.*_\]$/.test(rawText.trim()) || rawText.length === 0) continue;
+          const timing = extractWhisperCppEntryTiming(tok);
+          if (!timing) continue;
+          const startsNewWord = /^\s/.test(rawText) || words.length === 0;
+          const trimmed = rawText.trim();
+          if (!trimmed) continue;
+          const isPurePunct = !/[\p{L}\p{N}]/u.test(trimmed);
+          if (!startsNewWord || isPurePunct) {
+            if (words.length > 0) {
+              const prev = words[words.length - 1];
+              prev.word += trimmed;
+              prev.end = Math.max(prev.end, timing.end);
+              continue;
+            }
+          }
+          words.push({ word: trimmed, start: timing.start, end: timing.end });
+        }
+      } else if (typeof item.text === 'string' && item.text.trim().length > 0) {
+        const timing = extractWhisperCppEntryTiming(item);
+        if (!timing) continue;
+        const tokensInSeg = item.text.trim().split(/\s+/).filter(Boolean);
+        const span = Math.max(0, timing.end - timing.start);
+        tokensInSeg.forEach((w, idx) => {
+          words.push({
+            word: w,
+            start: timing.start + (span * idx) / tokensInSeg.length,
+            end: timing.start + (span * (idx + 1)) / tokensInSeg.length,
+          });
+        });
+      }
+    }
+    return words;
+  }
+
+  return [];
+}
+
+function normalizeWhisperLang(language) {
+  if (!isNonEmptyString(language)) return 'en';
+  return language.trim().toLowerCase().split(/[-_]/)[0] || 'en';
+}
+
+/**
+ * Local forced word alignment via `mlx_whisper` or `whisper-cli` / `whisper.cpp`
+ * (argument arrays only, never a shell) mapped onto exact script words.
+ */
+export async function alignWithWhisper({
+  audioFile,
+  text,
+  duration,
+  startOffset = 0,
+  language = 'en',
+  executable,
+  model,
+  runner,
+  env = process.env,
+  timeoutMs = 120000,
+} = {}) {
+  if (typeof text !== 'string') {
+    throw Error('alignWithWhisper requires text to be a string');
+  }
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return { aligner: 'whisper', backend: 'whisper', duration: duration ?? 0, words: [] };
+  }
+
+  const resolvedAudio = isNonEmptyString(audioFile) ? resolve(audioFile) : null;
+  let backend = 'custom-runner';
+  let rawPayload = null;
+
+  if (typeof runner === 'function') {
+    const out = await runner({
+      audioFile: resolvedAudio,
+      text: text.trim(),
+      language: normalizeWhisperLang(language),
+      executable,
+      model,
+    });
+    if (isObject(out) && isNonEmptyString(out.jsonFile)) {
+      rawPayload = JSON.parse(await readFile(resolve(out.jsonFile), 'utf8'));
+    } else {
+      rawPayload = out;
+    }
+    if (isObject(out) && isNonEmptyString(out.backend)) backend = out.backend;
+  } else {
+    if (!resolvedAudio) {
+      throw Error('alignWithWhisper requires an audioFile path');
+    }
+    await access(resolvedAudio);
+    const detected = await detectLocalWhisper({ executable, env });
+    if (!detected) {
+      throw Error(
+        'Local Whisper CLI not found. Install `mlx-whisper` (`pip install mlx-whisper`) or `whisper-cpp` (`brew install whisper-cpp`), or use aligner="gemini" or "proportional".'
+      );
+    }
+    backend = detected.kind;
+    const whisperLang = normalizeWhisperLang(language);
+    const tempDir = await mkdtemp(join(tmpdir(), 'screen-kit-whisper-'));
+    try {
+      const outBase = join(tempDir, 'align');
+      const outJson = `${outBase}.json`;
+      if (detected.kind === 'mlx-whisper') {
+        const args = [
+          resolvedAudio,
+          '--model',
+          model ?? env.MLX_WHISPER_MODEL ?? DEFAULT_MLX_WHISPER_MODEL,
+          '--output-dir',
+          tempDir,
+          '--output-name',
+          'align',
+          '--output-format',
+          'json',
+          '--word-timestamps',
+          'True',
+          '--verbose',
+          'False',
+          '--language',
+          whisperLang,
+          '--initial-prompt',
+          text.trim(),
+        ];
+        await exec(detected.executable, args, { timeout: timeoutMs, maxBuffer: 20e6, env });
+      } else {
+        const resolvedModel = model ?? env.WHISPER_CPP_MODEL;
+        const args = [
+          ...(isNonEmptyString(resolvedModel) ? ['-m', resolve(resolvedModel)] : []),
+          '-f',
+          resolvedAudio,
+          '-l',
+          whisperLang,
+          '-ojf',
+          '-of',
+          outBase,
+          '--prompt',
+          text.trim(),
+        ];
+        await exec(detected.executable, args, { timeout: timeoutMs, maxBuffer: 20e6, env });
+      }
+      rawPayload = JSON.parse(await readFile(outJson, 'utf8'));
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  const rawTimings = parseWhisperWordTimings(rawPayload);
+  let effectiveDuration = isFiniteNumber(duration) && duration > 0 ? duration : 0;
+  if (!(effectiveDuration > 0) && resolvedAudio) {
+    const probed = await probeAudio(resolvedAudio).catch(() => null);
+    if (probed?.hasAudio && probed.duration > 0) effectiveDuration = probed.duration;
+  }
+  if (!(effectiveDuration > 0) && rawTimings.length > 0) {
+    effectiveDuration = Math.max(0.05, rawTimings[rawTimings.length - 1].end);
+  }
+  if (!(effectiveDuration > 0)) effectiveDuration = 1.0;
+
+  const words = rawTimings.length > 0
+    ? alignWords({
+        text,
+        duration: effectiveDuration,
+        startOffset,
+        wordTimings: rawTimings,
+      })
+    : alignWords({
+        text,
+        duration: effectiveDuration,
+        startOffset,
+      });
+
+  return {
+    aligner: 'whisper',
+    backend,
+    duration: round(effectiveDuration, 4),
+    words,
+    rawWordCount: rawTimings.length,
+  };
+}
+
+function inferAudioMimeType(filePath = '') {
+  const ext = extname(String(filePath)).toLowerCase();
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.webm') return 'audio/webm';
+  if (ext === '.m4a' || ext === '.mp4' || ext === '.aac') return 'audio/mp4';
+  if (ext === '.flac') return 'audio/flac';
+  return 'audio/wav';
+}
+
+function stripJsonCodeFence(rawText = '') {
+  const trimmed = String(rawText).trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+/**
+ * Zero-install cloud word alignment using Gemini native audio understanding (`x-goog-api-key` header).
+ * Makes zero network calls when credentials are absent.
+ */
+export async function alignWithGemini({
+  audioFile,
+  audioBuffer,
+  mimeType,
+  text,
+  duration,
+  startOffset = 0,
+  language = 'en',
+  apiKey,
+  model = DEFAULT_GEMINI_ALIGN_MODEL,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  signal,
+} = {}) {
+  if (typeof text !== 'string') {
+    throw Error('alignWithGemini requires text to be a string');
+  }
+  const resolvedKey = apiKey ?? env.GEMINI_API_KEY ?? env.GOOGLE_API_KEY;
+  if (!isNonEmptyString(resolvedKey)) {
+    throw Error(
+      'Gemini audio alignment requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use aligner="whisper" or "proportional".'
+    );
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw Error('fetch is not available for Gemini audio alignment');
+  }
+
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return { aligner: 'gemini', backend: model, duration: duration ?? 0, words: [] };
+  }
+
+  let bytes = null;
+  let resolvedAudio = null;
+  if (Buffer.isBuffer(audioBuffer)) {
+    bytes = audioBuffer;
+  } else if (isNonEmptyString(audioFile)) {
+    resolvedAudio = resolve(audioFile);
+    bytes = await readFile(resolvedAudio);
+  } else {
+    throw Error('alignWithGemini requires audioFile or audioBuffer');
+  }
+
+  let effectiveDuration = isFiniteNumber(duration) && duration > 0 ? duration : 0;
+  if (!(effectiveDuration > 0)) {
+    const wavMeta = parseWavHeader(bytes);
+    if (wavMeta?.duration > 0) effectiveDuration = wavMeta.duration;
+    else if (resolvedAudio) {
+      const probed = await probeAudio(resolvedAudio).catch(() => null);
+      if (probed?.hasAudio && probed.duration > 0) effectiveDuration = probed.duration;
+    }
+  }
+
+  const resolvedMime = mimeType ?? inferAudioMimeType(resolvedAudio ?? 'audio.wav');
+  const prompt = [
+    `Align the attached spoken audio (${normalizeLanguageCode(language)}${effectiveDuration > 0 ? `, duration ${round(effectiveDuration, 3)}s` : ''}) to the exact script words below.`,
+    `Return ONLY valid JSON of shape: { "words": [{ "word": string, "start": number, "end": number }] } where start and end are timestamps in seconds from the beginning of the audio clip.`,
+    `Exact script (${tokens.length} words): ${JSON.stringify(tokens)}`,
+  ].join('\n');
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const response = await fetchImpl(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-goog-api-key': resolvedKey.trim(),
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: resolvedMime,
+                data: bytes.toString('base64'),
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0,
+      },
+    }),
+    ...(signal ? { signal } : {}),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw Error(`Gemini audio alignment API returned HTTP ${response.status}: ${body.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const rawText = (data?.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p?.text ?? '')
+    .join('\n')
+    .trim();
+
+  if (!rawText) {
+    throw Error('Gemini audio alignment returned an empty response');
+  }
+
+  const parsed = JSON.parse(stripJsonCodeFence(rawText));
+  const rawList = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.words)
+      ? parsed.words
+      : Array.isArray(parsed?.segments)
+        ? parsed.segments
+        : [];
+  const rawTimings = rawList.map(normalizeRawWordTiming).filter(Boolean);
+
+  if (!(effectiveDuration > 0) && rawTimings.length > 0) {
+    effectiveDuration = Math.max(0.05, rawTimings[rawTimings.length - 1].end);
+  }
+  if (!(effectiveDuration > 0)) effectiveDuration = 1.0;
+
+  const words = rawTimings.length > 0
+    ? alignWords({
+        text,
+        duration: effectiveDuration,
+        startOffset,
+        wordTimings: rawTimings,
+      })
+    : alignWords({
+        text,
+        duration: effectiveDuration,
+        startOffset,
+      });
+
+  return {
+    aligner: 'gemini',
+    backend: model,
+    duration: round(effectiveDuration, 4),
+    words,
+    rawWordCount: rawTimings.length,
+  };
+}
+
+/**
+ * Pluggable word-level audio alignment dispatcher (`auto` | `whisper` | `gemini` | `proportional`).
+ * - `whisper`: local `mlx_whisper` or `whisper-cli`/`whisper.cpp` (argument arrays only)
+ * - `gemini`: zero-install Gemini audio understanding (`x-goog-api-key` header)
+ * - `proportional`: deterministic syllable/character fallback
+ * - `auto`: tries local `whisper` -> `gemini` (when API key is set) -> `proportional` fallback
+ */
+export async function alignAudioWords({
+  audioFile,
+  audioBuffer,
+  mimeType,
+  text,
+  duration,
+  startOffset = 0,
+  aligner = 'auto',
+  language = 'en',
+  apiKey,
+  fetchImpl,
+  runner,
+  executable,
+  model,
+  env = process.env,
+  timeoutMs = 120000,
+  signal,
+} = {}) {
+  if (!WORD_ALIGNERS.includes(aligner)) {
+    throw Error(`Unsupported word aligner: ${String(aligner)} (expected one of ${WORD_ALIGNERS.join(', ')})`);
+  }
+  if (typeof text !== 'string') {
+    throw Error('alignAudioWords requires text to be a string');
+  }
+
+  const resolveEffectiveDuration = async () => {
+    if (isFiniteNumber(duration) && duration > 0) return duration;
+    if (Buffer.isBuffer(audioBuffer)) {
+      const wav = parseWavHeader(audioBuffer);
+      if (wav?.duration > 0) return wav.duration;
+    }
+    if (isNonEmptyString(audioFile)) {
+      const probed = await probeAudio(resolve(audioFile)).catch(() => null);
+      if (probed?.hasAudio && probed.duration > 0) return probed.duration;
+    }
+    return 0;
+  };
+
+  if (aligner === 'proportional') {
+    const effectiveDuration = await resolveEffectiveDuration();
+    const tokens = text.trim().split(/\s+/).filter(Boolean);
+    const words = tokens.length > 0
+      ? alignWords({ text, duration: effectiveDuration, startOffset })
+      : [];
+    return {
+      aligner: 'proportional',
+      backend: 'proportional',
+      duration: round(effectiveDuration, 4),
+      words,
+    };
+  }
+
+  if (aligner === 'whisper') {
+    return alignWithWhisper({
+      audioFile,
+      text,
+      duration,
+      startOffset,
+      language,
+      executable,
+      model,
+      runner,
+      env,
+      timeoutMs,
+    });
+  }
+
+  if (aligner === 'gemini') {
+    return alignWithGemini({
+      audioFile,
+      audioBuffer,
+      mimeType,
+      text,
+      duration,
+      startOffset,
+      language,
+      apiKey,
+      ...(model ? { model } : {}),
+      ...(fetchImpl ? { fetchImpl } : {}),
+      env,
+      signal,
+    });
+  }
+
+  // aligner === 'auto'
+  const canTryWhisper =
+    typeof runner === 'function' ||
+    (isNonEmptyString(audioFile) && Boolean(await detectLocalWhisper({ executable, env }).catch(() => null)));
+
+  if (canTryWhisper) {
+    try {
+      const whisperRes = await alignWithWhisper({
+        audioFile,
+        text,
+        duration,
+        startOffset,
+        language,
+        executable,
+        model,
+        runner,
+        env,
+        timeoutMs,
+      });
+      if (whisperRes.words.length === 0 || whisperRes.rawWordCount > 0) {
+        return whisperRes;
+      }
+    } catch {
+      // Fall through to Gemini / proportional in auto mode
+    }
+  }
+
+  const resolvedKey = apiKey ?? env?.GEMINI_API_KEY ?? env?.GOOGLE_API_KEY;
+  if (isNonEmptyString(resolvedKey) && (Buffer.isBuffer(audioBuffer) || isNonEmptyString(audioFile))) {
+    try {
+      const geminiRes = await alignWithGemini({
+        audioFile,
+        audioBuffer,
+        mimeType,
+        text,
+        duration,
+        startOffset,
+        language,
+        apiKey: resolvedKey,
+        ...(model ? { model } : {}),
+        ...(fetchImpl ? { fetchImpl } : {}),
+        env,
+        signal,
+      });
+      if (geminiRes.words.length === 0 || geminiRes.rawWordCount > 0) {
+        return geminiRes;
+      }
+    } catch {
+      // Fall through to deterministic proportional alignment in auto mode
+    }
+  }
+
+  const effectiveDuration = await resolveEffectiveDuration();
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  const words = tokens.length > 0
+    ? alignWords({ text, duration: effectiveDuration, startOffset })
+    : [];
+  return {
+    aligner: 'proportional',
+    backend: 'proportional',
+    duration: round(effectiveDuration, 4),
+    words,
+  };
 }
 
 const BREAK_BEFORE_WORDS = new Set([
@@ -1219,6 +2086,1061 @@ export async function buildNarrationTracks({
     captionTracks,
     subtitles,
     ...(updatedTimeline ? { timeline: updatedTimeline } : {}),
+  };
+}
+
+const EXTERNAL_MEDIA_RE = /^(?:https?:|data:|blob:)/i;
+
+async function fileExistsSafe(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveRefPath(ref, baseDir) {
+  if (!isNonEmptyString(ref) || EXTERNAL_MEDIA_RE.test(ref)) return null;
+  if (ref.startsWith('file://')) return fileURLToPath(ref);
+  return resolve(baseDir, ref);
+}
+
+function rebaseMediaRef(ref, fromBaseDir, toBaseDir) {
+  if (!isNonEmptyString(ref) || EXTERNAL_MEDIA_RE.test(ref)) return ref;
+  const abs = resolveRefPath(ref, fromBaseDir);
+  if (!abs) return ref;
+  if (!toBaseDir) return abs;
+  const rel = relative(toBaseDir, abs);
+  return rel || basename(abs);
+}
+
+async function padTakeVideoWithHolds({
+  sourceVideo,
+  outputVideo,
+  scheduledSteps,
+  finalDuration,
+  fps,
+  signal,
+}) {
+  const srcInfo = await probeVideo(sourceVideo);
+  const srcDuration = srcInfo.duration > 0 ? srcInfo.duration : 0.1;
+  const targetFps = isFiniteNumber(fps) && fps > 0 ? fps : srcInfo.fps || 30;
+  const minSlice = Math.max(0.02, 1.05 / targetFps);
+  const format = extname(outputVideo).toLowerCase() === '.webm' ? 'webm' : 'mp4';
+
+  // Collect internal hold points (0 < cut < srcDuration)
+  const internalHolds = [];
+  let sumInternalPad = 0;
+  for (let i = 0; i < scheduledSteps.length - 1; i += 1) {
+    const step = scheduledSteps[i];
+    if (!(step.padDuration > 1e-3)) continue;
+    const cut = Math.max(0, Math.min(srcDuration, step.origEnd));
+    if (cut >= minSlice && cut <= srcDuration - minSlice) {
+      const prev = internalHolds[internalHolds.length - 1];
+      if (prev && Math.abs(cut - prev.cut) < minSlice) {
+        prev.hold = round(prev.hold + step.padDuration, 6);
+      } else {
+        internalHolds.push({ cut: round(cut, 6), hold: round(step.padDuration, 6) });
+      }
+      sumInternalPad += step.padDuration;
+    }
+  }
+
+  const tailHold = Math.max(0, finalDuration - (srcDuration + sumInternalPad)) + 2 / targetFps;
+  await mkdir(dirname(outputVideo), { recursive: true });
+  const tempOut = join(dirname(outputVideo), `.${basename(outputVideo)}-${randomUUID().slice(0, 8)}.${format}`);
+
+  const codecArgs = format === 'webm'
+    ? ['-c:v', 'libvpx-vp9', '-crf', '22', '-b:v', '0', '-deadline', 'good', '-row-mt', '1']
+    : [
+        '-c:v', 'libx264',
+        '-crf', '15',
+        '-preset', 'fast',
+        '-movflags', '+faststart',
+        '-color_range', 'tv',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-colorspace', 'bt709',
+      ];
+
+  try {
+    if (internalHolds.length === 0) {
+      const vf = [
+        `tpad=stop_mode=clone:stop_duration=${tailHold.toFixed(6)}`,
+        `fps=${targetFps}`,
+        'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+      ].join(',');
+      await exec(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel', 'error',
+          '-y',
+          '-i', sourceVideo,
+          '-an',
+          '-vf', vf,
+          '-t', finalDuration.toFixed(6),
+          '-pix_fmt', 'yuv420p',
+          ...codecArgs,
+          '-threads', '2',
+          tempOut,
+        ],
+        { timeout: 300000, maxBuffer: 10e6, ...(signal ? { signal } : {}) }
+      );
+    } else {
+      const slices = [];
+      let prevCut = 0;
+      for (const item of internalHolds) {
+        slices.push({ start: prevCut, end: item.cut, hold: item.hold });
+        prevCut = item.cut;
+      }
+      slices.push({ start: prevCut, end: srcDuration, hold: tailHold });
+
+      const filterParts = [];
+      const concatInputs = [];
+      slices.forEach((slice, idx) => {
+        const padChain = slice.hold > 1e-4
+          ? `,tpad=stop_mode=clone:stop_duration=${slice.hold.toFixed(6)}`
+          : '';
+        filterParts.push(
+          `[0:v]trim=start=${slice.start.toFixed(6)}:end=${slice.end.toFixed(6)},setpts=PTS-STARTPTS${padChain}[v${idx}]`
+        );
+        concatInputs.push(`[v${idx}]`);
+      });
+      filterParts.push(
+        `${concatInputs.join('')}concat=n=${slices.length}:v=1:a=0,fps=${targetFps},pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p[outv]`
+      );
+
+      await exec(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel', 'error',
+          '-y',
+          '-i', sourceVideo,
+          '-filter_complex', filterParts.join(';'),
+          '-map', '[outv]',
+          '-an',
+          '-t', finalDuration.toFixed(6),
+          ...codecArgs,
+          '-threads', '2',
+          tempOut,
+        ],
+        { timeout: 300000, maxBuffer: 10e6, ...(signal ? { signal } : {}) }
+      );
+    }
+
+    const probed = await probeVideo(tempOut);
+    if (!probed.frames || !(probed.duration > 0)) {
+      throw Error('FFmpeg produced an empty padded take video');
+    }
+    await rename(tempOut, outputVideo);
+    return probed;
+  } finally {
+    await rm(tempOut, { force: true }).catch(() => {});
+  }
+}
+
+function buildPiecewiseTimeMapper(scheduledSteps) {
+  return (t) => {
+    if (!isFiniteNumber(t) || scheduledSteps.length === 0) return t;
+    if (t < scheduledSteps[0].origStart - EPS) return round(t, 4);
+    let idx = 0;
+    for (let i = 0; i < scheduledSteps.length; i += 1) {
+      if (scheduledSteps[i].origStart <= t + EPS) idx = i;
+      else break;
+    }
+    return round(t + scheduledSteps[idx].shiftBefore, 4);
+  };
+}
+
+function retimeCursorSamplesWithHolds(origCursor, scheduledSteps) {
+  if (!isObject(origCursor) || !Array.isArray(origCursor.samples) || origCursor.samples.length === 0) {
+    return origCursor?.samples ?? [];
+  }
+  const mapT = buildPiecewiseTimeMapper(scheduledSteps);
+  const rawSamples = origCursor.samples;
+  const holds = scheduledSteps.filter((s) => s.padDuration > 1e-4);
+  if (holds.length === 0) {
+    return rawSamples.map((s) => ({ ...s, t: mapT(s.t) }));
+  }
+
+  const out = [];
+  const pushSample = (sample) => {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.t === sample.t &&
+      prev.x === sample.x &&
+      prev.y === sample.y &&
+      prev.pressed === sample.pressed &&
+      prev.visible === sample.visible
+    ) {
+      return;
+    }
+    out.push(sample);
+  };
+
+  let sampleIdx = 0;
+  for (let i = 0; i < scheduledSteps.length; i += 1) {
+    const step = scheduledSteps[i];
+    const isLast = i === scheduledSteps.length - 1;
+    const cutoff = step.origEnd;
+
+    while (
+      sampleIdx < rawSamples.length &&
+      (isLast ? rawSamples[sampleIdx].t <= cutoff + EPS : rawSamples[sampleIdx].t < cutoff - EPS)
+    ) {
+      const s = rawSamples[sampleIdx++];
+      pushSample({ ...s, t: round(s.t + step.shiftBefore, 4) });
+    }
+
+    if (step.padDuration > 1e-4) {
+      const sampledAtBoundary = sampleCursor(
+        { enabled: true, style: origCursor.style ?? 'macos', samples: rawSamples },
+        cutoff
+      );
+      if (sampledAtBoundary) {
+        const holdStartT = round(cutoff + step.shiftBefore, 4);
+        const holdEndT = round(holdStartT + step.padDuration, 4);
+        pushSample({
+          t: holdStartT,
+          x: sampledAtBoundary.x,
+          y: sampledAtBoundary.y,
+          pressed: false,
+          visible: sampledAtBoundary.visible,
+        });
+        pushSample({
+          t: holdEndT,
+          x: sampledAtBoundary.x,
+          y: sampledAtBoundary.y,
+          pressed: false,
+          visible: sampledAtBoundary.visible,
+        });
+      }
+    }
+  }
+
+  const totalShift = scheduledSteps[scheduledSteps.length - 1]?.shiftAfter ?? 0;
+  while (sampleIdx < rawSamples.length) {
+    const s = rawSamples[sampleIdx++];
+    pushSample({ ...s, t: round(s.t + totalShift, 4) });
+  }
+
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
+function retimeCameraKeyframesWithHolds(origCamera, scheduledSteps) {
+  if (!isObject(origCamera) || !Array.isArray(origCamera.keyframes) || origCamera.keyframes.length === 0) {
+    return origCamera?.keyframes ?? [];
+  }
+  const holds = scheduledSteps.filter((s) => s.padDuration > 1e-4);
+  if (holds.length === 0) {
+    return origCamera.keyframes.map((kf) => ({ ...kf }));
+  }
+
+  const rawKfs = origCamera.keyframes;
+  const out = [];
+  const pushKf = (kf) => {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      Math.abs(prev.t - kf.t) < EPS &&
+      Math.abs(prev.x - kf.x) < EPS &&
+      Math.abs(prev.y - kf.y) < EPS &&
+      Math.abs(prev.zoom - kf.zoom) < EPS &&
+      prev.easing === kf.easing
+    ) {
+      return;
+    }
+    out.push(kf);
+  };
+
+  let kfIdx = 0;
+  for (let i = 0; i < scheduledSteps.length; i += 1) {
+    const step = scheduledSteps[i];
+    const isLast = i === scheduledSteps.length - 1;
+    const cutoff = step.origEnd;
+
+    while (
+      kfIdx < rawKfs.length &&
+      (isLast ? rawKfs[kfIdx].t <= cutoff + EPS : rawKfs[kfIdx].t < cutoff - EPS)
+    ) {
+      const kf = rawKfs[kfIdx++];
+      pushKf({ ...kf, t: round(kf.t + step.shiftBefore, 4) });
+    }
+
+    if (step.padDuration > 1e-4) {
+      const pose = sampleCamera(origCamera, cutoff);
+      const holdStartT = round(cutoff + step.shiftBefore, 4);
+      const holdEndT = round(holdStartT + step.padDuration, 4);
+      pushKf({
+        t: holdStartT,
+        x: pose.x,
+        y: pose.y,
+        zoom: pose.zoom,
+        easing: out.length === 0 ? 'linear' : 'ease-in-out',
+      });
+      pushKf({
+        t: holdEndT,
+        x: pose.x,
+        y: pose.y,
+        zoom: pose.zoom,
+        easing: 'linear',
+      });
+    }
+  }
+
+  const totalShift = scheduledSteps[scheduledSteps.length - 1]?.shiftAfter ?? 0;
+  while (kfIdx < rawKfs.length) {
+    const kf = rawKfs[kfIdx++];
+    pushKf({ ...kf, t: round(kf.t + totalShift, 4) });
+  }
+
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
+function retimeEventTrackWithHolds(eventTrack, scheduledSteps, origCursor, videoUpdate) {
+  if (!isObject(eventTrack) || !Array.isArray(eventTrack.events)) return null;
+  const cloned = structuredClone(eventTrack);
+  const rawEvents = cloned.events;
+  const outEvents = [];
+
+  let evIdx = 0;
+  for (let i = 0; i < scheduledSteps.length; i += 1) {
+    const step = scheduledSteps[i];
+    const isLast = i === scheduledSteps.length - 1;
+    const cutoff = step.origEnd;
+
+    while (
+      evIdx < rawEvents.length &&
+      (isLast ? rawEvents[evIdx].t <= cutoff + EPS : rawEvents[evIdx].t < cutoff - EPS)
+    ) {
+      const ev = rawEvents[evIdx++];
+      outEvents.push({ ...ev, t: round(ev.t + step.shiftBefore, 4) });
+    }
+
+    if (step.padDuration > 1e-4 && origCursor?.samples?.length > 0) {
+      const sampled = sampleCursor(
+        { enabled: true, style: origCursor.style ?? 'macos', samples: origCursor.samples },
+        cutoff
+      );
+      if (sampled) {
+        const holdStartT = round(cutoff + step.shiftBefore, 4);
+        const holdEndT = round(holdStartT + step.padDuration, 4);
+        outEvents.push({ t: holdStartT, type: 'pointermove', x: sampled.x, y: sampled.y });
+        outEvents.push({ t: holdEndT, type: 'pointermove', x: sampled.x, y: sampled.y });
+      }
+    }
+  }
+
+  const totalShift = scheduledSteps[scheduledSteps.length - 1]?.shiftAfter ?? 0;
+  while (evIdx < rawEvents.length) {
+    const ev = rawEvents[evIdx++];
+    outEvents.push({ ...ev, t: round(ev.t + totalShift, 4) });
+  }
+
+  outEvents.sort((a, b) => a.t - b.t);
+  cloned.events = outEvents;
+  if (isObject(cloned.video) && isObject(videoUpdate)) {
+    cloned.video = {
+      ...cloned.video,
+      ...videoUpdate,
+    };
+  }
+  return cloned;
+}
+
+/**
+ * End-to-end timeline narration pipeline:
+ * 1. Loads `timeline.json` (and optional `event-track.json` / `recipe`)
+ * 2. Synthesizes per-step WAVs via Gemini TTS (`x-goog-api-key`) or Kokoro offline fallback
+ * 3. Computes step durations via `computeStepDuration` (`max(action, 0.2 + speech + 0.4)`) and pads
+ *    take video + retimes timeline overlays/camera cleanly when speech exceeds action duration
+ * 4. Aligns words (`whisper` / `gemini` / `proportional` / `auto`), formats Netflix SRT/VTT files,
+ *    populates `timeline.audio.tracks` and `timeline.overlays.captions.tracks`, and writes `timeline.json`.
+ */
+export async function narrateTimeline({
+  timeline: timelineInput,
+  eventTrack: eventTrackInput,
+  recipe: recipeInput,
+  language = 'en',
+  languages,
+  provider = 'gemini',
+  aligner = 'auto',
+  outDir,
+  out,
+  cwd,
+  stylePrompt,
+  style,
+  tone,
+  pacing,
+  instructions,
+  voice,
+  speed,
+  apiKey,
+  fetchImpl,
+  ttsRunner,
+  alignRunner,
+  runner,
+  whisperExecutable,
+  whisperModel,
+  geminiModel,
+  providerOptions = {},
+  alignerOptions = {},
+  leadIn = DEFAULT_STEP_LEAD_IN,
+  leadOut = DEFAULT_STEP_LEAD_OUT,
+  captionRules = {},
+  volume = 1,
+  padVideo = true,
+  writeSubtitles = true,
+  writeTimeline = true,
+  env = process.env,
+  signal,
+} = {}) {
+  if (!TTS_PROVIDERS.includes(provider)) {
+    throw Error(`Unsupported TTS provider: ${String(provider)} (expected one of ${TTS_PROVIDERS.join(', ')})`);
+  }
+  if (!WORD_ALIGNERS.includes(aligner)) {
+    throw Error(`Unsupported word aligner: ${String(aligner)} (expected one of ${WORD_ALIGNERS.join(', ')})`);
+  }
+
+  const workingCwd = cwd ? resolve(cwd) : process.cwd();
+  let resolvedTimelineOut = null;
+  let resolvedOutDir = null;
+
+  if (isNonEmptyString(out) && extname(out).toLowerCase() === '.json') {
+    resolvedTimelineOut = resolve(workingCwd, out);
+    resolvedOutDir = isNonEmptyString(outDir) ? resolve(workingCwd, outDir) : dirname(resolvedTimelineOut);
+  } else if (isNonEmptyString(outDir) || isNonEmptyString(out)) {
+    resolvedOutDir = resolve(workingCwd, outDir ?? out);
+    resolvedTimelineOut = join(resolvedOutDir, 'timeline.json');
+  }
+
+  if (resolvedOutDir) {
+    await mkdir(resolvedOutDir, { recursive: true });
+  }
+
+  // Load eventTrack if explicitly provided
+  let eventTrack = null;
+  let eventTrackSourceDir = workingCwd;
+  if (isNonEmptyString(eventTrackInput)) {
+    const etPath = resolve(workingCwd, eventTrackInput);
+    eventTrackSourceDir = dirname(etPath);
+    eventTrack = JSON.parse(await readFile(etPath, 'utf8'));
+  } else if (isObject(eventTrackInput)) {
+    eventTrack = structuredClone(eventTrackInput);
+  }
+
+  // Load or compile base timeline
+  let baseTimeline = null;
+  let timelineSourceDir = workingCwd;
+  if (isNonEmptyString(timelineInput)) {
+    const tlPath = resolve(workingCwd, timelineInput);
+    timelineSourceDir = dirname(tlPath);
+    baseTimeline = JSON.parse(await readFile(tlPath, 'utf8'));
+  } else if (isObject(timelineInput)) {
+    baseTimeline = structuredClone(timelineInput);
+  } else if (eventTrack) {
+    baseTimeline = compileTimeline({
+      eventTrack,
+      recipe: isObject(recipeInput) ? recipeInput : {},
+    });
+    timelineSourceDir = eventTrackSourceDir;
+  } else {
+    throw Error('narrateTimeline requires a timeline (path or object) or eventTrack');
+  }
+
+  assertValidTimeline(baseTimeline);
+
+  if (!eventTrack && isNonEmptyString(baseTimeline.take?.eventTrack)) {
+    const candidateEtPath = resolveRefPath(baseTimeline.take.eventTrack, timelineSourceDir);
+    if (candidateEtPath && (await fileExistsSafe(candidateEtPath))) {
+      try {
+        eventTrack = JSON.parse(await readFile(candidateEtPath, 'utf8'));
+        eventTrackSourceDir = dirname(candidateEtPath);
+      } catch {
+        eventTrack = null;
+      }
+    }
+  }
+
+  const targetLanguages = Array.isArray(languages) && languages.length > 0
+    ? [...new Set(languages.map((l) => String(l).trim()).filter(Boolean))]
+    : String(language)
+        .split(',')
+        .map((l) => l.trim())
+        .filter(Boolean);
+  if (targetLanguages.length === 0) {
+    throw Error('narrateTimeline requires at least one target language');
+  }
+  const primaryLanguage = targetLanguages[0];
+
+  const origDuration = baseTimeline.take.duration;
+  const recipeSteps = Array.isArray(recipeInput?.steps) ? recipeInput.steps : [];
+  const eventStepsByIndex = new Map();
+  if (Array.isArray(eventTrack?.events)) {
+    for (const ev of eventTrack.events) {
+      if (isObject(ev) && ev.type === 'step' && Number.isInteger(ev.index)) {
+        eventStepsByIndex.set(ev.index, ev);
+      }
+    }
+  }
+
+  // Resolve ordered step descriptors with merged narration metadata
+  let rawStepEntries = [];
+  if (Array.isArray(baseTimeline.steps) && baseTimeline.steps.length > 0) {
+    rawStepEntries = baseTimeline.steps.map((tlStep, idx) => {
+      const stepIndex = Number.isInteger(tlStep.index) ? tlStep.index : idx;
+      const evStep = eventStepsByIndex.get(stepIndex);
+      const recStep = isObject(recipeSteps[stepIndex]) ? recipeSteps[stepIndex] : null;
+      const narration =
+        tlStep.narration ??
+        evStep?.narration ??
+        recStep?.narration ??
+        recStep?.say;
+      return {
+        index: stepIndex,
+        t: tlStep.t,
+        label: tlStep.label ?? evStep?.label ?? recStep?.label ?? `step-${stepIndex}`,
+        narration,
+        audioFile: tlStep.audioFile ?? recStep?.audioFile,
+        wordTimings: tlStep.wordTimings ?? recStep?.wordTimings,
+      };
+    });
+  } else if (eventStepsByIndex.size > 0) {
+    rawStepEntries = [...eventStepsByIndex.values()]
+      .sort((a, b) => a.t - b.t)
+      .map((evStep, idx) => {
+        const stepIndex = Number.isInteger(evStep.index) ? evStep.index : idx;
+        const recStep = isObject(recipeSteps[stepIndex]) ? recipeSteps[stepIndex] : null;
+        return {
+          index: stepIndex,
+          t: evStep.t,
+          label: evStep.label ?? recStep?.label ?? `step-${stepIndex}`,
+          narration: evStep.narration ?? recStep?.narration ?? recStep?.say,
+          audioFile: recStep?.audioFile,
+          wordTimings: recStep?.wordTimings,
+        };
+      });
+  } else if (recipeSteps.length > 0) {
+    rawStepEntries = recipeSteps
+      .map((recStep, idx) => {
+        if (!isObject(recStep)) return null;
+        const fallbackT = isFiniteNumber(recStep.at)
+          ? Math.min(origDuration, Math.max(0, recStep.at))
+          : round((origDuration * idx) / recipeSteps.length, 4);
+        return {
+          index: idx,
+          t: fallbackT,
+          label: isNonEmptyString(recStep.label) ? recStep.label.trim() : `step-${idx}`,
+          narration: recStep.narration ?? recStep.say,
+          audioFile: recStep.audioFile,
+          wordTimings: recStep.wordTimings,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  if (rawStepEntries.length === 0) {
+    throw Error('narrateTimeline found no steps to narrate in timeline, eventTrack, or recipe');
+  }
+
+  rawStepEntries.sort((a, b) => a.t - b.t || a.index - b.index);
+
+  let anyNarrationFound = false;
+  for (const step of rawStepEntries) {
+    for (const lang of targetLanguages) {
+      if (
+        resolveStepTextForLanguage(step, lang, primaryLanguage) ||
+        resolveStepAudioForLanguage(step, lang, primaryLanguage)
+      ) {
+        anyNarrationFound = true;
+        break;
+      }
+    }
+    if (anyNarrationFound) break;
+  }
+  if (!anyNarrationFound) {
+    throw Error(`No step narration found for language(s): ${targetLanguages.join(', ')}`);
+  }
+
+  const effectiveStyle =
+    stylePrompt ??
+    style ??
+    recipeInput?.narrationStyle ??
+    (isObject(recipeInput?.narration) ? recipeInput.narration.stylePrompt ?? recipeInput.narration.style : undefined);
+  const effectiveVoice =
+    voice ??
+    recipeInput?.narrationVoice ??
+    (isObject(recipeInput?.narration) ? recipeInput.narration.voice : undefined);
+
+  const effectiveTtsRunner =
+    providerOptions.runner ?? ttsRunner ?? (provider === 'kokoro' ? runner : undefined);
+  const effectiveAlignRunner =
+    alignerOptions.runner ?? alignRunner ?? (aligner === 'whisper' ? runner : undefined);
+
+  // 1. Synthesize or probe per-step audio for each requested language
+  const perLanguageStepData = new Map();
+  for (const lang of targetLanguages) {
+    perLanguageStepData.set(lang, []);
+  }
+
+  const audioStagingBaseDir = resolvedOutDir ?? timelineSourceDir;
+
+  for (let i = 0; i < rawStepEntries.length; i += 1) {
+    const step = rawStepEntries[i];
+    for (const lang of targetLanguages) {
+      const text = resolveStepTextForLanguage(step, lang, primaryLanguage);
+      const existingAudio = resolveStepAudioForLanguage(step, lang, primaryLanguage);
+      const explicitTimings = resolveStepWordTimings(step, lang, primaryLanguage);
+
+      if (!text && !existingAudio) {
+        perLanguageStepData.get(lang).push({
+          text: '',
+          audioFile: null,
+          speechDuration: 0,
+          wordTimings: null,
+        });
+        continue;
+      }
+
+      if (existingAudio) {
+        const audioPath = resolve(workingCwd, existingAudio);
+        const probed = await probeAudio(audioPath);
+        if (!probed.hasAudio || !(probed.duration > 0)) {
+          throw Error(`Step ${step.index} (${lang}) audio file has no valid audio stream: ${audioPath}`);
+        }
+        perLanguageStepData.get(lang).push({
+          text,
+          audioFile: audioPath,
+          speechDuration: probed.duration,
+          wordTimings: explicitTimings,
+        });
+      } else {
+        const langSlug = lang.toLowerCase().replace(/[^a-z0-9-]+/g, '-');
+        const stepSlug = String(step.index).padStart(3, '0');
+        const audioOutputFile = join(audioStagingBaseDir, 'audio', `${langSlug}-step-${stepSlug}.wav`);
+        const langOpts = isObject(providerOptions[lang])
+          ? { ...providerOptions, ...providerOptions[lang] }
+          : providerOptions;
+
+        const synth = await synthesizeSpeech({
+          ...langOpts,
+          provider,
+          text,
+          language: lang,
+          outputFile: audioOutputFile,
+          ...(effectiveVoice ? { voice: effectiveVoice } : {}),
+          ...(effectiveStyle ? { style: effectiveStyle } : {}),
+          ...(tone ? { tone } : {}),
+          ...(pacing ? { pacing } : {}),
+          ...(instructions ? { instructions } : {}),
+          ...(speed !== undefined ? { speed } : {}),
+          ...(apiKey ? { apiKey } : {}),
+          ...(fetchImpl ? { fetchImpl } : {}),
+          ...(effectiveTtsRunner ? { runner: effectiveTtsRunner } : {}),
+          env,
+          signal,
+        });
+
+        perLanguageStepData.get(lang).push({
+          text,
+          audioFile: synth.file,
+          speechDuration: synth.duration,
+          wordTimings: explicitTimings ?? synth.wordTimings ?? null,
+        });
+      }
+    }
+  }
+
+  // 2. Compute step durations (`max(actionDuration, leadIn + speechDuration + leadOut)`) & cumulative shifts
+  const minCueDuration = captionRules.minDuration ?? NETFLIX_CAPTION_RULES.minDuration;
+  const maxCpsRule = captionRules.maxCps ?? NETFLIX_CAPTION_RULES.maxCps;
+  const maxLinesRule = captionRules.maxLines ?? NETFLIX_CAPTION_RULES.maxLines;
+  const maxCharsRule = captionRules.maxCharsPerLine ?? NETFLIX_CAPTION_RULES.maxCharsPerLine;
+  const minGapRule = captionRules.minGap ?? NETFLIX_CAPTION_RULES.minGap;
+  const scheduledSteps = [];
+  let cumulativeShift = 0;
+
+  for (let i = 0; i < rawStepEntries.length; i += 1) {
+    const rawStep = rawStepEntries[i];
+    const origStart = Math.max(0, Math.min(origDuration, rawStep.t));
+    const origEnd = i + 1 < rawStepEntries.length
+      ? Math.max(origStart, Math.min(origDuration, rawStepEntries[i + 1].t))
+      : Math.max(origStart, origDuration);
+    const actionDuration = round(Math.max(0, origEnd - origStart), 4);
+    const maxSpeechDuration = Math.max(
+      0,
+      ...targetLanguages.map((lang) => perLanguageStepData.get(lang)[i].speechDuration)
+    );
+    let maxRequiredReadingSec = 0;
+    for (const lang of targetLanguages) {
+      const item = perLanguageStepData.get(lang)[i];
+      if (item.text && item.speechDuration > 0) {
+        const charLen = item.text.trim().replace(/\s+/g, ' ').length;
+        const approxCueCapacity = Math.max(20, Math.floor(maxLinesRule * maxCharsRule * 0.7));
+        const estCues = Math.max(1, Math.ceil(charLen / approxCueCapacity));
+        const safeCps = Math.max(1, maxCpsRule - 0.5);
+        const reqSec = Math.max(
+          minCueDuration,
+          charLen / safeCps + (estCues - 1) * (minGapRule + 0.05)
+        );
+        if (reqSec > maxRequiredReadingSec) maxRequiredReadingSec = reqSec;
+      }
+    }
+
+    const baseStepDuration = computeStepDuration({
+      actionDuration,
+      speechDuration: maxSpeechDuration,
+      leadIn,
+      leadOut,
+    });
+    const minCaptionStepWindow = maxRequiredReadingSec > 0
+      ? round(leadIn + maxRequiredReadingSec + 0.05, 4)
+      : 0;
+    const stepDuration = round(Math.max(baseStepDuration, minCaptionStepWindow), 4);
+    const padDuration = round(Math.max(0, stepDuration - actionDuration), 4);
+    const shiftBefore = round(cumulativeShift, 4);
+    const shiftAfter = round(cumulativeShift + padDuration, 4);
+    const newStart = round(origStart + shiftBefore, 4);
+    const newEnd = round(newStart + stepDuration, 4);
+
+    scheduledSteps.push({
+      index: rawStep.index,
+      label: rawStep.label,
+      ...(rawStep.narration !== undefined ? { narration: structuredClone(rawStep.narration) } : {}),
+      origStart: round(origStart, 4),
+      origEnd: round(origEnd, 4),
+      shiftBefore,
+      shiftAfter,
+      padDuration,
+      t: newStart,
+      start: newStart,
+      end: newEnd,
+      actionDuration,
+      speechDuration: round(maxSpeechDuration, 4),
+      duration: stepDuration,
+    });
+
+    cumulativeShift = shiftAfter;
+  }
+
+  const totalExtraPad = round(cumulativeShift, 4);
+  let finalDuration = round(origDuration + totalExtraPad, 4);
+
+  // 3. Word alignment + Netflix caption cue generation + SRT/VTT files
+  const timelineTargetDir = resolvedTimelineOut ? dirname(resolvedTimelineOut) : resolvedOutDir;
+  const rawAudioTracks = [];
+  const captionTracks = [];
+  const subtitles = {};
+  const segments = [];
+  const usedAligners = new Set();
+
+  for (const lang of targetLanguages) {
+    const langCues = [];
+    const langSteps = perLanguageStepData.get(lang);
+
+    for (let i = 0; i < scheduledSteps.length; i += 1) {
+      const sched = scheduledSteps[i];
+      const info = langSteps[i];
+      if (!info.text && !info.audioFile) continue;
+
+      const speechStart = round(sched.start + leadIn, 4);
+      const speechEnd = round(speechStart + info.speechDuration, 4);
+
+      if (info.audioFile) {
+        const srcRef = timelineTargetDir
+          ? rebaseMediaRef(info.audioFile, workingCwd, timelineTargetDir)
+          : info.audioFile;
+        rawAudioTracks.push({
+          id: `narration-${lang}-${String(sched.index).padStart(3, '0')}`,
+          kind: 'narration',
+          src: srcRef,
+          absSrc: info.audioFile,
+          start: speechStart,
+          volume,
+          language: lang,
+          stepIndex: sched.index,
+          duration: info.speechDuration,
+        });
+      }
+
+      segments.push({
+        language: lang,
+        stepIndex: sched.index,
+        label: sched.label,
+        start: speechStart,
+        end: speechEnd,
+        duration: info.speechDuration,
+        src: info.audioFile,
+      });
+
+      if (info.text && info.speechDuration > 0) {
+        let alignedWords;
+        if (Array.isArray(info.wordTimings) && info.wordTimings.length > 0) {
+          alignedWords = alignWords({
+            text: info.text,
+            duration: info.speechDuration,
+            startOffset: speechStart,
+            wordTimings: info.wordTimings,
+          });
+          usedAligners.add('explicit');
+        } else {
+          const alignment = await alignAudioWords({
+            ...alignerOptions,
+            audioFile: info.audioFile,
+            text: info.text,
+            duration: info.speechDuration,
+            startOffset: speechStart,
+            aligner,
+            language: lang,
+            ...(apiKey ? { apiKey } : {}),
+            ...(fetchImpl ? { fetchImpl } : {}),
+            ...(effectiveAlignRunner ? { runner: effectiveAlignRunner } : {}),
+            ...(whisperExecutable !== undefined ? { executable: whisperExecutable } : {}),
+            ...(aligner === 'gemini' && geminiModel
+              ? { model: geminiModel }
+              : whisperModel
+                ? { model: whisperModel }
+                : {}),
+            env,
+            signal,
+          });
+          alignedWords = alignment.words;
+          usedAligners.add(alignment.aligner);
+        }
+
+        const stepCues = formatNetflixCues({
+          words: alignedWords,
+          stepEnd: sched.end,
+          ...captionRules,
+        });
+        for (const cue of stepCues) {
+          langCues.push({ ...cue, stepIndex: sched.index });
+        }
+      }
+    }
+
+    const srt = formatSrt(langCues);
+    const vtt = formatVtt(langCues);
+    let srtFile = null;
+    let vttFile = null;
+
+    if (resolvedOutDir && writeSubtitles) {
+      const langSlug = lang.toLowerCase().replace(/[^a-z0-9-]+/g, '-');
+      srtFile = join(resolvedOutDir, `captions-${langSlug}.srt`);
+      vttFile = join(resolvedOutDir, `captions-${langSlug}.vtt`);
+      await writeFile(srtFile, srt, 'utf8');
+      await writeFile(vttFile, vtt, 'utf8');
+    }
+
+    subtitles[lang] = {
+      language: lang,
+      cues: langCues,
+      srt,
+      vtt,
+      ...(srtFile ? { srtFile } : {}),
+      ...(vttFile ? { vttFile } : {}),
+    };
+
+    captionTracks.push({
+      language: lang,
+      cues: langCues.map(({ start, end, text }) => ({ start, end, text })),
+    });
+  }
+
+  // 4. Pad source take video if step speech windows extended timeline duration
+  const updatedTimeline = structuredClone(baseTimeline);
+  const absSourceVideo = resolveRefPath(baseTimeline.take.video, timelineSourceDir);
+  const sourceVideoExists = absSourceVideo ? await fileExistsSafe(absSourceVideo) : false;
+
+  let paddedVideoPath = null;
+  let finalFrames = Math.max(1, Math.round(finalDuration * baseTimeline.take.fps));
+
+  if (padVideo && totalExtraPad > 1e-3 && sourceVideoExists && resolvedOutDir) {
+    const ext = extname(absSourceVideo).toLowerCase() === '.webm' ? '.webm' : '.mp4';
+    paddedVideoPath = join(resolvedOutDir, `take-narrated${ext}`);
+    const paddedInfo = await padTakeVideoWithHolds({
+      sourceVideo: absSourceVideo,
+      outputVideo: paddedVideoPath,
+      scheduledSteps,
+      finalDuration,
+      fps: baseTimeline.take.fps,
+      signal,
+    });
+    finalDuration = round(paddedInfo.duration, 4);
+    finalFrames = paddedInfo.frames;
+    updatedTimeline.take.width = paddedInfo.width;
+    updatedTimeline.take.height = paddedInfo.height;
+    updatedTimeline.take.video = timelineTargetDir
+      ? rebaseMediaRef(paddedVideoPath, workingCwd, timelineTargetDir)
+      : paddedVideoPath;
+  } else {
+    updatedTimeline.take.video = timelineTargetDir
+      ? rebaseMediaRef(baseTimeline.take.video, timelineSourceDir, timelineTargetDir)
+      : baseTimeline.take.video;
+  }
+
+  updatedTimeline.take.duration = finalDuration;
+  updatedTimeline.take.frames = finalFrames;
+
+  if (updatedTimeline.stage?.background?.type === 'image') {
+    updatedTimeline.stage.background.src = timelineTargetDir
+      ? rebaseMediaRef(baseTimeline.stage.background.src, timelineSourceDir, timelineTargetDir)
+      : updatedTimeline.stage.background.src;
+  }
+
+  // 5. Retime overlays, camera keyframes, steps, and optional eventTrack
+  const mapTime = buildPiecewiseTimeMapper(scheduledSteps);
+  if (totalExtraPad > 1e-4) {
+    updatedTimeline.overlays.cursor.samples = retimeCursorSamplesWithHolds(
+      baseTimeline.overlays.cursor,
+      scheduledSteps
+    );
+    updatedTimeline.overlays.ripples = (baseTimeline.overlays.ripples ?? []).map((r) => ({
+      ...r,
+      t: mapTime(r.t),
+    }));
+    updatedTimeline.overlays.gestures = (baseTimeline.overlays.gestures ?? []).map((g) => ({
+      ...g,
+      t: mapTime(g.t),
+    }));
+    updatedTimeline.overlays.keystrokes = (baseTimeline.overlays.keystrokes ?? []).map((ks) => ({
+      ...ks,
+      t: mapTime(ks.t),
+    }));
+  }
+
+  let retimedEventTrack = null;
+  let retimedEventTrackPath = null;
+  if (eventTrack) {
+    retimedEventTrack = totalExtraPad > 1e-4
+      ? retimeEventTrackWithHolds(eventTrack, scheduledSteps, baseTimeline.overlays.cursor, {
+          ...(paddedVideoPath && resolvedOutDir
+            ? { file: relative(resolvedOutDir, paddedVideoPath) || basename(paddedVideoPath) }
+            : {}),
+          duration: finalDuration,
+          frames: finalFrames,
+        })
+      : structuredClone(eventTrack);
+
+    // Ensure step events carry narration in retimed event track
+    const narrByStepIdx = new Map(
+      rawStepEntries
+        .filter((s) => s.narration !== undefined)
+        .map((s) => [s.index, s.narration])
+    );
+    for (const ev of retimedEventTrack.events ?? []) {
+      if (ev?.type === 'step' && ev.narration === undefined && narrByStepIdx.has(ev.index)) {
+        ev.narration = structuredClone(narrByStepIdx.get(ev.index));
+      }
+    }
+
+    if (totalExtraPad > 1e-4 && resolvedOutDir && writeTimeline) {
+      const checkEt = validateEventTrack(retimedEventTrack);
+      if (checkEt.ok) {
+        retimedEventTrackPath = join(resolvedOutDir, 'event-track.narrated.json');
+        await writeFile(retimedEventTrackPath, `${JSON.stringify(retimedEventTrack, null, 2)}\n`, 'utf8');
+        updatedTimeline.take.eventTrack = timelineTargetDir
+          ? rebaseMediaRef(retimedEventTrackPath, workingCwd, timelineTargetDir)
+          : retimedEventTrackPath;
+      }
+    }
+  }
+
+  if (!retimedEventTrackPath) {
+    updatedTimeline.take.eventTrack = timelineTargetDir
+      ? rebaseMediaRef(baseTimeline.take.eventTrack, timelineSourceDir, timelineTargetDir)
+      : baseTimeline.take.eventTrack;
+  }
+
+  if (totalExtraPad > 1e-4) {
+    const hasStepCameraHints = Array.isArray(retimedEventTrack?.events) &&
+      retimedEventTrack.events.some((ev) => ev?.type === 'step' && ev.camera !== undefined);
+    const recompiledKfs = hasStepCameraHints
+      ? compileStepCameraKeyframes({
+          events: retimedEventTrack.events,
+          viewportWidth: updatedTimeline.take.viewport.width,
+          viewportHeight: updatedTimeline.take.viewport.height,
+          stage: updatedTimeline.stage,
+          window: updatedTimeline.window,
+          outputWidth: updatedTimeline.camera.outputWidth,
+          outputHeight: updatedTimeline.camera.outputHeight,
+          cursor: updatedTimeline.overlays.cursor,
+        })
+      : null;
+
+    updatedTimeline.camera.keyframes =
+      recompiledKfs && recompiledKfs.length > 0
+        ? recompiledKfs
+        : retimeCameraKeyframesWithHolds(baseTimeline.camera, scheduledSteps);
+  }
+
+  updatedTimeline.steps = scheduledSteps.map((s) => ({
+    t: s.t,
+    index: s.index,
+    label: s.label,
+    duration: s.duration,
+    end: s.end,
+    ...(s.narration !== undefined ? { narration: structuredClone(s.narration) } : {}),
+  }));
+
+  const primaryAudioTracks = rawAudioTracks
+    .filter((t) => t.language === primaryLanguage)
+    .map(({ absSrc: _abs, ...track }) => track);
+  const nonNarrationTracks = (baseTimeline.audio?.tracks ?? [])
+    .filter((track) => track.kind !== 'narration')
+    .map((track) => ({
+      ...track,
+      src: timelineTargetDir
+        ? rebaseMediaRef(track.src, timelineSourceDir, timelineTargetDir)
+        : track.src,
+    }));
+
+  updatedTimeline.audio = {
+    tracks: [...nonNarrationTracks, ...primaryAudioTracks],
+  };
+  updatedTimeline.overlays = {
+    ...updatedTimeline.overlays,
+    captions: {
+      enabled: true,
+      tracks: captionTracks,
+    },
+  };
+
+  assertValidTimeline(updatedTimeline);
+
+  if (resolvedTimelineOut && writeTimeline) {
+    await mkdir(dirname(resolvedTimelineOut), { recursive: true });
+    await writeFile(resolvedTimelineOut, `${JSON.stringify(updatedTimeline, null, 2)}\n`, 'utf8');
+  }
+
+  const resolvedAlignerList = [...usedAligners];
+  const effectiveAligner = resolvedAlignerList.length === 1 ? resolvedAlignerList[0] : (resolvedAlignerList[0] ?? aligner);
+
+  return {
+    ok: true,
+    provider,
+    aligner: effectiveAligner,
+    alignersUsed: resolvedAlignerList,
+    language: primaryLanguage,
+    languages: targetLanguages,
+    ...(resolvedOutDir ? { outDir: resolvedOutDir } : {}),
+    ...(resolvedTimelineOut && writeTimeline ? { timelineFile: resolvedTimelineOut } : {}),
+    ...(retimedEventTrackPath ? { eventTrackFile: retimedEventTrackPath } : {}),
+    ...(paddedVideoPath ? { paddedVideoFile: paddedVideoPath } : {}),
+    paddedSeconds: totalExtraPad,
+    totalDuration: finalDuration,
+    steps: scheduledSteps,
+    segments,
+    audioTracks: updatedTimeline.audio.tracks,
+    captionTracks,
+    subtitles,
+    timeline: updatedTimeline,
   };
 }
 

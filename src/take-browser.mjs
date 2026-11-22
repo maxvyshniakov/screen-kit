@@ -12,6 +12,7 @@ import {
   GESTURE_KINDS as TIMELINE_GESTURE_KINDS,
   validateEventTrack as checkEventTrackSchema,
   validateStepCameraHint,
+  validateStepNarration,
 } from './timeline.mjs';
 import { probeVideo } from './video.mjs';
 
@@ -1249,6 +1250,13 @@ export async function createBrowserTakeCapture({
             throw Error(`Invalid step camera hint: ${camCheck.errors.join('; ')}`);
           }
         }
+        const stepNarration = rawStep.narration !== undefined ? rawStep.narration : rawStep.say;
+        if (stepNarration !== undefined) {
+          const narrCheck = validateStepNarration(stepNarration, `steps[${stepIndex}].narration`);
+          if (!narrCheck.ok) {
+            throw Error(`Invalid step narration: ${narrCheck.errors.join('; ')}`);
+          }
+        }
 
         const kind = rawStep.type
           ?? (rawStep.click !== undefined ? 'click'
@@ -1260,6 +1268,7 @@ export async function createBrowserTakeCapture({
             : rawStep.text !== undefined ? 'type'
             : rawStep.pause !== undefined || rawStep.wait !== undefined ? 'pause'
             : rawStep.eval !== undefined ? 'eval'
+            : stepNarration !== undefined ? (rawStep.duration !== undefined ? 'pause' : 'step')
             : null);
 
         const locatorOpts = {
@@ -1273,7 +1282,11 @@ export async function createBrowserTakeCapture({
 
         const stepLabel = rawStep.label;
         const stepCamera = rawStep.camera;
-        const shouldEmitStep = stepLabel !== undefined || stepCamera !== undefined || kind === 'step';
+        const shouldEmitStep =
+          stepLabel !== undefined ||
+          stepCamera !== undefined ||
+          stepNarration !== undefined ||
+          kind === 'step';
         let stepEmitted = false;
         const emitStepMarker = (resolvedTarget = null) => {
           if (stepEmitted || !shouldEmitStep) return;
@@ -1289,6 +1302,7 @@ export async function createBrowserTakeCapture({
             label: normalizedLabel,
             ...(resolvedTarget ? { target: [roundCoord(resolvedTarget[0]), roundCoord(resolvedTarget[1])] } : {}),
             ...(stepCamera !== undefined ? { camera: structuredClone(stepCamera) } : {}),
+            ...(stepNarration !== undefined ? { narration: structuredClone(stepNarration) } : {}),
           });
         };
 

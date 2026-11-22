@@ -364,6 +364,22 @@ export function validateStepCameraHint(camera, label = 'camera') {
   return { ok: errors.length === 0, errors };
 }
 
+/** Validate a per-step `narration` value (string or `{ [lang]: string }` map). */
+export function validateStepNarration(narration, label = 'narration') {
+  const errors = [];
+  if (typeof narration === 'string') {
+    return { ok: true, errors };
+  }
+  if (
+    isObject(narration) &&
+    Object.values(narration).every((value) => typeof value === 'string')
+  ) {
+    return { ok: true, errors };
+  }
+  errors.push(`${label} must be a string or an object mapping language codes to strings`);
+  return { ok: false, errors };
+}
+
 /** Validate an Event Track v1 object and return `{ ok, errors }`. */
 export function validateEventTrack(eventTrack) {
   const errors = [];
@@ -631,6 +647,10 @@ export function validateEventTrack(eventTrack) {
         if (event.camera !== undefined) {
           const camCheck = validateStepCameraHint(event.camera, `${prefix}.camera`);
           for (const err of camCheck.errors) errors.push(err);
+        }
+        if (event.narration !== undefined) {
+          const narrCheck = validateStepNarration(event.narration, `${prefix}.narration`);
+          for (const err of narrCheck.errors) errors.push(err);
         }
         break;
     }
@@ -1190,6 +1210,16 @@ export function validateTimeline(timeline) {
         }
         if (!isNonNegativeInteger(step.index)) errors.push(`${prefix}.index must be a non-negative integer`);
         if (!isNonEmptyString(step.label)) errors.push(`${prefix}.label must be a non-empty string`);
+        if (step.duration !== undefined && !isNonNegativeNumber(step.duration)) {
+          errors.push(`${prefix}.duration must be a non-negative finite number`);
+        }
+        if (step.end !== undefined && (!isNonNegativeNumber(step.end) || (isNonNegativeNumber(step.t) && step.end < step.t))) {
+          errors.push(`${prefix}.end must be a finite number >= t`);
+        }
+        if (step.narration !== undefined) {
+          const narrCheck = validateStepNarration(step.narration, `${prefix}.narration`);
+          for (const err of narrCheck.errors) errors.push(err);
+        }
       });
     }
   }
@@ -1598,6 +1628,7 @@ function compileOverlays(events, recipeOverlays, duration) {
           t: roundTime(event.t),
           index: event.index,
           label,
+          ...(event.narration !== undefined ? { narration: structuredClone(event.narration) } : {}),
         });
         break;
       }

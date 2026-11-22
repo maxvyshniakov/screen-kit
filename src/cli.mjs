@@ -13,8 +13,9 @@ const help = `screen-kit ${VERSION}
 screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4]
+screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--voice Kore] [--style "..."]
 screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
-screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop]
+screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--verify-cursor] [--narration en] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
 screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json] [--verify-cursor]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
@@ -110,6 +111,7 @@ const allowed = new Set([
   'kind', 'prompt', 'aspect-ratio', 'model', 'cache-dir',
   'target', 'name', 'poster', 'formats', 'color-space',
   'title', 'description', 'privacy', 'captions', 'thumbnail', 'dry-run',
+  'lang', 'language', 'narration', 'tts-provider', 'aligner', 'voice', 'style', 'style-prompt', 'speed',
 ]);
 const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor']);
 const toBoolFlag = (val) => val === true || val === 'true' || val === '1';
@@ -277,10 +279,65 @@ try {
         ...(width !== undefined ? { width } : {}),
       });
       console.log(JSON.stringify(result, null, 2));
+    } else if (command === 'narrate') {
+      const timelineArg = flags.input ?? flags.timeline;
+      const outArg = flags.out ?? flags['out-dir'];
+      if (!timelineArg && !flags['event-track'] && !flags.config) {
+        throw Error('narrate requires --input timeline.json (or --event-track / --config) and --out');
+      }
+      if (!outArg) throw Error('narrate requires --out');
+
+      let recipeObj;
+      let resolvedCwd = flags.cwd ? resolve(flags.cwd) : process.cwd();
+      if (flags.config) {
+        const loaded = await loadConfiguration(flags.config);
+        if (!flags.cwd) resolvedCwd = loaded.cwd;
+        if (loaded.config?.recipes && typeof loaded.config.recipes === 'object') {
+          const recipeName = flags.recipe ?? flags.only;
+          const entries = recipeName
+            ? selectedRecipes(loaded.config, recipeName)
+            : Object.entries(loaded.config.recipes);
+          if (entries.length !== 1) {
+            throw Error('narrate --config has multiple recipes; pass --recipe <name>');
+          }
+          recipeObj = entries[0][1];
+        } else {
+          recipeObj = loaded.config;
+        }
+      }
+
+      const langRaw = flags.lang ?? flags.language ?? 'en';
+      const langs = String(langRaw).split(',').map((s) => s.trim()).filter(Boolean);
+      const speedVal = flags.speed !== undefined ? Number(flags.speed) : undefined;
+      if (speedVal !== undefined && (!Number.isFinite(speedVal) || speedVal <= 0)) {
+        throw Error(`--speed must be a positive finite number (received ${flags.speed})`);
+      }
+
+      const { narrateTimeline } = await import('./narration.mjs');
+      const narrated = await narrateTimeline({
+        ...(timelineArg ? { timeline: resolve(timelineArg) } : {}),
+        ...(flags['event-track'] ? { eventTrack: resolve(flags['event-track']) } : {}),
+        ...(recipeObj ? { recipe: recipeObj } : {}),
+        cwd: resolvedCwd,
+        out: resolve(outArg),
+        language: langs[0] ?? 'en',
+        ...(langs.length > 1 ? { languages: langs } : {}),
+        provider: flags['tts-provider'] ?? flags.provider ?? 'gemini',
+        aligner: flags.aligner ?? 'auto',
+        ...(flags.voice ? { voice: flags.voice } : {}),
+        ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
+        ...(speedVal !== undefined ? { speed: speedVal } : {}),
+      });
+      const { timeline: _fullTimeline, ...summary } = narrated;
+      console.log(JSON.stringify(summary, null, 2));
     } else if (command === 'run') {
       const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
       const profileArg = flags.profiles ?? flags.profile;
       const verifyCursor = toBoolFlag(flags['verify-cursor']);
+      const speedVal = flags.speed !== undefined ? Number(flags.speed) : undefined;
+      if (speedVal !== undefined && (!Number.isFinite(speedVal) || speedVal <= 0)) {
+        throw Error(`--speed must be a positive finite number (received ${flags.speed})`);
+      }
       const result = await runPipeline({
         config: loaded.config,
         cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
@@ -290,6 +347,14 @@ try {
         reuseTake: toBoolFlag(flags['reuse-take']),
         ...(profileArg ? { profiles: profileArg } : {}),
         ...(verifyCursor ? { reviewOptions: { verifyCursor: true } } : {}),
+        ...(flags.narration !== undefined ? { narration: flags.narration } : {}),
+        ...((flags['tts-provider'] ?? flags.provider) ? { ttsProvider: flags['tts-provider'] ?? flags.provider } : {}),
+        ...(flags.aligner ? { aligner: flags.aligner } : {}),
+        narrationOptions: {
+          ...(flags.voice ? { voice: flags.voice } : {}),
+          ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
+          ...(speedVal !== undefined ? { speed: speedVal } : {}),
+        },
       });
       console.log(JSON.stringify(result, null, 2));
       if (!result.ok) process.exitCode = 1;

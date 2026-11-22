@@ -165,6 +165,10 @@ export async function runPipeline({
   previewOnly = false,
   reuseTake = false,
   profiles,
+  narration,
+  ttsProvider,
+  aligner,
+  narrationOptions = {},
   captureOptions = {},
   renderOptions = {},
   reviewOptions = {},
@@ -177,6 +181,30 @@ export async function runPipeline({
     cwd = loaded.cwd;
   }
 
+  let narrationConfig = null;
+  if (narration !== undefined && narration !== false && narration !== null && narration !== '') {
+    if (typeof narration === 'string') {
+      const langs = narration.split(',').map((s) => s.trim()).filter(Boolean);
+      narrationConfig = {
+        ...narrationOptions,
+        language: langs[0] ?? 'en',
+        ...(langs.length > 1 ? { languages: langs } : {}),
+      };
+    } else if (narration === true) {
+      narrationConfig = { ...narrationOptions, language: narrationOptions.language ?? 'en' };
+    } else if (typeof narration === 'object' && !Array.isArray(narration)) {
+      narrationConfig = { ...narrationOptions, ...narration };
+    } else {
+      throw Error(`Invalid narration option: ${String(narration)}`);
+    }
+    if (ttsProvider !== undefined && narrationConfig.provider === undefined) {
+      narrationConfig.provider = ttsProvider;
+    }
+    if (aligner !== undefined && narrationConfig.aligner === undefined) {
+      narrationConfig.aligner = aligner;
+    }
+  }
+
   const recipes = selectedRecipes(config, only);
   for (const [name, recipe] of recipes) {
     if (recipe.source !== 'browser') {
@@ -187,13 +215,14 @@ export async function runPipeline({
   const out = resolve(cwd, outInput ?? join(cwd, 'out', 'screen-kit'));
   await mkdir(out, { recursive: true });
 
-  const [{ captureBrowserTake, validateEventTrack }, { compileTimeline }, { renderTimeline, renderTimelinePreview }, { probeVideo }, { reviewVideo }] =
+  const [{ captureBrowserTake, validateEventTrack }, { compileTimeline }, { renderTimeline, renderTimelinePreview }, { probeVideo }, { reviewVideo }, narrationMod] =
     await Promise.all([
       import('./take-browser.mjs'),
       import('./timeline.mjs'),
       import('./render-timeline.mjs'),
       import('./video.mjs'),
       import('./review-video.mjs'),
+      narrationConfig ? import('./narration.mjs') : Promise.resolve(null),
     ]);
 
   const recipeResults = {};
@@ -249,7 +278,7 @@ export async function runPipeline({
     const relVideo = relative(recipeDir, videoPath);
     const relEventTrack = relative(recipeDir, eventTrackPath);
 
-    const compiledTimeline = compileTimeline({
+    let activeTimeline = compileTimeline({
       take: {
         video: relVideo,
         eventTrack: relEventTrack,
@@ -257,7 +286,46 @@ export async function runPipeline({
       eventTrack,
       recipe: presentation,
     });
-    await writeFile(timelinePath, JSON.stringify(compiledTimeline, null, 2) + '\n');
+    let activeEventTrackPath = eventTrackPath;
+    let narrationSummary = null;
+
+    if (narrationConfig && narrationMod) {
+      const narrated = await narrationMod.narrateTimeline({
+        ...narrationConfig,
+        timeline: activeTimeline,
+        eventTrack,
+        recipe,
+        outDir: recipeDir,
+        cwd: recipeDir,
+      });
+      activeTimeline = narrated.timeline;
+      if (narrated.eventTrackFile) {
+        activeEventTrackPath = narrated.eventTrackFile;
+      }
+      narrationSummary = {
+        provider: narrated.provider,
+        aligner: narrated.aligner,
+        language: narrated.language,
+        languages: narrated.languages,
+        paddedSeconds: narrated.paddedSeconds,
+        totalDuration: narrated.totalDuration,
+        ...(narrated.paddedVideoFile ? { paddedVideoFile: narrated.paddedVideoFile } : {}),
+        ...(narrated.eventTrackFile ? { eventTrackFile: narrated.eventTrackFile } : {}),
+        audioTracks: narrated.audioTracks.length,
+        subtitles: Object.fromEntries(
+          Object.entries(narrated.subtitles).map(([lang, sub]) => [
+            lang,
+            {
+              cueCount: sub.cues.length,
+              ...(sub.srtFile ? { srtFile: sub.srtFile } : {}),
+              ...(sub.vttFile ? { vttFile: sub.vttFile } : {}),
+            },
+          ])
+        ),
+      };
+    } else {
+      await writeFile(timelinePath, JSON.stringify(activeTimeline, null, 2) + '\n');
+    }
 
     const takeSummary = {
       reused,
@@ -273,9 +341,9 @@ export async function runPipeline({
 
     const timelineSummary = {
       file: timelinePath,
-      steps: compiledTimeline.steps,
-      cameraKeyframes: compiledTimeline.camera.keyframes.length,
-      outputs: compiledTimeline.outputs,
+      steps: activeTimeline.steps,
+      cameraKeyframes: activeTimeline.camera.keyframes.length,
+      outputs: activeTimeline.outputs,
     };
 
     if (previewOnly) {
@@ -289,6 +357,7 @@ export async function runPipeline({
         ok: true,
         take: takeSummary,
         timeline: timelineSummary,
+        ...(narrationSummary ? { narration: narrationSummary } : {}),
         preview,
       };
     } else {
@@ -315,7 +384,7 @@ export async function runPipeline({
         const fullReview = await reviewVideo({
           video: primaryVideo.file,
           timeline: timelinePath,
-          eventTrack: eventTrackPath,
+          eventTrack: activeEventTrackPath,
           outDir: reviewDir,
           ...reviewOptions,
         });
@@ -336,6 +405,7 @@ export async function runPipeline({
         ok: recipeOk,
         take: takeSummary,
         timeline: timelineSummary,
+        ...(narrationSummary ? { narration: narrationSummary } : {}),
         render: renderResult,
         review: reviewSummary,
       };
@@ -354,6 +424,7 @@ export async function runPipeline({
           recipe: singleName,
           take: singleResult.take,
           timeline: singleResult.timeline,
+          ...(singleResult.narration ? { narration: singleResult.narration } : {}),
           ...(previewOnly
             ? { preview: singleResult.preview }
             : { render: singleResult.render, review: singleResult.review }),

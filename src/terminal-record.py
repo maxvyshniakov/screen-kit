@@ -40,7 +40,12 @@ def record(config):
                 step = steps[index]
                 if step.get('input'):
                     os.write(master, step['input'].encode())
-                actions.append(dict(at=round(elapsed, 3), input=step.get('input', '')))
+                action_entry = dict(at=round(elapsed, 3), input=step.get('input', ''))
+                if 'label' in step:
+                    action_entry['label'] = step['label']
+                if 'narration' in step:
+                    action_entry['narration'] = step['narration']
+                actions.append(action_entry)
                 if step.get('expect'):
                     checks.append(dict(at=step['at'] + step.get('settle', .3), expect=step['expect']))
                 index += 1
