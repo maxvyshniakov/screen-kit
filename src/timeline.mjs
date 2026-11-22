@@ -20,15 +20,24 @@ export const CAPTURE_MODES = ['quality', 'headless'];
 export const WINDOW_FRAMES = ['none', 'macos', 'browser', 'device'];
 export const BACKGROUND_TYPES = ['solid', 'gradient', 'image'];
 export const IMAGE_FITS = ['cover', 'contain', 'fill'];
-export const CAMERA_EASINGS = ['linear', 'ease-in', 'ease-out', 'ease-in-out', 'smoothstep', 'hold'];
+export const CAMERA_EASINGS = [
+  'linear',
+  'ease-in',
+  'ease-out',
+  'ease-in-out',
+  'quint-in-out',
+  'expo-out',
+  'smoothstep',
+  'hold',
+];
 export const CURSOR_STYLES = ['macos', 'pointer', 'dot', 'ring'];
 export const MOUSE_BUTTONS = ['left', 'right', 'middle'];
 export const GESTURE_KINDS = ['wheel', 'scroll', 'pinch', 'pan', 'swipe', 'drag', 'touch'];
 export const OUTPUT_FORMATS = ['mp4', 'webm', 'png', 'webp'];
 export const AUDIO_TRACK_KINDS = ['narration', 'sfx', 'music'];
 export const STEP_CAMERA_FOCUSES = ['target', 'pointer', 'window'];
-export const DEFAULT_STEP_CAMERA_LEAD = 0.15;
-export const DEFAULT_STEP_CAMERA_HOLD = 0.4;
+export const DEFAULT_STEP_CAMERA_LEAD = 0.85;
+export const DEFAULT_STEP_CAMERA_HOLD = 0.35;
 
 const EVENT_TYPES = new Set([
   'pointermove',
@@ -117,6 +126,10 @@ export function applyEasing(easing, u) {
       return 1 - (1 - clamped) ** 3;
     case 'ease-in-out':
       return clamped < 0.5 ? 4 * clamped * clamped * clamped : 1 - ((-2 * clamped + 2) ** 3) / 2;
+    case 'quint-in-out':
+      return clamped < 0.5 ? 16 * clamped ** 5 : 1 - ((-2 * clamped + 2) ** 5) / 2;
+    case 'expo-out':
+      return clamped >= 1 ? 1 : 1 - 2 ** (-10 * clamped);
     case 'smoothstep':
       return clamped * clamped * (3 - 2 * clamped);
     case 'hold':
@@ -1608,7 +1621,7 @@ export function compileStepCameraKeyframes({
       return {
         t: roundTime(event.t),
         ...pose,
-        easing: 'ease-in-out',
+        easing: 'quint-in-out',
         lead: DEFAULT_STEP_CAMERA_LEAD,
         hold: DEFAULT_STEP_CAMERA_HOLD,
       };
@@ -1650,7 +1663,7 @@ export function compileStepCameraKeyframes({
     return {
       t: roundTime(event.t),
       ...pose,
-      easing: normalizeEasing(hint.easing, 'ease-in-out'),
+      easing: normalizeEasing(hint.easing, 'quint-in-out'),
       lead: hint.lead ?? DEFAULT_STEP_CAMERA_LEAD,
       hold: hint.hold ?? DEFAULT_STEP_CAMERA_HOLD,
     };
