@@ -491,8 +491,8 @@ test('S5: media.mjs buildColorEncodeArgs enforces identical sRGB (BT.709) and Di
   // 2. Real FFmpeg CICP consistency across renderVideo, encodeScreencastFrames, publishWebBundle (AV1), and narrateTimeline
   const f0 = join(dir, '0.png');
   const f1 = join(dir, '1.png');
-  await sharp({ create: { width: 16, height: 16, channels: 3, background: '#ef4444' } }).png().toFile(f0);
-  await sharp({ create: { width: 16, height: 16, channels: 3, background: '#3b82f6' } }).png().toFile(f1);
+  await sharp({ create: { width: 64, height: 64, channels: 3, background: '#ef4444' } }).png().toFile(f0);
+  await sharp({ create: { width: 64, height: 64, channels: 3, background: '#3b82f6' } }).png().toFile(f1);
 
   for (const [cs, expectedPrimaries, expectedTransfer] of [
     ['srgb', 'bt709', 'bt709'],

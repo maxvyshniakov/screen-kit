@@ -231,16 +231,20 @@ test('built-in playwright-core captures PNG & WebP stills, clip crops, dark/ligh
   assert.equal(pngMeta.format, 'png');
   assert.ok(pngMeta.icc, 'PNG still preserves Display P3 ICC profile');
 
-  // Verify green pixel inside cropped #card after all semantic steps succeeded
+  // Verify green background inside cropped #card after all semantic steps succeeded
+  // (scan all pixels so cross-platform Linux/macOS input font metrics never hit an <input> box).
   const { data: rawPixels, info: rawInfo } = await sharp(pngShot.file)
     .toColourspace('srgb')
     .removeAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
-  const sampleOffset = ((rawInfo.height - 6) * rawInfo.width + (rawInfo.width - 6)) * 3;
+  let greenPixels = 0;
+  for (let i = 0; i < rawPixels.length; i += 3) {
+    if (rawPixels[i + 1] > 110 && rawPixels[i] < 40) greenPixels += 1;
+  }
   assert.ok(
-    rawPixels[sampleOffset + 1] > 110 && rawPixels[sampleOffset] < 40,
-    `expected green background after semantic interactions, got RGB(${rawPixels[sampleOffset]}, ${rawPixels[sampleOffset + 1]}, ${rawPixels[sampleOffset + 2]})`
+    greenPixels > rawInfo.width * rawInfo.height * 0.15,
+    `expected green background after semantic interactions, found ${greenPixels}/${rawInfo.width * rawInfo.height} green pixels`
   );
 
   // Verify multi-theme capture (colorScheme + Storybook globals=theme:... + stack) and reusable session teardown
