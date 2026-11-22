@@ -1,7 +1,9 @@
 {
   "name": "@maxvyshniakov/screen-kit",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "packageManager": "bun@1.4.4",
   "description": "Agent-operated product demo video, screenshot, and terminal recording pipeline with Remotion 4, Display P3, Gemini TTS, Shorts 9:16, and automated QA.",

@@ -4,7 +4,7 @@ import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, relative, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 export const hash = data => createHash('sha256').update(data).digest('hex');
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, Math.max(0, ms)));

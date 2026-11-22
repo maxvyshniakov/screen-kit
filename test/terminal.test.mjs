@@ -20,8 +20,8 @@ test('records real PTY input, checks rendered selection and cleans up the child'
  const cwd=await mkdtemp(join(tmpdir(),'screen-kit-terminal-'));
  try {
   const result=await captureTerminalRecipe({name:'navigation',cwd,out:join(cwd,'out'),recipe:{
-   source:'terminal',command:['python3','-c',application],columns:30,rows:6,duration:.8,
-   format:'cast',steps:[{at:.2,input:'j',expect:'selected: beta'}],
+   source:'terminal',command:['python3','-c',application],columns:30,rows:6,duration:1.5,
+   format:'cast',steps:[{at:.6,input:'j',settle:.4,expect:'selected: beta'}],
   }});
   assert.ok(result.take.endsWith('.cast'));
   const lines=(await readFile(result.take,'utf8')).trim().split('\n').map(JSON.parse);
