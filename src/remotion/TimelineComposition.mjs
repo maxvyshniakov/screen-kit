@@ -376,99 +376,78 @@ function renderRippleOverlay(ripple) {
   });
 }
 
-function renderGestureOverlay(gesture) {
-  const s = gesture.scale;
-  const badgeRadius = 22 * s;
-  const travelOffset = (gesture.progress - 0.5) * 10 * s;
+function hudPillStyle(scale, { opacity = 1, liftPx = 0, mono = false } = {}) {
+  return {
+    opacity,
+    transform: liftPx ? `translateY(${liftPx}px)` : undefined,
+    padding: `${9 * scale}px ${16 * scale}px`,
+    borderRadius: 12 * scale,
+    backgroundColor: 'rgba(14, 15, 19, 0.88)',
+    border: `${Math.max(1, 1 * scale)}px solid rgba(255, 255, 255, 0.14)`,
+    boxShadow:
+      '0 10px 28px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1)',
+    color: '#ffffff',
+    fontFamily: mono ? MONO_FONT : UI_FONT,
+    fontSize: (mono ? 16 : 15) * scale,
+    fontWeight: mono ? 600 : 500,
+    letterSpacing: mono ? '0.03em' : '-0.005em',
+    lineHeight: 1.15,
+    whiteSpace: 'nowrap',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8 * scale,
+  };
+}
 
+function renderGesturePill(gesture) {
+  const s = gesture.scale;
   return h(
     'div',
     {
       key: gesture.key,
       'data-overlay': 'gesture',
-      style: {
-        position: 'absolute',
-        left: gesture.x,
-        top: gesture.y,
-        transform: 'translate(-50%, -50%)',
-        opacity: gesture.opacity,
-        pointerEvents: 'none',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        gap: 4 * s,
-      },
+      style: hudPillStyle(s, { opacity: gesture.opacity }),
     },
     h(
-      'div',
+      'svg',
       {
+        width: 16 * s,
+        height: 16 * s,
+        viewBox: '0 0 24 24',
+        fill: 'none',
         style: {
-          width: badgeRadius * 2,
-          height: badgeRadius * 2,
-          borderRadius: '50%',
-          backgroundColor: 'rgba(15, 23, 42, 0.78)',
-          border: `${Math.max(1, 1.5 * s)}px solid rgba(255, 255, 255, 0.28)`,
-          boxShadow: '0 4px 14px rgba(0, 0, 0, 0.35)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
+          flexShrink: 0,
+          opacity: 0.9,
+          transform: `rotate(${gesture.angleDeg}deg)`,
         },
       },
-      h(
-        'svg',
-        {
-          width: 24 * s,
-          height: 24 * s,
-          viewBox: '0 0 24 24',
-          fill: 'none',
-          style: {
-            transform: `rotate(${gesture.angleDeg}deg) translateX(${travelOffset / Math.max(s, 0.01)}px)`,
-          },
-        },
-        gesture.kind === 'pinch'
-          ? h('path', {
-              d: 'M4 12H10M14 12H20M7 9L4 12L7 15M17 9L20 12L17 15',
-              stroke: '#38bdf8',
-              strokeWidth: 2.2,
-              strokeLinecap: 'round',
-              strokeLinejoin: 'round',
-            })
-          : h('path', {
-              d: 'M5 12H19M13 6L19 12L13 18',
-              stroke: '#38bdf8',
-              strokeWidth: 2.2,
-              strokeLinecap: 'round',
-              strokeLinejoin: 'round',
-            })
-      )
+      gesture.kind === 'pinch'
+        ? h('path', {
+            d: 'M4 12H10M14 12H20M7 9L4 12L7 15M17 9L20 12L17 15',
+            stroke: '#ffffff',
+            strokeWidth: 2,
+            strokeLinecap: 'round',
+            strokeLinejoin: 'round',
+          })
+        : h('path', {
+            d: 'M5 12H19M13 6L19 12L13 18',
+            stroke: '#ffffff',
+            strokeWidth: 2,
+            strokeLinecap: 'round',
+            strokeLinejoin: 'round',
+          })
     ),
-    h(
-      'div',
-      {
-        style: {
-          padding: `${2 * s}px ${8 * s}px`,
-          borderRadius: 999,
-          backgroundColor: 'rgba(15, 23, 42, 0.82)',
-          border: `${Math.max(1, s)}px solid rgba(255, 255, 255, 0.16)`,
-          color: '#f8fafc',
-          fontFamily: UI_FONT,
-          fontSize: 11 * s,
-          fontWeight: 600,
-          letterSpacing: '0.02em',
-          whiteSpace: 'nowrap',
-        },
-      },
-      gesture.label
-    )
+    h('span', null, gesture.label)
   );
 }
 
-function renderKeystrokePills(keystrokes, hudAnchor) {
-  if (!keystrokes.length) return null;
+function renderBottomHud(gestures, keystrokes, hudAnchor) {
+  if (!gestures.length && !keystrokes.length) return null;
+  const s = (keystrokes[0] ?? gestures[0]).scale;
   return h(
     'div',
     {
-      'data-overlay': 'keystrokes',
+      'data-overlay': keystrokes.length ? 'keystrokes' : 'gesture-hud',
       style: {
         position: 'absolute',
         left: hudAnchor.centerX,
@@ -476,31 +455,22 @@ function renderKeystrokePills(keystrokes, hudAnchor) {
         transform: 'translate(-50%, -100%)',
         display: 'flex',
         alignItems: 'center',
-        gap: 10 * keystrokes[0].scale,
+        justifyContent: 'center',
+        gap: 10 * s,
         pointerEvents: 'none',
       },
     },
+    ...gestures.map(renderGesturePill),
     ...keystrokes.map((ks) =>
       h(
         'div',
         {
           key: ks.key,
-          style: {
+          style: hudPillStyle(ks.scale, {
             opacity: ks.opacity,
-            transform: `translateY(${ks.liftPx}px)`,
-            padding: `${8 * ks.scale}px ${16 * ks.scale}px`,
-            borderRadius: 10 * ks.scale,
-            backgroundColor: 'rgba(15, 23, 42, 0.88)',
-            border: `${Math.max(1, 1.5 * ks.scale)}px solid rgba(255, 255, 255, 0.22)`,
-            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.14)',
-            color: '#f8fafc',
-            fontFamily: MONO_FONT,
-            fontSize: 18 * ks.scale,
-            fontWeight: 600,
-            letterSpacing: '0.04em',
-            lineHeight: 1.1,
-            whiteSpace: 'nowrap',
-          },
+            liftPx: ks.liftPx,
+            mono: true,
+          }),
         },
         ks.label
       )
@@ -751,9 +721,12 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
         style: { pointerEvents: 'none', overflow: 'hidden' },
       },
       ...overlays.ripples.map(renderRippleOverlay),
-      ...overlays.gestures.map(renderGestureOverlay),
-      renderCaptions(overlays.captions, overlays.hudAnchor, overlays.keystrokes.length > 0),
-      renderKeystrokePills(overlays.keystrokes, overlays.hudAnchor),
+      renderCaptions(
+        overlays.captions,
+        overlays.hudAnchor,
+        overlays.keystrokes.length > 0 || overlays.gestures.length > 0
+      ),
+      renderBottomHud(overlays.gestures, overlays.keystrokes, overlays.hudAnchor),
       renderCursorOverlay(overlays.cursor)
     ),
     // Layer 3: Optional timeline audio tracks
