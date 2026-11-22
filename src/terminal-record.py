@@ -90,20 +90,20 @@ def record(config):
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
                 process.wait()
             # The group can outlive its leader: a descendant may ignore TERM even
             # when wait() above succeeds. This is our own newly-created session.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             deadline = time.monotonic() + 1
             while time.monotonic() < deadline:
                 try:
                     os.killpg(process.pid, 0)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     break
                 time.sleep(.01)
         os.close(master)
