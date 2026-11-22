@@ -9,7 +9,7 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from 'remotion';
-import { computeFrameScene } from './layout.mjs';
+import { buildSquirclePath, computeFrameScene } from './layout.mjs';
 
 const h = React.createElement;
 
@@ -19,7 +19,11 @@ const MONO_FONT =
   '"SF Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
 
 function renderTrafficLights() {
-  const colors = ['#ff5f57', '#febc2e', '#28c840'];
+  const lights = [
+    { fill: '#ff5f57', border: 'rgba(224, 68, 62, 0.72)' },
+    { fill: '#febc2e', border: 'rgba(222, 161, 35, 0.72)' },
+    { fill: '#28c840', border: 'rgba(26, 171, 41, 0.72)' },
+  ];
   return h(
     'div',
     {
@@ -27,21 +31,59 @@ function renderTrafficLights() {
         display: 'flex',
         alignItems: 'center',
         gap: 8,
-        paddingLeft: 14,
+        paddingLeft: 16,
         flexShrink: 0,
       },
     },
-    ...colors.map((color, idx) =>
+    ...lights.map((light, idx) =>
       h('span', {
         key: idx,
         style: {
           width: 12,
           height: 12,
           borderRadius: '50%',
-          backgroundColor: color,
-          boxShadow: 'inset 0 0 0 0.5px rgba(0, 0, 0, 0.28)',
+          backgroundColor: light.fill,
+          boxShadow: `inset 0 0 0 0.75px ${light.border}, 0 0.5px 1px rgba(0, 0, 0, 0.35)`,
           display: 'inline-block',
         },
+      })
+    )
+  );
+}
+
+function renderBrowserNavIcons() {
+  const iconStyle = { display: 'block', opacity: 0.32 };
+  return h(
+    'div',
+    {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        marginLeft: 18,
+        flexShrink: 0,
+      },
+    },
+    h(
+      'svg',
+      { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: iconStyle },
+      h('path', {
+        d: 'M7.75 2.25L4 6L7.75 9.75',
+        stroke: '#e2e8f0',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+      })
+    ),
+    h(
+      'svg',
+      { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: { display: 'block', opacity: 0.18 } },
+      h('path', {
+        d: 'M4.25 2.25L8 6L4.25 9.75',
+        stroke: '#e2e8f0',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
       })
     )
   );
@@ -58,8 +100,9 @@ function renderTopChromeBar(windowChrome) {
           top: 0,
           width: windowChrome.outerRect.width,
           height: windowChrome.topBarHeight,
-          background: 'linear-gradient(180deg, #2b303b 0%, #1f2430 100%)',
-          borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+          background: 'linear-gradient(180deg, #27292e 0%, #1d1f24 100%)',
+          borderBottom: '1px solid rgba(0, 0, 0, 0.55)',
+          boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.08)',
           display: 'flex',
           alignItems: 'center',
           boxSizing: 'border-box',
@@ -73,14 +116,14 @@ function renderTopChromeBar(windowChrome) {
             {
               style: {
                 position: 'absolute',
-                left: 84,
-                right: 84,
+                left: 88,
+                right: 88,
                 textAlign: 'center',
-                color: 'rgba(241, 245, 249, 0.88)',
+                color: 'rgba(241, 245, 249, 0.82)',
                 fontFamily: UI_FONT,
                 fontSize: 13,
                 fontWeight: 500,
-                letterSpacing: '0.01em',
+                letterSpacing: '-0.005em',
                 whiteSpace: 'nowrap',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -103,8 +146,9 @@ function renderTopChromeBar(windowChrome) {
           top: 0,
           width: windowChrome.outerRect.width,
           height: windowChrome.topBarHeight,
-          backgroundColor: '#181c24',
-          borderBottom: '1px solid rgba(255, 255, 255, 0.09)',
+          background: 'linear-gradient(180deg, #25272d 0%, #1c1e23 100%)',
+          borderBottom: '1px solid rgba(0, 0, 0, 0.58)',
+          boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.07)',
           display: 'flex',
           alignItems: 'center',
           boxSizing: 'border-box',
@@ -112,32 +156,71 @@ function renderTopChromeBar(windowChrome) {
         },
       },
       renderTrafficLights(),
+      renderBrowserNavIcons(),
       h(
         'div',
         {
           style: {
-            margin: '0 auto',
-            minWidth: Math.min(360, Math.max(140, windowChrome.outerRect.width * 0.42)),
-            maxWidth: Math.max(180, windowChrome.outerRect.width - 180),
-            height: 26,
+            position: 'absolute',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            minWidth: Math.min(340, Math.max(160, windowChrome.outerRect.width * 0.34)),
+            maxWidth: Math.max(200, windowChrome.outerRect.width - 260),
+            height: 27,
             padding: '0 14px',
-            borderRadius: 7,
-            backgroundColor: 'rgba(255, 255, 255, 0.07)',
-            border: '1px solid rgba(255, 255, 255, 0.08)',
+            borderRadius: 8,
+            backgroundColor: 'rgba(255, 255, 255, 0.055)',
+            boxShadow:
+              'inset 0 0 0 0.75px rgba(255, 255, 255, 0.075), inset 0 1px 2px rgba(0, 0, 0, 0.25)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: 'rgba(226, 232, 240, 0.85)',
+            gap: 6,
+            color: 'rgba(226, 232, 240, 0.76)',
             fontFamily: UI_FONT,
             fontSize: 12,
+            fontWeight: 450,
+            letterSpacing: '-0.005em',
             whiteSpace: 'nowrap',
             overflow: 'hidden',
-            textOverflow: 'ellipsis',
           },
         },
-        addressText
-      ),
-      h('div', { style: { width: 66, flexShrink: 0 } })
+        h(
+          'svg',
+          {
+            width: 10,
+            height: 11,
+            viewBox: '0 0 10 11',
+            fill: 'none',
+            style: { flexShrink: 0, opacity: 0.48 },
+          },
+          h('rect', {
+            x: 1.5,
+            y: 4.5,
+            width: 7,
+            height: 5.2,
+            rx: 1.4,
+            fill: '#cbd5e1',
+          }),
+          h('path', {
+            d: 'M3.1 4.5V3.2C3.1 2.15 3.95 1.3 5 1.3C6.05 1.3 6.9 2.15 6.9 3.2V4.5',
+            stroke: '#cbd5e1',
+            strokeWidth: 1.2,
+            strokeLinecap: 'round',
+          })
+        ),
+        h(
+          'span',
+          {
+            style: {
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            },
+          },
+          addressText
+        )
+      )
     );
   }
 
@@ -485,8 +568,15 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
   });
 
   const { stage, windowChrome, videoSrc, camera, overlays, audioTracks } = scene;
-  const windowShadow = windowChrome.shadow
-    ? '0 28px 70px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.1)'
+  const outerW = windowChrome.outerRect.width;
+  const outerH = windowChrome.outerRect.height;
+  const outerRadius = windowChrome.borderRadius;
+  const hasRoundedCorners = outerRadius > 0.01;
+  const squirclePath = hasRoundedCorners ? buildSquirclePath(outerW, outerH, outerRadius, 0.6) : '';
+  const squircleClipId = 'screen-kit-window-squircle';
+  const rimGradId = 'screen-kit-window-rim-grad';
+  const windowShadowFilter = windowChrome.shadow
+    ? 'drop-shadow(0 2px 6px rgba(0, 0, 0, 0.38)) drop-shadow(0 18px 36px rgba(0, 0, 0, 0.44)) drop-shadow(0 38px 72px rgba(0, 0, 0, 0.36))'
     : 'none';
 
   return h(
@@ -527,52 +617,130 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
             },
           })
         : null,
+      // Shadow wrapper follows the exact squircle silhouette via CSS drop-shadow
       h(
         'div',
         {
-          'data-layer': 'window-frame',
-          'data-frame-kind': windowChrome.frame,
+          'data-layer': 'window-shadow',
           style: {
             position: 'absolute',
             left: windowChrome.outerRect.x,
             top: windowChrome.outerRect.y,
-            width: windowChrome.outerRect.width,
-            height: windowChrome.outerRect.height,
-            borderRadius: windowChrome.borderRadius,
-            boxShadow: windowShadow,
-            backgroundColor: windowChrome.frame === 'device' ? '#0b0f17' : '#111827',
-            overflow: 'hidden',
+            width: outerW,
+            height: outerH,
+            filter: windowShadowFilter,
           },
         },
-        renderTopChromeBar(windowChrome),
+        hasRoundedCorners
+          ? h(
+              'svg',
+              {
+                width: 0,
+                height: 0,
+                style: { position: 'absolute', pointerEvents: 'none' },
+                'aria-hidden': 'true',
+              },
+              h(
+                'defs',
+                null,
+                h(
+                  'clipPath',
+                  { id: squircleClipId, clipPathUnits: 'userSpaceOnUse' },
+                  h('path', { d: squirclePath })
+                )
+              )
+            )
+          : null,
         h(
           'div',
           {
-            'data-layer': 'viewport-content',
+            'data-layer': 'window-frame',
+            'data-frame-kind': windowChrome.frame,
             style: {
               position: 'absolute',
-              left: windowChrome.contentOffset.left,
-              top: windowChrome.contentOffset.top,
-              width: windowChrome.contentRect.width,
-              height: windowChrome.contentRect.height,
-              borderRadius: windowChrome.frame === 'device' ? Math.max(0, windowChrome.borderRadius - 12) : 0,
+              left: 0,
+              top: 0,
+              width: outerW,
+              height: outerH,
+              ...(hasRoundedCorners
+                ? { clipPath: `url(#${squircleClipId})` }
+                : {}),
+              backgroundColor: windowChrome.frame === 'device' ? '#0b0f17' : '#111318',
               overflow: 'hidden',
-              backgroundColor: '#000000',
             },
           },
-          renderVideoElement && videoSrc
-            ? h(OffthreadVideo, {
-                src: videoSrc,
-                muted: true,
+          renderTopChromeBar(windowChrome),
+          h(
+            'div',
+            {
+              'data-layer': 'viewport-content',
+              style: {
+                position: 'absolute',
+                left: windowChrome.contentOffset.left,
+                top: windowChrome.contentOffset.top,
+                width: windowChrome.contentRect.width,
+                height: windowChrome.contentRect.height,
+                borderRadius: windowChrome.frame === 'device' ? Math.max(0, outerRadius - 12) : 0,
+                overflow: 'hidden',
+                backgroundColor: '#000000',
+              },
+            },
+            renderVideoElement && videoSrc
+              ? h(OffthreadVideo, {
+                  src: videoSrc,
+                  muted: true,
+                  style: {
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'fill',
+                    display: 'block',
+                  },
+                })
+              : null
+          )
+        ),
+        // Precision vector double-hairline rim (dark outer edge + vertical specular inner edge)
+        hasRoundedCorners
+          ? h(
+              'svg',
+              {
+                'data-layer': 'window-rim',
+                width: outerW,
+                height: outerH,
+                viewBox: `0 0 ${outerW} ${outerH}`,
+                fill: 'none',
                 style: {
-                  width: '100%',
-                  height: '100%',
-                  objectFit: 'fill',
-                  display: 'block',
+                  position: 'absolute',
+                  left: 0,
+                  top: 0,
+                  pointerEvents: 'none',
+                  overflow: 'visible',
                 },
+              },
+              h(
+                'defs',
+                null,
+                h(
+                  'linearGradient',
+                  { id: rimGradId, x1: '0', y1: '0', x2: '0', y2: '1' },
+                  h('stop', { offset: '0%', stopColor: 'rgba(255, 255, 255, 0.24)' }),
+                  h('stop', { offset: '18%', stopColor: 'rgba(255, 255, 255, 0.11)' }),
+                  h('stop', { offset: '100%', stopColor: 'rgba(255, 255, 255, 0.05)' })
+                )
+              ),
+              h('path', {
+                d: squirclePath,
+                stroke: 'rgba(0, 0, 0, 0.62)',
+                strokeWidth: 2,
+              }),
+              h('path', {
+                d: squirclePath,
+                stroke: `url(#${rimGradId})`,
+                strokeWidth: 1.5,
+                clipPath: `url(#${squircleClipId})`,
               })
-            : null
-        )
+            )
+          : null
       )
     ),
     // Layer 2: Screen-space overlays AFTER camera at constant scale

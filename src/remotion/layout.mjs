@@ -14,13 +14,50 @@ export function resolveAssetUrl(src, mapAsset) {
 }
 
 /**
+ * Build an Apple/Figma-style continuous-corner (squircle) SVG path for a rectangle of size `width x height`.
+ * Uses smooth cubic Bezier transitions (`smoothness` in [0..1], default 0.6) so corners avoid the
+ * harsh curvature jump of circular CSS `border-radius`.
+ */
+export function buildSquirclePath(width, height, radius, smoothness = 0.6) {
+  const w = Math.max(0, Number(width) || 0);
+  const h = Math.max(0, Number(height) || 0);
+  const r = Math.max(0, Math.min(Number(radius) || 0, w / 2, h / 2));
+  if (r <= 0.01) {
+    return `M 0 0 H ${w} V ${h} H 0 Z`;
+  }
+  // Effective shoulder length extends slightly past r for G2-like continuous curvature
+  const s = Math.min(r * (1 + smoothness * 0.52), w / 2, h / 2);
+  // Control point pull toward the corner vertex
+  const c1 = r * (1 - 0.5522847498) * (1 - smoothness * 0.38);
+  const c2 = s * 0.45;
+  const f = (n) => Number(n.toFixed(3));
+
+  return [
+    `M ${f(s)} 0`,
+    `H ${f(w - s)}`,
+    `C ${f(w - c2)} 0 ${f(w - c1)} 0 ${f(w - c1)} ${f(c1)}`,
+    `C ${f(w)} ${f(c1)} ${f(w)} ${f(c2)} ${f(w)} ${f(s)}`,
+    `V ${f(h - s)}`,
+    `C ${f(w)} ${f(h - c2)} ${f(w)} ${f(h - c1)} ${f(w - c1)} ${f(h - c1)}`,
+    `C ${f(w - c1)} ${f(h)} ${f(w - c2)} ${f(h)} ${f(w - s)} ${f(h)}`,
+    `H ${f(s)}`,
+    `C ${f(c2)} ${f(h)} ${f(c1)} ${f(h)} ${f(c1)} ${f(h - c1)}`,
+    `C 0 ${f(h - c1)} 0 ${f(h - c2)} 0 ${f(h - s)}`,
+    `V ${f(s)}`,
+    `C 0 ${f(c2)} 0 ${f(c1)} ${f(c1)} ${f(c1)}`,
+    `C ${f(c1)} 0 ${f(c2)} 0 ${f(s)} 0`,
+    'Z',
+  ].join(' ');
+}
+
+/**
  * Compute stage-space geometry for the window frame and viewport content rectangle.
  * `window.{x, y, width, height}` ALWAYS locates the take's viewport content rectangle on the stage;
  * decorative frame chrome (`macos`, `browser`, `device`) wraps around it inside stage padding so
  * `projectViewportToStage` and `projectViewportToScreen` remain exact for every frame style.
  */
 export function computeWindowChrome(win) {
-  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 12);
+  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 16);
   const shadow = win.shadow ?? win.frame !== 'none';
 
   switch (win.frame) {
