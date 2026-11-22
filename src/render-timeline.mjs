@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
 import { access, copyFile, link, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -738,6 +739,22 @@ function assertValidColorSpaceOption(colorSpace) {
  * staging, single Rspack `bundle()`, lazy sRGB / Display P3 browser pool, symmetric `AbortSignal`
  * listener cleanup, and temporary directory teardown.
  */
+function allocateFreePort() {
+  return new Promise((resolvePort, reject) => {
+    const srv = createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close((closeErr) => {
+        if (closeErr) reject(closeErr);
+        else resolvePort(port);
+      });
+    });
+  });
+}
+
 async function withRemotionSession(
   {
     prefix = 'screen-kit-remotion-',
@@ -830,9 +847,11 @@ async function withRemotionSession(
     });
 
     throwIfAborted();
+    const port = await allocateFreePort();
 
     return await runFn({
       serveUrl,
+      port,
       tempOutputsDir,
       stagedVariants,
       stagedTimeline: stagedVariants.get('default'),
@@ -898,6 +917,7 @@ export async function renderTimeline({
     },
     async ({
       serveUrl,
+      port,
       tempOutputsDir,
       stagedTimeline,
       getBrowserForColorSpace,
@@ -928,6 +948,7 @@ export async function renderTimeline({
 
         const composition = await selectComposition({
           serveUrl,
+          port,
           id: COMPOSITION_ID,
           inputProps,
           puppeteerInstance: browser,
@@ -947,6 +968,7 @@ export async function renderTimeline({
           const frame = Math.min(maxFrame, Math.max(0, Math.round((target.posterTime ?? 0) * composition.fps)));
           await renderStill({
             serveUrl,
+            port,
             composition,
             inputProps,
             frame,
@@ -983,6 +1005,7 @@ export async function renderTimeline({
           const crf = target.codec === 'vp9' ? 20 : 15;
           await renderMedia({
             serveUrl,
+            port,
             composition,
             inputProps,
             codec: target.codec,
@@ -1132,6 +1155,7 @@ export async function renderTimelineStills({
     },
     async ({
       serveUrl,
+      port,
       tempOutputsDir,
       stagedVariants,
       getBrowserForColorSpace,
@@ -1162,6 +1186,7 @@ export async function renderTimelineStills({
         };
         const composition = await selectComposition({
           serveUrl,
+          port,
           id: COMPOSITION_ID,
           inputProps,
           puppeteerInstance: browser,
@@ -1196,6 +1221,7 @@ export async function renderTimelineStills({
 
         await renderStill({
           serveUrl,
+          port,
           composition,
           inputProps,
           frame,
@@ -1432,6 +1458,7 @@ export async function renderTimelinePreview({
     },
     async ({
       serveUrl,
+      port,
       tempOutputsDir,
       stagedTimeline,
       getBrowserForColorSpace,
@@ -1455,6 +1482,7 @@ export async function renderTimelinePreview({
 
       const composition = await selectComposition({
         serveUrl,
+        port,
         id: COMPOSITION_ID,
         inputProps,
         puppeteerInstance: browser,
@@ -1471,6 +1499,7 @@ export async function renderTimelinePreview({
         const tempStillFile = join(tempOutputsDir, target.filename);
         await renderStill({
           serveUrl,
+          port,
           composition,
           inputProps,
           frame,
