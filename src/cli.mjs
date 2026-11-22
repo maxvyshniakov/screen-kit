@@ -19,7 +19,7 @@ screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline sti
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30]
-screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master] [--poster-format png]
+screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master,shorts] [--poster-format png]
 screen-kit publish --target web --input demo.mp4 --out out/web [--name demo] [--poster poster.png] [--formats vp9,h264] [--fps 30] [--color-space srgb|p3]
 screen-kit publish --target youtube --input demo.mp4 --title "..." [--description "..."] [--privacy unlisted|private|public] [--captions en:subs.srt] [--thumbnail thumb.png] [--dry-run] [--out report.json]
 screen-kit asset --kind thumbnail|wallpaper --prompt "..." --out out/thumb.png [--aspect-ratio 16:9] [--model imagen-3.0-generate-002] [--cache-dir dir]

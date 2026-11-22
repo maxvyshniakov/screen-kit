@@ -13,12 +13,14 @@ import {
   RENDER_PROFILES,
   computeFrameScene,
   moveFileAtomic,
+  projectViewportToRender,
   renderTimeline,
   renderTimelinePreview,
   resolvePreviewTargets,
   resolveRenderTargets,
   screenToRender,
 } from '../src/render-timeline.mjs';
+import { reviewVideo } from '../src/review-video.mjs';
 import { runPipeline } from '../src/run.mjs';
 import { calculateTimelineMetadata } from '../src/remotion/Root.mjs';
 import { buildSquirclePath } from '../src/remotion/layout.mjs';
@@ -26,6 +28,7 @@ import {
   compileTimeline,
   projectViewportToScreen,
   projectViewportToStage,
+  validateTimeline,
 } from '../src/timeline.mjs';
 import { probeVideo, renderVideo } from '../src/video.mjs';
 
@@ -79,7 +82,8 @@ test('package exports and strict renderer module boundary stay decoupled from ca
   assert.equal(rootApi.renderTimeline, renderTimeline);
   assert.equal(rootApi.resolveRenderTargets, resolveRenderTargets);
   assert.equal(rootApi.computeFrameScene, computeFrameScene);
-  assert.deepEqual(rootApi.RENDER_PROFILES, ['web-loop', 'youtube-master']);
+  assert.equal(rootApi.projectViewportToRender, projectViewportToRender);
+  assert.deepEqual(rootApi.RENDER_PROFILES, ['web-loop', 'youtube-master', 'shorts']);
 
   const subpathMod = await import('@maxvyshniakov/screen-kit/render-timeline');
   assert.equal(subpathMod.renderTimeline, renderTimeline);
@@ -174,7 +178,365 @@ test('resolveRenderTargets validates timelines and resolves web-loop, youtube-ma
     () => resolveRenderTargets({ timeline, out: '/tmp/demo.mp4', profiles: ['web-loop', 'youtube-master'] }),
     /Single-file/
   );
-  assert.deepEqual(RENDER_PROFILES, ['web-loop', 'youtube-master']);
+  assert.deepEqual(RENDER_PROFILES, ['web-loop', 'youtube-master', 'shorts']);
+});
+
+test('shorts profile resolution, portrait 9:16 smart-follow bounds, verticalKeyframes override, cursor alignment, and safe HUD/caption zones', () => {
+  const desktopEventTrack = makeSyntheticEventTrack({
+    viewport: { width: 1280, height: 720, deviceScaleFactor: 2 },
+    video: { file: 'take.mp4', width: 2560, height: 1440, fps: 30, duration: 1, frames: 30 },
+    events: [
+      { t: 0.0, type: 'pointermove', x: 60, y: 120 },
+      { t: 0.2, type: 'pointerdown', x: 60, y: 120, button: 'left' },
+      { t: 0.3, type: 'pointerup', x: 60, y: 120, button: 'left' },
+      { t: 0.5, type: 'key', key: 'k', modifiers: ['Meta'], action: 'press', duration: 0.4 },
+      { t: 0.6, type: 'pointermove', x: 640, y: 360 },
+      { t: 0.9, type: 'pointermove', x: 1220, y: 600 },
+    ],
+  });
+
+  // 1. Profile resolution via timeline.outputs: ['shorts'] and --profiles shorts
+  const shortsOnlyTimeline = compileTimeline({
+    eventTrack: desktopEventTrack,
+    recipe: {
+      stage: { width: 1520, height: 960, padding: 120 },
+      window: { frame: 'macos', title: 'Shorts Demo', width: 1280, height: 720 },
+      camera: { outputWidth: 1280, outputHeight: 720 },
+      overlays: {
+        captions: {
+          enabled: true,
+          tracks: [
+            {
+              language: 'en',
+              cues: [
+                {
+                  start: 0.1,
+                  end: 0.9,
+                  text: 'Smart-follow portrait framing keeps the action centered in 9:16 Shorts.',
+                },
+              ],
+            },
+          ],
+        },
+      },
+      outputs: ['shorts'],
+    },
+  });
+
+  assert.deepEqual(shortsOnlyTimeline.outputs, [
+    {
+      id: 'shorts',
+      format: 'mp4',
+      codec: 'h264',
+      width: 1080,
+      height: 1920,
+      fps: 60,
+      loop: false,
+      poster: false,
+    },
+  ]);
+
+  const dirPlan = resolveRenderTargets({
+    timeline: shortsOnlyTimeline,
+    outDir: '/tmp/renders',
+    profiles: ['shorts'],
+  });
+  assert.equal(dirPlan.mode, 'directory');
+  assert.deepEqual(
+    dirPlan.targets.map((t) => ({
+      id: t.id,
+      role: t.role,
+      format: t.format,
+      codec: t.codec,
+      width: t.width,
+      height: t.height,
+      fps: t.fps,
+      file: t.file,
+    })),
+    [
+      {
+        id: 'shorts',
+        role: 'video',
+        format: 'mp4',
+        codec: 'h264',
+        width: 1080,
+        height: 1920,
+        fps: 60,
+        file: resolve('/tmp/renders/shorts.mp4'),
+      },
+    ]
+  );
+
+  // Requesting --profiles shorts on a default landscape-outputs timeline also resolves 1080x1920 @ 60fps
+  const landscapeDefaultTimeline = compileTimeline({
+    eventTrack: desktopEventTrack,
+    recipe: {
+      stage: { width: 1520, height: 960, padding: 120 },
+      window: { frame: 'macos', title: 'Landscape Source', width: 1280, height: 720 },
+      camera: { outputWidth: 1280, outputHeight: 720 },
+    },
+  });
+  const overridePlan = resolveRenderTargets({
+    timeline: landscapeDefaultTimeline,
+    outDir: '/tmp/renders',
+    profiles: ['shorts'],
+  });
+  assert.equal(overridePlan.targets.length, 1);
+  assert.equal(overridePlan.targets[0].width, 1080);
+  assert.equal(overridePlan.targets[0].height, 1920);
+  assert.equal(overridePlan.targets[0].fps, 60);
+  assert.equal(overridePlan.targets[0].codec, 'h264');
+
+  const singleShortsPlan = resolveRenderTargets({
+    timeline: landscapeDefaultTimeline,
+    out: '/tmp/renders/vertical.mp4',
+    profiles: ['shorts'],
+  });
+  assert.equal(singleShortsPlan.mode, 'file');
+  assert.equal(singleShortsPlan.targets[0].width, 1080);
+  assert.equal(singleShortsPlan.targets[0].height, 1920);
+  assert.equal(singleShortsPlan.targets[0].fps, 60);
+
+  // 2. Smart-follow 9:16 portrait framing bounds, smooth pan, full-bleed fill, and cursor/ripple alignment
+  const sampledCenterX = [];
+  for (let frame = 0; frame <= 60; frame += 6) {
+    const scene = computeFrameScene(shortsOnlyTimeline, {
+      frame,
+      fps: 60,
+      width: 1080,
+      height: 1920,
+    });
+    const { camera, overlays } = scene;
+    sampledCenterX.push(camera.sample.x);
+
+    assert.equal(camera.portrait, true);
+    assert.equal(camera.reframed, true);
+    assert.equal(camera.mode, 'portrait-smart-follow');
+    assert.equal(camera.offsetX, 0);
+    assert.equal(camera.offsetY, 0);
+    assert.equal(camera.logicalWidth, 1080);
+    assert.equal(camera.logicalHeight, 1920);
+
+    // Strictly inside stage [0..1520, 0..960] with exact 9:16 visible rect aspect ratio
+    assert.ok(camera.visibleRect.left >= -1e-6, `left out of stage: ${camera.visibleRect.left}`);
+    assert.ok(camera.visibleRect.top >= -1e-6, `top out of stage: ${camera.visibleRect.top}`);
+    assert.ok(
+      camera.visibleRect.right <= shortsOnlyTimeline.stage.width + 1e-6,
+      `right out of stage: ${camera.visibleRect.right}`
+    );
+    assert.ok(
+      camera.visibleRect.bottom <= shortsOnlyTimeline.stage.height + 1e-6,
+      `bottom out of stage: ${camera.visibleRect.bottom}`
+    );
+    assert.ok(
+      Math.abs(camera.visibleRect.width / camera.visibleRect.height - 9 / 16) < 1e-6,
+      `expected 9:16 visible crop, got ${camera.visibleRect.width}x${camera.visibleRect.height}`
+    );
+
+    // Cursor matches both CSS stage transform and projectViewportToRender with 0 px error
+    assert.ok(overlays.cursor, 'expected visible cursor');
+    const stagePt = projectViewportToStage(
+      overlays.cursor.viewportX,
+      overlays.cursor.viewportY,
+      shortsOnlyTimeline
+    );
+    const cssX = camera.translateX + stagePt.x * camera.effectiveScale;
+    const cssY = camera.translateY + stagePt.y * camera.effectiveScale;
+    assert.ok(Math.abs(overlays.cursor.x - cssX) < 1e-6, `cursor x drift: ${overlays.cursor.x} vs ${cssX}`);
+    assert.ok(Math.abs(overlays.cursor.y - cssY) < 1e-6, `cursor y drift: ${overlays.cursor.y} vs ${cssY}`);
+
+    const directPt = projectViewportToRender(
+      overlays.cursor.viewportX,
+      overlays.cursor.viewportY,
+      shortsOnlyTimeline,
+      scene.t,
+      1080,
+      1920
+    );
+    assert.ok(Math.abs(overlays.cursor.x - directPt.x) < 1e-6);
+    assert.ok(Math.abs(overlays.cursor.y - directPt.y) < 1e-6);
+    assert.ok(overlays.cursor.x >= 0 && overlays.cursor.x <= 1080, `cursor x outside 1080: ${overlays.cursor.x}`);
+    assert.ok(overlays.cursor.y >= 0 && overlays.cursor.y <= 1920, `cursor y outside 1920: ${overlays.cursor.y}`);
+    assert.equal(overlays.cursor.scale, 1.5);
+  }
+
+  // Smart-follow panned horizontally from left focus to right focus
+  assert.ok(
+    sampledCenterX.at(-1) - sampledCenterX[0] > 400,
+    `expected smart-follow horizontal pan > 400px, got ${sampledCenterX[0]} -> ${sampledCenterX.at(-1)}`
+  );
+
+  // Ripple alignment & portrait HUD/caption safe zones at t=0.25s and t=0.55s
+  const sceneClick = computeFrameScene(shortsOnlyTimeline, {
+    frame: 15,
+    fps: 60,
+    width: 1080,
+    height: 1920,
+  });
+  assert.equal(sceneClick.overlays.ripples.length, 1);
+  const expectedRipple = projectViewportToRender(60, 120, shortsOnlyTimeline, 0.25, 1080, 1920);
+  assert.ok(Math.abs(sceneClick.overlays.ripples[0].x - expectedRipple.x) < 1e-6);
+  assert.ok(Math.abs(sceneClick.overlays.ripples[0].y - expectedRipple.y) < 1e-6);
+
+  const sceneHud = computeFrameScene(shortsOnlyTimeline, {
+    frame: 33,
+    fps: 60,
+    width: 1080,
+    height: 1920,
+  });
+  assert.equal(sceneHud.overlays.keystrokes.length, 1);
+  assert.equal(sceneHud.overlays.captions.length, 1);
+  const { hudAnchor } = sceneHud.overlays;
+  assert.equal(hudAnchor.portrait, true);
+  assert.ok(1920 - hudAnchor.bottomY >= 180, `bottom safe zone < 180px: ${1920 - hudAnchor.bottomY}`);
+  const leftEdge = hudAnchor.centerX - hudAnchor.maxWidth / 2;
+  const rightMargin = 1080 - (hudAnchor.centerX + hudAnchor.maxWidth / 2);
+  assert.ok(leftEdge >= 32, `left safe margin too small: ${leftEdge}`);
+  assert.ok(rightMargin >= 120, `right Shorts chrome safe margin too small: ${rightMargin}`);
+  assert.ok(hudAnchor.maxWidth <= 960 && hudAnchor.maxWidth > 600, `unexpected caption maxWidth: ${hudAnchor.maxWidth}`);
+
+  // 3. Optional timeline.camera.verticalKeyframes override + strict schema bounds validation
+  const overrideTimeline = compileTimeline({
+    eventTrack: desktopEventTrack,
+    recipe: {
+      stage: { width: 1520, height: 960, padding: 120 },
+      window: { frame: 'macos', title: 'Vertical Override', width: 1280, height: 720 },
+      camera: {
+        outputWidth: 1280,
+        outputHeight: 720,
+        verticalKeyframes: [
+          { t: 0, x: 400, y: 480, zoom: 1, easing: 'linear' },
+          { t: 0.5, x: 1000, y: 480, zoom: 1.5, easing: 'smoothstep' },
+        ],
+      },
+      outputs: ['shorts'],
+    },
+  });
+  assert.equal(overrideTimeline.camera.verticalKeyframes.length, 2);
+
+  const vStart = computeFrameScene(overrideTimeline, { frame: 0, fps: 60, width: 1080, height: 1920 });
+  assert.equal(vStart.camera.mode, 'portrait-vertical-keyframes');
+  assert.equal(vStart.camera.sample.x, 400);
+  assert.equal(vStart.camera.sample.y, 480);
+  assert.equal(vStart.camera.sample.zoom, 1);
+
+  const vMid = computeFrameScene(overrideTimeline, { frame: 30, fps: 60, width: 1080, height: 1920 });
+  assert.equal(vMid.camera.mode, 'portrait-vertical-keyframes');
+  assert.equal(vMid.camera.sample.x, 1000);
+  assert.equal(vMid.camera.sample.y, 480);
+  assert.equal(vMid.camera.sample.zoom, 1.5);
+
+  // Out-of-bounds verticalKeyframes fail validateTimeline cleanly
+  const badVertical = structuredClone(overrideTimeline);
+  badVertical.camera.verticalKeyframes[0].x = 50; // left = 50 - 270 = -220 < 0
+  const badCheck = validateTimeline(badVertical);
+  assert.equal(badCheck.ok, false);
+  assert.ok(badCheck.errors.some((e) => /verticalKeyframes\[0\].*leaves stage/.test(e)));
+
+  const emptyVertical = structuredClone(overrideTimeline);
+  emptyVertical.camera.verticalKeyframes = [];
+  assert.equal(validateTimeline(emptyVertical).ok, false);
+});
+
+test('headless Remotion renders shorts 9:16 (1080x1920 @ 60fps) MP4 verified by probeVideo and reviewVideo', async () => {
+  const workDir = await mkdtemp(join(tmpdir(), 'screen-kit-shorts-e2e-'));
+  const scratchDir = join(workDir, 'scratch');
+  try {
+    // Build a fast 0.2s 320x180 @ 5fps take (left half emerald green, right half blue)
+    const leftHalf = await sharp({
+      create: { width: 160, height: 180, channels: 3, background: { r: 16, g: 185, b: 129 } },
+    })
+      .png()
+      .toBuffer();
+    const framePng = await sharp({
+      create: { width: 320, height: 180, channels: 3, background: { r: 37, g: 99, b: 235 } },
+    })
+      .composite([{ input: leftHalf, left: 0, top: 0 }])
+      .png()
+      .toBuffer();
+    await sharp(framePng).toFile(join(workDir, 'frame-0.png'));
+
+    const takeFile = join(workDir, 'short-take.mp4');
+    await renderVideo({ input: join(workDir, 'frame-%d.png'), output: takeFile, fps: 5 });
+
+    // Same landscape timeline (480x270 stage, 320x180 window) with cursor focused on emerald left half (80, 90)
+    const timeline = compileTimeline({
+      take: { video: takeFile, eventTrack: 'event-track.json' },
+      eventTrack: makeSyntheticEventTrack({
+        video: { file: takeFile, width: 320, height: 180, fps: 5, duration: 0.2, frames: 1 },
+        events: [
+          { t: 0, type: 'pointermove', x: 80, y: 90 },
+          { t: 0.05, type: 'key', key: 'k', modifiers: ['Meta'], action: 'press', duration: 0.2 },
+        ],
+      }),
+      recipe: {
+        stage: {
+          width: 480,
+          height: 270,
+          padding: 45,
+          background: { type: 'solid', color: '#0f172a' },
+        },
+        window: {
+          frame: 'macos',
+          title: 'Shorts 9:16',
+          width: 320,
+          height: 180,
+        },
+        camera: {
+          outputWidth: 480,
+          outputHeight: 270,
+        },
+        outputs: ['web-loop', 'shorts'],
+      },
+    });
+
+    const outDir = join(workDir, 'out-shorts');
+    const result = await renderTimeline({
+      timeline,
+      outDir,
+      profiles: ['shorts'],
+      scratchDir,
+    });
+
+    assert.equal(result.outputs.length, 1);
+    const shortsOut = result.outputs[0];
+    assert.equal(shortsOut.id, 'shorts');
+    assert.equal(shortsOut.format, 'mp4');
+
+    const probe = await probeVideo(shortsOut.file);
+    assert.equal(probe.width, 1080);
+    assert.equal(probe.height, 1920);
+    assert.equal(Math.round(probe.fps), 60);
+    assert.equal(probe.codec, 'h264');
+    assert.equal(probe.frames, 12);
+    assert.equal(probe.colorSpace, 'bt709');
+    assert.equal(probe.colorPrimaries, 'bt709');
+    assert.equal(probe.colorTransfer, 'bt709');
+    assert.equal(probe.colorRange, 'tv');
+
+    // Verify smart-follow centered the 9:16 crop on the emerald-green left half instead of letterboxing
+    // Sample 120px left of center (420, 960) to avoid the vector cursor tip drawn directly at (540, 960)
+    const emeraldRgb = decodePixelRgb(shortsOut.file, 0.05, 420, 960);
+    assert.ok(
+      emeraldRgb[1] > 140 && emeraldRgb[0] < 80,
+      `expected smart-follow emerald green in 1080x1920 frame, got ${emeraldRgb}`
+    );
+
+    const review = await reviewVideo({
+      video: shortsOut.file,
+      timeline,
+      outputId: 'shorts',
+    });
+    assert.equal(review.ok, true, `reviewVideo failed: ${JSON.stringify(review.findings)}`);
+    assert.equal(review.metrics.width, 1080);
+    assert.equal(review.metrics.height, 1920);
+    assert.equal(Math.round(review.metrics.fps), 60);
+
+    // Scratch directory must be completely cleaned up
+    assert.deepEqual(await readdir(scratchDir), []);
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
 });
 
 test('computeFrameScene preserves window content alignment and constant-scale screen-space overlays under zoom', () => {

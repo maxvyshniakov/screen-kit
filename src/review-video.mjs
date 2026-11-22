@@ -8,12 +8,11 @@ import { difference, generateContactSheet } from './images.mjs';
 import {
   cameraViewportRect,
   compileCursorSamples,
-  projectViewportToScreen,
   sampleCamera,
   sampleCursor,
   validateTimeline,
 } from './timeline.mjs';
-import { screenToRender } from './remotion/layout.mjs';
+import { projectViewportToRender } from './remotion/layout.mjs';
 import { reviewNarration } from './narration.mjs';
 
 const exec = promisify(execFile);
@@ -561,8 +560,9 @@ function buildCursorFromEventTrack(eventTrack, fallbackDuration = 0) {
 
 /**
  * Pure geometric/sample verifier for cursor accuracy (`<= thresholdPx`, default 2 px).
- * Projects expected viewport coordinates with `projectViewportToScreen` + `screenToRender`
- * at frame-aligned timestamps and compares them against observed `cursorSamples`.
+ * Projects expected viewport coordinates with `projectViewportToRender` (supporting both
+ * landscape scaling and portrait 9:16 reframing) at frame-aligned timestamps and compares
+ * them against observed `cursorSamples`.
  * Non-pixel fallback modes (`event-track-alignment`, `projection-self-check`) report
  * `checked: false, skipped: true` so pixel verification is never falsely claimed.
  */
@@ -613,19 +613,16 @@ export function verifyCursorAccuracy({
     };
   }
 
-  const cameraWidth = timeline.camera?.outputWidth;
-  const cameraHeight = timeline.camera?.outputHeight;
   const effectiveFps = fps !== undefined ? fps : timeline?.take?.fps;
 
   const projectExpected = (sourceCursor, t) => {
     const vp = sampleCursor(sourceCursor, t);
     if (!vp) return null;
-    const screen = projectViewportToScreen(vp.x, vp.y, timeline, t);
-    const rendered = screenToRender(
-      screen.x,
-      screen.y,
-      cameraWidth,
-      cameraHeight,
+    const rendered = projectViewportToRender(
+      vp.x,
+      vp.y,
+      timeline,
+      t,
       outputWidth,
       outputHeight
     );
@@ -673,12 +670,11 @@ export function verifyCursorAccuracy({
       let actualX = sample.x;
       let actualY = sample.y;
       if (sample.space === 'viewport') {
-        const projected = projectViewportToScreen(sample.x, sample.y, timeline, sampleT);
-        const rendered = screenToRender(
-          projected.x,
-          projected.y,
-          cameraWidth,
-          cameraHeight,
+        const rendered = projectViewportToRender(
+          sample.x,
+          sample.y,
+          timeline,
+          sampleT,
           outputWidth,
           outputHeight
         );
@@ -1808,12 +1804,11 @@ export async function reviewVideo({
         if (!cursorDetection.region && isFiniteNumber(cursorDetection.searchRadius) && cursorDetection.searchRadius > 0) {
           const vp = sampleCursor(timeline.overlays.cursor, frameT);
           if (vp) {
-            const expectedPt = projectViewportToScreen(vp.x, vp.y, timeline, frameT);
-            const renderedPt = screenToRender(
-              expectedPt.x,
-              expectedPt.y,
-              timeline.camera?.outputWidth,
-              timeline.camera?.outputHeight,
+            const renderedPt = projectViewportToRender(
+              vp.x,
+              vp.y,
+              timeline,
+              frameT,
               probe.width || undefined,
               probe.height || undefined
             );

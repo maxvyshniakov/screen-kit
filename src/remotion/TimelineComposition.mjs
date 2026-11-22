@@ -505,6 +505,8 @@ function renderBottomHud(gestures, keystrokes, hudAnchor) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
+        flexWrap: hudAnchor.portrait ? 'wrap' : 'nowrap',
+        ...(hudAnchor.maxWidth ? { maxWidth: hudAnchor.maxWidth } : {}),
         gap: 10 * s,
         pointerEvents: 'none',
       },
@@ -530,7 +532,8 @@ function renderBottomHud(gestures, keystrokes, hudAnchor) {
 function renderCaptions(captions, hudAnchor, hasKeystrokes) {
   if (!captions.length) return null;
   const s = captions[0].scale;
-  const extraOffset = hasKeystrokes ? 54 * s : 0;
+  const extraOffset = hasKeystrokes ? (hudAnchor.portrait ? 64 : 54) * s : 0;
+  const maxWidth = hudAnchor.maxWidth ?? 720 * s;
   return h(
     'div',
     {
@@ -543,6 +546,7 @@ function renderCaptions(captions, hudAnchor, hasKeystrokes) {
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
+        maxWidth,
         gap: 6 * s,
         pointerEvents: 'none',
       },
@@ -562,7 +566,9 @@ function renderCaptions(captions, hudAnchor, hasKeystrokes) {
             fontWeight: 500,
             textAlign: 'center',
             whiteSpace: 'pre-line',
-            maxWidth: 720 * s,
+            overflowWrap: 'break-word',
+            boxSizing: 'border-box',
+            maxWidth,
           },
         },
         caption.text

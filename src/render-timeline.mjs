@@ -15,12 +15,12 @@ import {
 import { assertValidTimeline } from './timeline.mjs';
 import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
-import { computeFrameScene, screenToRender } from './remotion/layout.mjs';
+import { computeFrameScene, projectViewportToRender, screenToRender } from './remotion/layout.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
 
-export { computeFrameScene, screenToRender };
+export { computeFrameScene, projectViewportToRender, screenToRender };
 
-export const RENDER_PROFILES = ['web-loop', 'youtube-master'];
+export const RENDER_PROFILES = ['web-loop', 'youtube-master', 'shorts'];
 const POSTER_FORMATS = new Set(['png', 'webp']);
 const SINGLE_FILE_EXTENSIONS = new Set(['mp4', 'webm', 'png', 'webp']);
 const EXTERNAL_URL_RE = /^(?:https?:|data:|blob:)/i;
@@ -65,6 +65,18 @@ function buildPresetSpec(profileId, timeline, fpsOverride) {
       codec: 'h264',
       width: 2560,
       height: 1440,
+      fps: fpsOverride ?? Math.max(timeline.take.fps, 60),
+      loop: false,
+      poster: false,
+    };
+  }
+  if (profileId === 'shorts') {
+    return {
+      id: 'shorts',
+      format: 'mp4',
+      codec: 'h264',
+      width: 1080,
+      height: 1920,
       fps: fpsOverride ?? Math.max(timeline.take.fps, 60),
       loop: false,
       poster: false,
@@ -275,6 +287,38 @@ export function resolveRenderTargets({
           fps: masterFps,
           posterTime,
           file: join(targetDir, `youtube-master-poster.${posterFormat}`),
+        });
+      }
+      continue;
+    }
+
+    if (spec.id === 'shorts') {
+      const width = evenDimension(spec.width ?? 1080);
+      const height = evenDimension(spec.height ?? 1920);
+      const shortsFps = fps ?? spec.fps ?? Math.max(timeline.take.fps, 60);
+      targets.push({
+        id: 'shorts',
+        role: 'video',
+        kind: 'video',
+        format: 'mp4',
+        codec: normalizeRemotionCodec(spec.codec, 'mp4'),
+        width,
+        height,
+        fps: shortsFps,
+        loop: Boolean(spec.loop),
+        file: join(targetDir, 'shorts.mp4'),
+      });
+      if (spec.poster === true) {
+        targets.push({
+          id: 'shorts',
+          role: 'poster',
+          kind: 'still',
+          format: posterFormat,
+          width,
+          height,
+          fps: shortsFps,
+          posterTime,
+          file: join(targetDir, `shorts-poster.${posterFormat}`),
         });
       }
       continue;

@@ -1,7 +1,9 @@
 import {
+  cameraViewportRect,
+  portraitBaseDimensions,
+  projectViewportToStage,
   sampleCamera,
   sampleCursor,
-  projectViewportToScreen,
 } from '../timeline.mjs';
 
 const EXTERNAL_URL_RE = /^(?:https?:|data:|blob:)/i;
@@ -288,18 +290,179 @@ export function screenToRender(
   };
 }
 
+const PORTRAIT_SMOOTH_HALF_WINDOW = 0.25;
+const PORTRAIT_SMOOTH_OFFSETS = [-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1];
+
+/** Return true when the render target is portrait (`renderHeight > renderWidth`, e.g. 9:16 Shorts). */
+export function isPortraitOutput(renderWidth, renderHeight) {
+  return (
+    Number.isFinite(renderWidth) &&
+    Number.isFinite(renderHeight) &&
+    renderWidth > 0 &&
+    renderHeight > 0 &&
+    renderHeight > renderWidth
+  );
+}
+
+function shouldUsePortraitReframe(camera, renderWidth, renderHeight) {
+  if (!isPortraitOutput(renderWidth, renderHeight)) return false;
+  if (!camera) return false;
+  if (Array.isArray(camera.verticalKeyframes) && camera.verticalKeyframes.length > 0) {
+    return true;
+  }
+  return (
+    Number.isFinite(camera.outputWidth) &&
+    Number.isFinite(camera.outputHeight) &&
+    camera.outputWidth >= camera.outputHeight
+  );
+}
+
+function clampPortraitSampleToStage(sample, baseWidth, baseHeight, stage) {
+  const zoom = Number.isFinite(sample.zoom) && sample.zoom > 0 ? Math.max(1, sample.zoom) : 1;
+  const visW = baseWidth / zoom;
+  const visH = baseHeight / zoom;
+  const halfW = visW / 2;
+  const halfH = visH / 2;
+
+  const minX = halfW;
+  const maxX = stage.width - halfW;
+  const minY = halfH;
+  const maxY = stage.height - halfH;
+
+  const x = minX <= maxX ? Math.min(maxX, Math.max(minX, sample.x)) : stage.width / 2;
+  const y = minY <= maxY ? Math.min(maxY, Math.max(minY, sample.y)) : stage.height / 2;
+  return {
+    x: Object.is(x, -0) ? 0 : x,
+    y: Object.is(y, -0) ? 0 : y,
+    zoom,
+  };
+}
+
+function samplePortraitSmartFollow(timeline, camera, t, baseWidth, baseHeight, stage) {
+  const rawFocusAt = (tau) => {
+    const camSample = sampleCamera(camera, tau);
+    const camRect = cameraViewportRect(camera, camSample);
+    let focusX = camSample.x;
+    let focusY = camSample.y;
+    let cursorStage = null;
+
+    if (timeline?.overlays?.cursor && timeline?.take?.viewport && timeline?.window) {
+      const rawCursor = sampleCursor(timeline.overlays.cursor, tau);
+      if (rawCursor && rawCursor.visible) {
+        cursorStage = projectViewportToStage(rawCursor.x, rawCursor.y, timeline);
+        const marginX = Math.max(1, camRect.width * 0.15);
+        const marginY = Math.max(1, camRect.height * 0.15);
+        const distOutX = Math.max(0, camRect.left - cursorStage.x, cursorStage.x - camRect.right);
+        const distOutY = Math.max(0, camRect.top - cursorStage.y, cursorStage.y - camRect.bottom);
+        const outsideRatio = Math.max(distOutX / marginX, distOutY / marginY);
+        const cursorWeight = Math.max(0, Math.min(1, 1 - outsideRatio));
+
+        const weight = camSample.zoom <= 1.05 ? cursorWeight : cursorWeight * 0.7;
+        focusX = camSample.x + (cursorStage.x - camSample.x) * weight;
+        focusY = camSample.y + (cursorStage.y - camSample.y) * weight;
+      }
+    }
+
+    const portraitZoom = camSample.zoom > 1 ? 1 + (camSample.zoom - 1) * 0.5 : 1;
+    return { x: focusX, y: focusY, zoom: portraitZoom, cursorStage, camSample, camRect };
+  };
+
+  const duration =
+    Number.isFinite(timeline?.take?.duration) && timeline.take.duration > 0
+      ? timeline.take.duration
+      : 0;
+
+  let sumW = 0;
+  let smoothX = 0;
+  let smoothY = 0;
+  let smoothZoom = 0;
+
+  for (const u of PORTRAIT_SMOOTH_OFFSETS) {
+    const w = 0.5 * (1 + Math.cos(Math.PI * u * 0.85));
+    const shifted = t + u * PORTRAIT_SMOOTH_HALF_WINDOW;
+    const tau = duration > 0 ? Math.max(0, Math.min(duration, shifted)) : Math.max(0, shifted);
+    const pt = rawFocusAt(tau);
+    smoothX += pt.x * w;
+    smoothY += pt.y * w;
+    smoothZoom += pt.zoom * w;
+    sumW += w;
+  }
+
+  let x = smoothX / sumW;
+  let y = smoothY / sumW;
+  const zoom = Math.max(1, smoothZoom / sumW);
+
+  // Keep instantaneous visible cursor within the inner 70% of the portrait crop when in landscape view
+  const now = rawFocusAt(t);
+  if (now.cursorStage) {
+    const { camRect } = now;
+    const inLandscapeView =
+      now.cursorStage.x >= camRect.left &&
+      now.cursorStage.x <= camRect.right &&
+      now.cursorStage.y >= camRect.top &&
+      now.cursorStage.y <= camRect.bottom;
+    if (inLandscapeView) {
+      const visW = baseWidth / zoom;
+      const visH = baseHeight / zoom;
+      const maxLeadX = visW * 0.35;
+      const maxLeadY = visH * 0.35;
+      if (now.cursorStage.x - x > maxLeadX) x = now.cursorStage.x - maxLeadX;
+      else if (x - now.cursorStage.x > maxLeadX) x = now.cursorStage.x + maxLeadX;
+      if (now.cursorStage.y - y > maxLeadY) y = now.cursorStage.y - maxLeadY;
+      else if (y - now.cursorStage.y > maxLeadY) y = now.cursorStage.y + maxLeadY;
+    }
+  }
+
+  return clampPortraitSampleToStage({ x, y, zoom }, baseWidth, baseHeight, stage);
+}
+
 /**
  * Compute camera sample and stage-to-render-frame affine transform at timestamp `t`.
  * Supports output profiles (`renderWidth x renderHeight`) that scale relative to
- * `camera.outputWidth x camera.outputHeight` (e.g. 2560x1440 YouTube master).
+ * `camera.outputWidth x camera.outputHeight` (e.g. 2560x1440 YouTube master),
+ * as well as portrait 9:16 vertical reframing (e.g. 1080x1920 Shorts) via optional
+ * `camera.verticalKeyframes` or automatic smart-follow clamped inside stage bounds.
  */
-export function computeCameraTransform(camera, t, renderWidth, renderHeight) {
-  const sample = sampleCamera(camera, t);
+export function computeCameraTransform(camera, t, renderWidth, renderHeight, timeline = null) {
+  const portrait = isPortraitOutput(renderWidth, renderHeight);
+  const reframed = shouldUsePortraitReframe(camera, renderWidth, renderHeight);
+
+  let effectiveOutputWidth = camera.outputWidth;
+  let effectiveOutputHeight = camera.outputHeight;
+  let sample;
+  let mode = 'standard';
+
+  if (reframed) {
+    const stage =
+      timeline?.stage &&
+      Number.isFinite(timeline.stage.width) &&
+      timeline.stage.width > 0 &&
+      Number.isFinite(timeline.stage.height) &&
+      timeline.stage.height > 0
+        ? timeline.stage
+        : { width: camera.outputWidth, height: camera.outputHeight };
+    const renderAspect = renderWidth / renderHeight;
+    const base = portraitBaseDimensions(stage, renderAspect);
+    effectiveOutputWidth = base.width;
+    effectiveOutputHeight = base.height;
+
+    if (Array.isArray(camera.verticalKeyframes) && camera.verticalKeyframes.length > 0) {
+      const rawVertical = sampleCamera({ keyframes: camera.verticalKeyframes }, t);
+      sample = clampPortraitSampleToStage(rawVertical, base.width, base.height, stage);
+      mode = 'portrait-vertical-keyframes';
+    } else {
+      sample = samplePortraitSmartFollow(timeline, camera, t, base.width, base.height, stage);
+      mode = 'portrait-smart-follow';
+    }
+  } else {
+    sample = sampleCamera(camera, t);
+  }
+
   const frameMap = screenToRender(
     0,
     0,
-    camera.outputWidth,
-    camera.outputHeight,
+    effectiveOutputWidth,
+    effectiveOutputHeight,
     renderWidth,
     renderHeight
   );
@@ -308,7 +471,24 @@ export function computeCameraTransform(camera, t, renderWidth, renderHeight) {
   const translateX = offsetX + logicalWidth / 2 - sample.x * effectiveScale;
   const translateY = offsetY + logicalHeight / 2 - sample.y * effectiveScale;
 
+  const visW = effectiveOutputWidth / sample.zoom;
+  const visH = effectiveOutputHeight / sample.zoom;
+  const visibleRect = {
+    left: Object.is(sample.x - visW / 2, -0) ? 0 : sample.x - visW / 2,
+    top: Object.is(sample.y - visH / 2, -0) ? 0 : sample.y - visH / 2,
+    right: Object.is(sample.x + visW / 2, -0) ? 0 : sample.x + visW / 2,
+    bottom: Object.is(sample.y + visH / 2, -0) ? 0 : sample.y + visH / 2,
+    width: visW,
+    height: visH,
+  };
+
   return {
+    mode,
+    portrait,
+    reframed,
+    outputWidth: effectiveOutputWidth,
+    outputHeight: effectiveOutputHeight,
+    visibleRect,
     sample,
     outputScale,
     offsetX,
@@ -319,6 +499,47 @@ export function computeCameraTransform(camera, t, renderWidth, renderHeight) {
     translateX,
     translateY,
     cssTransform: `translate(${translateX}px, ${translateY}px) scale(${effectiveScale})`,
+  };
+}
+
+/**
+ * Project a viewport-space point `(vx, vy)` directly into rendered frame coordinates
+ * `(renderWidth x renderHeight)` at timestamp `t`, honoring both landscape scaling and
+ * portrait 9:16 vertical reframing.
+ */
+export function projectViewportToRender(
+  vx,
+  vy,
+  timeline,
+  t,
+  renderWidth,
+  renderHeight,
+  cameraStateOverride = null
+) {
+  const cameraState =
+    cameraStateOverride ??
+    computeCameraTransform(timeline.camera, t, renderWidth, renderHeight, timeline);
+  const stagePoint = projectViewportToStage(vx, vy, timeline);
+  const screenX =
+    (stagePoint.x - cameraState.sample.x) * cameraState.sample.zoom + cameraState.outputWidth / 2;
+  const screenY =
+    (stagePoint.y - cameraState.sample.y) * cameraState.sample.zoom + cameraState.outputHeight / 2;
+  const mapped = screenToRender(
+    screenX,
+    screenY,
+    cameraState.outputWidth,
+    cameraState.outputHeight,
+    renderWidth,
+    renderHeight
+  );
+  return {
+    x: Object.is(mapped.x, -0) ? 0 : mapped.x,
+    y: Object.is(mapped.y, -0) ? 0 : mapped.y,
+    screenX: Object.is(screenX, -0) ? 0 : screenX,
+    screenY: Object.is(screenY, -0) ? 0 : screenY,
+    stageX: stagePoint.x,
+    stageY: stagePoint.y,
+    cameraState,
   };
 }
 
@@ -351,38 +572,43 @@ const GESTURE_LABELS = {
  * track zoomed/panned targets accurately while their visual scale stays constant (`outputScale`),
  * independent of `camera.zoom`.
  */
-export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight) {
-  const cameraState = computeCameraTransform(timeline.camera, t, renderWidth, renderHeight);
-  const { outputScale, offsetX, offsetY, logicalWidth, logicalHeight } = cameraState;
+export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, cameraStateOverride = null) {
+  const cameraState =
+    cameraStateOverride ??
+    computeCameraTransform(timeline.camera, t, renderWidth, renderHeight, timeline);
+  const { offsetX, offsetY, logicalWidth, logicalHeight, portrait } = cameraState;
+  const effectiveRenderWidth =
+    Number.isFinite(renderWidth) && renderWidth > 0 ? renderWidth : cameraState.outputWidth;
+  const effectiveRenderHeight =
+    Number.isFinite(renderHeight) && renderHeight > 0 ? renderHeight : cameraState.outputHeight;
+  const overlayScale = portrait ? effectiveRenderWidth / 720 : cameraState.outputScale;
 
-  const toRenderPoint = (screenPoint) => {
-    const pt = screenToRender(
-      screenPoint.x,
-      screenPoint.y,
-      timeline.camera.outputWidth,
-      timeline.camera.outputHeight,
-      renderWidth,
-      renderHeight
+  const projectPoint = (vx, vy) =>
+    projectViewportToRender(
+      vx,
+      vy,
+      timeline,
+      t,
+      effectiveRenderWidth,
+      effectiveRenderHeight,
+      cameraState
     );
-    return { x: pt.x, y: pt.y };
-  };
 
   // 1. Cursor overlay
   let cursor = null;
   const rawCursor = sampleCursor(timeline.overlays?.cursor, t);
   if (rawCursor && rawCursor.visible) {
-    const screenPoint = projectViewportToScreen(rawCursor.x, rawCursor.y, timeline, t);
-    const renderPoint = toRenderPoint(screenPoint);
+    const projected = projectPoint(rawCursor.x, rawCursor.y);
     cursor = {
       style: timeline.overlays.cursor.style ?? 'macos',
       viewportX: rawCursor.x,
       viewportY: rawCursor.y,
-      screenX: screenPoint.x,
-      screenY: screenPoint.y,
-      x: renderPoint.x,
-      y: renderPoint.y,
+      screenX: projected.screenX,
+      screenY: projected.screenY,
+      x: projected.x,
+      y: projected.y,
       pressed: rawCursor.pressed,
-      scale: outputScale,
+      scale: overlayScale,
       pressScale: rawCursor.pressed ? 0.88 : 1,
     };
   }
@@ -393,25 +619,24 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight) {
     if (t < ripple.t || t > ripple.t + ripple.duration) continue;
     const progress = Math.min(1, Math.max(0, (t - ripple.t) / ripple.duration));
     const eased = 1 - (1 - progress) ** 3;
-    const screenPoint = projectViewportToScreen(ripple.x, ripple.y, timeline, t);
-    const renderPoint = toRenderPoint(screenPoint);
+    const projected = projectPoint(ripple.x, ripple.y);
     ripples.push({
       key: `ripple-${index}-${ripple.t}`,
       button: ripple.button,
       progress,
-      screenX: screenPoint.x,
-      screenY: screenPoint.y,
-      x: renderPoint.x,
-      y: renderPoint.y,
-      scale: outputScale,
-      radius: (8 + 28 * eased) * outputScale,
-      strokeWidth: Math.max(1.5, 2.5 * (1 - progress * 0.4) * outputScale),
+      screenX: projected.screenX,
+      screenY: projected.screenY,
+      x: projected.x,
+      y: projected.y,
+      scale: overlayScale,
+      radius: (8 + 28 * eased) * overlayScale,
+      strokeWidth: Math.max(1.5, 2.5 * (1 - progress * 0.4) * overlayScale),
       opacity: Math.max(0, (1 - progress) ** 1.4 * 0.9),
       color: RIPPLE_COLORS[ripple.button] ?? RIPPLE_COLORS.left,
     });
   }
 
-const MIN_HUD_DURATION = 1.0;
+  const MIN_HUD_DURATION = 1.0;
 
   // 3. Wheel / trackpad / drag gesture indicators (minimum 1.0s visible duration; latest active wins)
   const gestures = [];
@@ -424,8 +649,7 @@ const MIN_HUD_DURATION = 1.0;
     );
     if (t < gesture.t || t > gesture.t + displayDuration) continue;
     const progress = Math.min(1, Math.max(0, (t - gesture.t) / Math.max(displayDuration, 0.001)));
-    const screenPoint = projectViewportToScreen(gesture.x, gesture.y, timeline, t);
-    const renderPoint = toRenderPoint(screenPoint);
+    const projected = projectPoint(gesture.x, gesture.y);
     const magnitude = Math.hypot(gesture.deltaX, gesture.deltaY);
     const angleDeg = magnitude > 0 ? (Math.atan2(gesture.deltaY, gesture.deltaX) * 180) / Math.PI : 90;
     gestures.push({
@@ -433,15 +657,15 @@ const MIN_HUD_DURATION = 1.0;
       kind: gesture.kind,
       label: GESTURE_LABELS[gesture.kind] ?? gesture.kind,
       progress,
-      screenX: screenPoint.x,
-      screenY: screenPoint.y,
-      x: renderPoint.x,
-      y: renderPoint.y,
+      screenX: projected.screenX,
+      screenY: projected.screenY,
+      x: projected.x,
+      y: projected.y,
       deltaX: gesture.deltaX,
       deltaY: gesture.deltaY,
       magnitude,
       angleDeg,
-      scale: outputScale,
+      scale: overlayScale,
       opacity: envelopeOpacity(progress, 0.1, 0.22),
     });
   }
@@ -453,7 +677,7 @@ const MIN_HUD_DURATION = 1.0;
     if (t < ks.t || t > ks.t + displayDuration) continue;
     const progress = Math.min(1, Math.max(0, (t - ks.t) / displayDuration));
     const opacity = envelopeOpacity(progress, 0.08, 0.2);
-    const liftPx = (1 - Math.min(1, progress / 0.1)) * 6 * outputScale;
+    const liftPx = (1 - Math.min(1, progress / 0.1)) * 6 * overlayScale;
     keystrokes.push({
       key: `keystroke-${index}-${ks.t}`,
       label: ks.label,
@@ -461,7 +685,7 @@ const MIN_HUD_DURATION = 1.0;
       progress,
       opacity,
       liftPx,
-      scale: outputScale,
+      scale: overlayScale,
     });
   }
 
@@ -474,18 +698,43 @@ const MIN_HUD_DURATION = 1.0;
         captions.push({
           key: `caption-${index}-${cue.start}`,
           text: cue.text,
-          scale: outputScale,
+          scale: overlayScale,
         });
       }
     }
   }
 
-  return {
-    scale: outputScale,
-    hudAnchor: {
+  let hudAnchor;
+  if (portrait) {
+    const safeLeft = Math.round(effectiveRenderWidth * (48 / 1080));
+    const safeRight = Math.round(effectiveRenderWidth * (144 / 1080));
+    const safeBottom = Math.round(effectiveRenderHeight * (240 / 1920));
+    const safeTop = Math.round(effectiveRenderHeight * (120 / 1920));
+    const safeWidth = Math.max(120, effectiveRenderWidth - safeLeft - safeRight);
+    hudAnchor = {
+      centerX: safeLeft + safeWidth / 2,
+      bottomY: effectiveRenderHeight - safeBottom,
+      maxWidth: safeWidth,
+      safeMargins: {
+        left: safeLeft,
+        right: safeRight,
+        bottom: safeBottom,
+        top: safeTop,
+      },
+      portrait: true,
+    };
+  } else {
+    hudAnchor = {
       centerX: offsetX + logicalWidth / 2,
-      bottomY: offsetY + logicalHeight - 40 * outputScale,
-    },
+      bottomY: offsetY + logicalHeight - 40 * overlayScale,
+      maxWidth: 720 * overlayScale,
+      portrait: false,
+    };
+  }
+
+  return {
+    scale: overlayScale,
+    hudAnchor,
     cursor,
     ripples,
     gestures,
@@ -506,8 +755,8 @@ export function computeFrameScene(timeline, { frame = 0, fps, width, height, map
 
   const stageBackground = computeStageBackground(timeline.stage.background, mapAsset);
   const windowChrome = computeWindowChrome(timeline.window);
-  const camera = computeCameraTransform(timeline.camera, t, renderWidth, renderHeight);
-  const overlays = computeOverlaysAtTime(timeline, t, renderWidth, renderHeight);
+  const camera = computeCameraTransform(timeline.camera, t, renderWidth, renderHeight, timeline);
+  const overlays = computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, camera);
   const videoSrc = resolveAssetUrl(timeline.take.video, mapAsset);
   const audioTracks = (timeline.audio?.tracks ?? []).map((track) => ({
     ...track,

@@ -38,6 +38,7 @@ export const AUDIO_TRACK_KINDS = ['narration', 'sfx', 'music'];
 export const STEP_CAMERA_FOCUSES = ['target', 'pointer', 'window'];
 export const DEFAULT_STEP_CAMERA_LEAD = 0.85;
 export const DEFAULT_STEP_CAMERA_HOLD = 0.35;
+export const DEFAULT_PORTRAIT_ASPECT_RATIO = 9 / 16;
 
 const EVENT_TYPES = new Set([
   'pointermove',
@@ -203,6 +204,25 @@ export function cameraViewportRect(camera, sampleOrTime) {
     top,
     right: normalizeZero(left + width),
     bottom: normalizeZero(top + height),
+    width: normalizeZero(width),
+    height: normalizeZero(height),
+  };
+}
+
+/**
+ * Compute the maximum stage-space `(width, height)` rectangle matching `aspectRatio`
+ * (default 9:16) that fits strictly inside `stage`.
+ */
+export function portraitBaseDimensions(stage, aspectRatio = DEFAULT_PORTRAIT_ASPECT_RATIO) {
+  if (!isObject(stage) || !isPositiveNumber(stage.width) || !isPositiveNumber(stage.height)) {
+    throw Error('stage must have positive width and height');
+  }
+  if (!isPositiveNumber(aspectRatio)) {
+    throw Error('aspectRatio must be a positive finite number');
+  }
+  const height = Math.min(stage.height, stage.width / aspectRatio);
+  const width = height * aspectRatio;
+  return {
     width: normalizeZero(width),
     height: normalizeZero(height),
   };
@@ -828,6 +848,88 @@ export function validateTimeline(timeline) {
         }
       }
     }
+
+    if (camera.verticalKeyframes !== undefined) {
+      if (!Array.isArray(camera.verticalKeyframes) || camera.verticalKeyframes.length === 0) {
+        errors.push('timeline.camera.verticalKeyframes must be a non-empty array when provided');
+      } else {
+        const portraitOut = Array.isArray(timeline.outputs)
+          ? timeline.outputs.find(
+              (o) => isObject(o) && isPositiveNumber(o.width) && isPositiveNumber(o.height) && o.height > o.width
+            )
+          : null;
+        const portraitAspect = portraitOut
+          ? portraitOut.width / portraitOut.height
+          : DEFAULT_PORTRAIT_ASPECT_RATIO;
+        const verticalCamera = stageValidDimensions
+          ? (() => {
+              const base = portraitBaseDimensions(timeline.stage, portraitAspect);
+              return {
+                outputWidth: base.width,
+                outputHeight: base.height,
+                keyframes: camera.verticalKeyframes,
+              };
+            })()
+          : null;
+
+        let verticalStructurallyValid = true;
+        let prevVT = 0;
+        camera.verticalKeyframes.forEach((kf, index) => {
+          const prefix = `timeline.camera.verticalKeyframes[${index}]`;
+          if (!isObject(kf)) {
+            errors.push(`${prefix} must be an object`);
+            verticalStructurallyValid = false;
+            return;
+          }
+          const tOk = isNonNegativeNumber(kf.t);
+          const xOk = isFiniteNumber(kf.x);
+          const yOk = isFiniteNumber(kf.y);
+          const zoomOk = isPositiveNumber(kf.zoom);
+          const easingOk = CAMERA_EASINGS.includes(kf.easing);
+
+          if (!tOk) errors.push(`${prefix}.t must be a non-negative finite number`);
+          else {
+            if (index > 0 && kf.t < prevVT) {
+              errors.push(`${prefix}.t (${kf.t}) must be monotonically non-decreasing (previous ${prevVT})`);
+              verticalStructurallyValid = false;
+            }
+            prevVT = kf.t;
+          }
+          if (!xOk) errors.push(`${prefix}.x must be a finite number`);
+          if (!yOk) errors.push(`${prefix}.y must be a finite number`);
+          if (!zoomOk) errors.push(`${prefix}.zoom must be a positive finite number`);
+          if (!easingOk) errors.push(`${prefix}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
+
+          if (!(tOk && xOk && yOk && zoomOk && easingOk)) {
+            verticalStructurallyValid = false;
+            return;
+          }
+
+          if (verticalCamera) {
+            checkCameraBounds(errors, `${prefix} (t=${kf.t})`, verticalCamera, timeline.stage, kf);
+          }
+        });
+
+        if (verticalStructurallyValid && verticalCamera) {
+          for (let i = 0; i + 1 < camera.verticalKeyframes.length; i += 1) {
+            const from = camera.verticalKeyframes[i];
+            const to = camera.verticalKeyframes[i + 1];
+            if (to.t <= from.t) continue;
+            for (let step = 1; step < BOUND_SAMPLE_SUBDIVISIONS; step += 1) {
+              const t = from.t + ((to.t - from.t) * step) / BOUND_SAMPLE_SUBDIVISIONS;
+              const sample = sampleCamera(verticalCamera, t);
+              checkCameraBounds(
+                errors,
+                `timeline.camera.verticalKeyframes segment ${i}->${i + 1} (t=${t.toFixed(4)})`,
+                verticalCamera,
+                timeline.stage,
+                sample
+              );
+            }
+          }
+        }
+      }
+    }
   }
 
   // overlays
@@ -1175,6 +1277,16 @@ function buildOutputProfiles(recipeOutputs, camera, take) {
       codec: 'h264',
       width: 2560,
       height: 1440,
+      fps: Math.max(take.fps, 60),
+      loop: false,
+      poster: false,
+    },
+    shorts: {
+      id: 'shorts',
+      format: 'mp4',
+      codec: 'h264',
+      width: 1080,
+      height: 1920,
       fps: Math.max(take.fps, 60),
       loop: false,
       poster: false,
@@ -1898,14 +2010,11 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     );
   };
 
-  const rawKeyframes = recipeCamera.keyframes;
-  let keyframes = null;
-
-  if (Array.isArray(rawKeyframes) && rawKeyframes.length > 0) {
-    keyframes = rawKeyframes.map((kf, index) => {
+  const compileRawKeyframes = (list, refWidth, refHeight, labelPrefix) =>
+    list.map((kf, index) => {
       if (!isObject(kf)) return kf;
       if (kf.clampToWindow !== undefined && typeof kf.clampToWindow !== 'boolean') {
-        throw Error(`timeline.camera.keyframes[${index}].clampToWindow must be a boolean`);
+        throw Error(`${labelPrefix}[${index}].clampToWindow must be a boolean`);
       }
       const zoom = kf.zoom ?? 1;
       const rawTarget = kf.target ?? kf.focus;
@@ -1934,13 +2043,13 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
         isFiniteNumber(targetX) &&
         isFiniteNumber(targetY) &&
         isPositiveNumber(zoom) &&
-        isPositiveNumber(outputWidth) &&
-        isPositiveNumber(outputHeight) &&
+        isPositiveNumber(refWidth) &&
+        isPositiveNumber(refHeight) &&
         isPositiveNumber(stage.width) &&
         isPositiveNumber(stage.height)
       ) {
-        const halfW = outputWidth / (2 * zoom);
-        const halfH = outputHeight / (2 * zoom);
+        const halfW = refWidth / (2 * zoom);
+        const halfH = refHeight / (2 * zoom);
         if (shouldClampToWindow && isPositiveNumber(win.width) && isPositiveNumber(win.height)) {
           targetX = clampCameraAxisToBox(targetX, halfW, win.x, win.x + win.width);
           targetY = clampCameraAxisToBox(targetY, halfH, win.y, win.y + win.height);
@@ -1957,6 +2066,12 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
         easing: normalizeEasing(kf.easing, index === 0 ? 'linear' : 'ease-in-out'),
       };
     });
+
+  const rawKeyframes = recipeCamera.keyframes;
+  let keyframes = null;
+
+  if (Array.isArray(rawKeyframes) && rawKeyframes.length > 0) {
+    keyframes = compileRawKeyframes(rawKeyframes, outputWidth, outputHeight, 'timeline.camera.keyframes');
   } else if (recipeCamera.fromSteps !== false) {
     keyframes = compileStepCameraKeyframes({
       events: eventTrack.events,
@@ -1988,10 +2103,34 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     keyframes,
   };
 
+  const outputs = buildOutputProfiles(effectiveRecipe.outputs, camera, resolvedTake);
+
+  if (recipeCamera.verticalKeyframes !== undefined) {
+    if (Array.isArray(recipeCamera.verticalKeyframes) && recipeCamera.verticalKeyframes.length > 0) {
+      const portraitOut = outputs.find(
+        (o) => isObject(o) && isPositiveNumber(o.width) && isPositiveNumber(o.height) && o.height > o.width
+      );
+      const portraitAspect = portraitOut
+        ? portraitOut.width / portraitOut.height
+        : DEFAULT_PORTRAIT_ASPECT_RATIO;
+      const verticalBase =
+        isPositiveNumber(stage.width) && isPositiveNumber(stage.height)
+          ? portraitBaseDimensions(stage, portraitAspect)
+          : { width: outputWidth, height: outputHeight };
+      camera.verticalKeyframes = compileRawKeyframes(
+        recipeCamera.verticalKeyframes,
+        verticalBase.width,
+        verticalBase.height,
+        'timeline.camera.verticalKeyframes'
+      );
+    } else {
+      camera.verticalKeyframes = recipeCamera.verticalKeyframes;
+    }
+  }
+
   const audio = {
     tracks: Array.isArray(effectiveRecipe.audio?.tracks) ? structuredClone(effectiveRecipe.audio.tracks) : [],
   };
-  const outputs = buildOutputProfiles(effectiveRecipe.outputs, camera, resolvedTake);
 
   const timeline = {
     version: TIMELINE_VERSION,
