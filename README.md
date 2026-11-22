@@ -15,6 +15,7 @@
 
 ## Why screen-kit?
 
+- **Living docs & website screenshots that never go stale** — keeping screenshots and feature clips up to date on a product site or docs portal is a notorious chore every time the UI changes. With `screen-kit`, you drop a declarative capture recipe into the consumer repository **once** and forget about manual screenshotting. Whenever the app evolves, run `screen-kit` (or let an agent run it in CI) to regenerate every screenshot, dark/light theme composite, cropped callout, and demo clip with verifiable provenance (`run.json`) and `--baseline` visual diffs.
 - **Built for AI agents and CI from day one** — every step has a CLI and JSON contract (`capture` → `timeline` → `preview` → `narrate` → `audio-mix` → `render` → `review` → `publish`). No GUI editor required.
 - **100% real UI, reusable takes** — capture once at Retina 2× / 60 fps (`quality` mode behind windows on macOS or headless on Linux/CI), then re-edit camera choreography, overlays, narration languages, or aspect ratios without relaunching your app.
 - **Cinematic motion without manual keyframing** — semantic DOM locators (`selector`, `role`, `text`, `label`), minimum-jerk pointer trajectories, 60 Hz eased wheel/pinch sub-steps, and smooth `sine-in-out` per-step camera glides (`clampToWindow` prevents dark stage edges).
@@ -22,6 +23,22 @@
 - **Multi-format & multi-language from one take** — export 16:9 `youtube-master`, `web-loop`, and `shorts` (9:16 `1080×1920 @ 60 fps` with smart-follow camera & safe HUD zones) in any language (`en`, `uk`, etc.).
 - **Native macOS & browser chrome** — `macos-inset` (macOS Tahoe `hiddenInset` overlay traffic lights, zero extra bar), `macos`, `browser`, `device`, or `none`.
 - **Automated quality gates** — contact sheets, baseline pixel diffs, freeze/black/gap detection, `ebur128` loudness checks, Netflix caption rule validation, `--verify-cursor` (`<= 2 px` pixel-marker verification), and optional Gemini multimodal visual review.
+
+---
+
+## Living Docs & Marketing Media (Write Once, Refresh Anytime)
+
+Instead of manually retaking, cropping, and re-framing dozens of screenshots every release:
+
+1. **Define recipes alongside your app or docs** (`screens.mjs` / `screen-kit.config.mjs`) — one entry per docs screenshot, dark/light theme stack, terminal animation, or feature demo video.
+2. **After any UI change, let an agent or script refresh everything in one command:**
+
+```sh
+screen-kit capture --config docs/screens.mjs --out docs/public/media
+screen-kit review --manifest docs/public/media/run.json --baseline docs/baselines
+```
+
+3. **Review what changed without clicking through every page** — `run.json` records the exact source git revision, SHA-256 hashes, dimensions, and checkpoints, while `review` generates side-by-side diffs and contact sheets so you only inspect real visual changes.
 
 ---
 
