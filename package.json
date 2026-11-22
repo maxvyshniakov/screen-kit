@@ -4,7 +4,33 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.4",
-  "description": "Reproducible browser and terminal screenshots, animations and recordings.",
+  "description": "Agent-operated product demo video, screenshot, and terminal recording pipeline with Remotion 4, Display P3, Gemini TTS, Shorts 9:16, and automated QA.",
+  "homepage": "https://github.com/maxvyshniakov/screen-kit#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxvyshniakov/screen-kit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/maxvyshniakov/screen-kit/issues"
+  },
+  "keywords": [
+    "screen-recording",
+    "product-demo",
+    "demo-video",
+    "remotion",
+    "playwright",
+    "ffmpeg",
+    "display-p3",
+    "ai-agents",
+    "screenshots",
+    "terminal-recording",
+    "asciinema",
+    "youtube-shorts",
+    "gemini-tts",
+    "whisper",
+    "subtitles",
+    "cli"
+  ],
   "bin": {
     "screen-kit": "src/cli.mjs"
   },

@@ -1,95 +1,202 @@
 # screen-kit
 
-Reproducible browser and terminal screenshots, animations and recordings. Recipes live with
-products; screen-kit owns capture, saved takes, export and verification. The package is not published to a registry.
+[![CI](https://github.com/maxvyshniakov/screen-kit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/maxvyshniakov/screen-kit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maxvyshniakov/screen-kit)](https://github.com/maxvyshniakov/screen-kit/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#setup)
 
-## Local setup
+**Programmatic, agent-operated product demo videos, screenshots, and terminal recordings.**
+
+`screen-kit` turns declarative JavaScript recipes into polished, verified product demos — driving **real browser and PTY terminal input** (never synthesized UI), compiling into a renderer-neutral `timeline.json`, and rendering headlessly via **Remotion 4** in **Display P3 wide-gamut** across **16:9 YouTube**, **web loops**, and **9:16 Shorts** — complete with **Gemini 2.5 Pro TTS / Kokoro narration**, **Whisper forced word alignment**, **procedural UI SFX**, **voice-ducked music beds**, and **automated pixel-level QA**.
+
+> Recipes live in your product repository. `screen-kit` owns capture, reusable takes, timeline choreography, rendering, narration, audio mixing, and machine-checkable review.
+
+---
+
+## Why screen-kit?
+
+- **Built for AI agents and CI from day one** — every step has a CLI and JSON contract (`capture` → `timeline` → `preview` → `narrate` → `audio-mix` → `render` → `review` → `publish`). No GUI editor required.
+- **100% real UI, reusable takes** — capture once at Retina 2× / 60 fps (`quality` mode behind windows on macOS or headless on Linux/CI), then re-edit camera choreography, overlays, narration languages, or aspect ratios without relaunching your app.
+- **Cinematic motion without manual keyframing** — semantic DOM locators (`selector`, `role`, `text`, `label`), minimum-jerk pointer trajectories, 60 Hz eased wheel/pinch sub-steps, and smooth `sine-in-out` per-step camera glides (`clampToWindow` prevents dark stage edges).
+- **Display P3 wide-gamut end-to-end** — preserves `smpte432` / `iec61966-2-1` color from Chromium capture through frame-hold padding and Remotion 4 MP4/WebM export.
+- **Multi-format & multi-language from one take** — export 16:9 `youtube-master`, `web-loop`, and `shorts` (9:16 `1080×1920 @ 60 fps` with smart-follow camera & safe HUD zones) in any language (`en`, `uk`, etc.).
+- **Native macOS & browser chrome** — `macos-inset` (macOS Tahoe `hiddenInset` overlay traffic lights, zero extra bar), `macos`, `browser`, `device`, or `none`.
+- **Automated quality gates** — contact sheets, baseline pixel diffs, freeze/black/gap detection, `ebur128` loudness checks, Netflix caption rule validation, `--verify-cursor` (`<= 2 px` pixel-marker verification), and optional Gemini multimodal visual review.
+
+---
+
+## Pipeline Overview
+
+```text
+recipe.mjs (in consumer repo)
+   │
+   ▼  screen-kit capture
+raw take (take.mp4 / take.cast) + event-track.json + run.json
+   │
+   ▼  screen-kit timeline
+timeline.json v1  (stage, window chrome, camera keyframes, overlays, outputs)
+   │
+   ├──▶ screen-kit preview      → fast contact sheet of key step frames
+   ├──▶ screen-kit narrate      → Gemini 2.5 Pro TTS / Kokoro + Whisper alignment + SRT/VTT
+   ├──▶ screen-kit audio-mix    → voice + procedural UI SFX + -30 LUFS music with voice ducking
+   │
+   ▼  screen-kit render (Remotion 4, Display P3)
+youtube-master.mp4 (16:9) · web-loop.webm · shorts.mp4 (9:16) · poster.png
+   │
+   ▼  screen-kit review
+review.json (provenance, --verify-cursor <= 2px, ebur128, Netflix captions, contact sheet)
+   │
+   ▼  screen-kit publish (opt-in)
+web bundle (VP9/AV1 + H.264 + WebP poster + embed.html) · YouTube upload (--dry-run supported)
+```
+
+---
+
+## Setup
+
+### macOS
 
 ```sh
 bun install
 bun link
-brew install agg webp ffmpeg   # macOS: terminal exports and video; Python 3 is also required
-# Linux (Debian/Ubuntu): sudo apt-get install -y ffmpeg webp python3, plus agg >= 1.9 from github.com/asciinema/agg/releases
+brew install agg webp ffmpeg   # Python 3 is also required for PTY terminal capture
 screen-kit --help
 ```
 
-Browser capture needs `agent-browser` on PATH. Every capture, browser integration test and
-encoder runs through `slotfather run -n 1 -- ...`; timing benchmarks require all slots.
-Terminal rendering uses agg 1.9 or newer and its swash backend. Bundled JetBrains Mono
-and Noto Sans Symbols 2 include their licenses in `fonts/`.
+### Linux (Debian / Ubuntu)
 
-## Capture
+```sh
+sudo apt-get update
+sudo apt-get install -y ffmpeg webp python3
+# Install agg >= 1.9 from https://github.com/asciinema/agg/releases into /usr/local/bin/agg
+bun install
+bun link
+screen-kit --help
+```
 
-A JavaScript module (or JSON file) contains named recipes. Paths resolve relative to the config
-file, or its `cwd` setting. Browser steps use agent-browser argument arrays or trusted preparation
-JavaScript. Terminal steps send real input to the application in a PTY.
+### Optional Capabilities
+
+| Capability | Requirement |
+|---|---|
+| **Gemini 2.5 Pro TTS**, multimodal review, Imagen assets, Lyria music | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) sent via `x-goog-api-key` header |
+| **Offline TTS fallback** | `kokoro` / `kokoro-tts` on `PATH` (or Python `kokoro` package) |
+| **Local forced word alignment** | `mlx_whisper` (Apple Silicon) or `whisper-cli` (`whisper.cpp`) on `PATH` |
+| **Opt-in YouTube upload** | `YOUTUBE_ACCESS_TOKEN` OAuth Bearer token (never called without explicit invocation) |
+
+Bundled terminal fonts (JetBrains Mono & Noto Sans Symbols 2) include their licenses in [`fonts/`](fonts/).
+
+---
+
+## Quickstart
+
+Write a standalone recipe in your project (see [`examples/`](examples/) for full real-world configs):
 
 ```js
+// demo.screen-kit.mjs
 export default {
   cwd: '.',
+  defaults: {
+    source: 'browser',
+    url: 'http://127.0.0.1:3000',
+    captureMode: 'quality', // 'quality' (Retina 2x 60fps) or 'headless' (CI)
+    colorSpace: 'p3',       // 'p3' (Display P3) or 'srgb'
+    viewport: [1440, 810],
+    fps: 60,
+    themes: ['dark'],
+  },
   recipes: {
-    navigation: {
-      source: 'terminal', command: ['python3', 'demo.py'],
-      columns: 120, rows: 36, duration: 12, fps: 1, format: 'webp',
+    showcase: {
+      ready: '[data-testid="canvas"]',
+      setup: ["document.querySelector('.app-shell')?.setAttribute('data-native-titlebar', 'true')"],
+      presentation: {
+        stage: { width: 1920, height: 1080, padding: 88, background: { type: 'image', src: 'wallpaper.jpg', fit: 'cover' } },
+        window: { frame: 'macos-inset', width: 1440, height: 810 },
+        camera: { outputWidth: 1920, outputHeight: 1080 },
+        overlays: { cursor: { enabled: true }, ripples: { enabled: true }, keystrokes: { enabled: true } },
+        outputs: ['youtube-master', 'shorts'],
+      },
       steps: [
-        { at: 3, input: 'j', expect: 'selected: beta' },
-        { at: 8, input: 'k', expect: 'selected: alpha' },
+        {
+          type: 'click',
+          target: { role: 'button', name: 'New Workflow' },
+          camera: { zoom: 1.25, focus: 'target', clampToWindow: true },
+          narration: {
+            en: 'Click any action card to inspect and configure its parameters.',
+            uk: 'Натисніть на будь-яку картку дії, щоб налаштувати її параметри.',
+          },
+        },
+        {
+          type: 'key',
+          key: 'l',
+          modifiers: ['Shift', 'Meta'],
+          camera: 'wide',
+          narration: {
+            en: 'And tidy the entire workflow with a single keyboard shortcut.',
+            uk: 'І впорядкуйте весь сценарій одним клавіатурним скороченням.',
+          },
+        },
       ],
-    },
-    page: {
-      source: 'browser', url: 'http://localhost:3000',
-      viewport: [1440, 810], themes: ['dark'], format: 'webp',
-      steps: [['click', '[data-demo-open]']],
     },
   },
 };
 ```
 
-```sh
-slotfather run -n 1 -- screen-kit capture --config screens.mjs --out out/screens
-screen-kit status --config screens.mjs --manifest out/screens/run.json
-screen-kit review --manifest out/screens/run.json
-```
-
-`--only name,name` selects recipes. `run.json` records source revision/dirty state, recipe and
-artifact hashes, dimensions, frames, duration, original take hashes and checkpoints. Failures
-leave a failed manifest. `status` is read-only; `review` detects replaced files and failed checks.
-Terminal expectations read the rendered screen through xterm, not a grep of the ANSI stream.
-
-Terminal defaults use Ghostty's built-in palette, bundled JetBrains Mono and a symbol fallback.
-This is actual application output rendered headlessly, not a capture of the Ghostty window.
-Font family/size, line height, font directory and theme are recipe settings. `format: 'png'`
-captures a still; `webp` is animated, lossless and looping. Identical frames may share a longer
-delay, so a 1 fps recording can store fewer than one distinct frame per second.
-
-Browser stills support Storybook stories, args, themes, crops, bands and composites, retaining
-Display P3. Browser recording uses `format: 'webm' | 'mp4'`, a viewport, `duration`, `fps`,
-optional `setup` steps and timed `steps: [{at: 1, click: 'selector'}]`. Recording
-currently rejects crop/composite/multitheme recipes. Measured frame counts and duration come
-from the encoded result; requested fps is not a performance guarantee.
-
-## Reuse a take
+Run the unified pipeline end-to-end:
 
 ```sh
-slotfather run -n 1 -- screen-kit render --input out/screens/takes/navigation.cast --out demo.webp
-slotfather run -n 1 -- screen-kit render --input out/screens/takes/navigation.cast --out still.png --at 4
-slotfather run -n 1 -- screen-kit render --input out/screens/takes/navigation.cast --out demo.mp4
-slotfather run -n 1 -- screen-kit render --input take.webm --out demo.mp4
+# Fast contact-sheet preview of key step frames (seconds, before full encode)
+screen-kit run --config demo.screen-kit.mjs --out out/demo --preview-only
+
+# Full capture -> timeline -> narrate -> Remotion 4 render (16:9 + 9:16 Shorts) -> review
+screen-kit run --config demo.screen-kit.mjs --out out/demo \
+  --profiles youtube-master,shorts --color-space p3 \
+  --narration en --aligner whisper --verify-cursor
+
+# Re-render in another language reusing the exact same captured take
+screen-kit run --config demo.screen-kit.mjs --out out/demo-uk \
+  --reuse-take --profiles youtube-master,shorts --color-space p3 \
+  --narration uk --aligner whisper
 ```
 
-Terminal takes preserve ANSI output and input events. Video export accepts actual captured
-video, GIF takes and numbered PNG sequences. It exports silent MP4/WebM without starting an
-application. Cropping/stacking, catalog resolution and comparison images also have package
-exports; see the integration in the personal site's `scripts/screens.mjs`.
+---
 
-## Consumers and verification
+## CLI Reference
 
-- Slotfather owns its historical fixture, demo application mode and navigation recipe.
-- The personal site owns its case recipes and import/pin workflow. A private vendored package
-  tarball lets its CI install from a standalone checkout; the package is not published.
-- `bun run verify` is the repo-kit gate. Real browser tests are opt-in as documented in
-  [checks](docs/agents/checks.md), with local fixture servers and cleanup.
+| Command | Purpose |
+|---|---|
+| `screen-kit run` | Unified pipeline: `capture` → `timeline` → (`narrate`) → `preview` / `render` → `review`. Supports `--preview-only`, `--reuse-take`, `--profiles`, `--color-space`, `--narration`, `--burn-captions`, `--verify-cursor`. |
+| `screen-kit capture` | Record browser (`quality` / `headless`) or PTY terminal takes with provenance manifest (`run.json`) and `event-track.json`. |
+| `screen-kit timeline` | Compile `event-track.json` + recipe into validated, renderer-neutral `timeline.json` v1. |
+| `screen-kit preview` | Render key step frames of `timeline.json` into a fast contact sheet. |
+| `screen-kit narrate` | Synthesize per-step speech (Gemini 2.5 Pro TTS or Kokoro), apply frame-hold video padding, run forced word alignment (`whisper` / `gemini` / `proportional`), and emit Netflix-validated `.srt`/`.vtt`. |
+| `screen-kit audio-mix` | Mix narration, procedural UI SFX (synced to ripples/keystrokes), and local or opt-in Lyria music beds with automatic voice ducking (`envelope` / `sidechain`) and `ebur128` verification. |
+| `screen-kit render` | Headlessly render `timeline.json` via Remotion 4 (`web-loop`, `youtube-master`, `shorts`, `--color-space p3`), or re-export `.cast`/`.gif`/video takes. |
+| `screen-kit review` | Verify provenance hashes, dimensions, cadence, freeze/black frames, `ebur128` loudness, Netflix caption rules, pixel-level cursor accuracy (`--verify-cursor`), baseline diffs, and optional `--multimodal` review. |
+| `screen-kit publish` | Export self-contained `--target web` bundles (VP9/AV1 WebM + H.264 MP4 + WebP poster + `embed.html` + `bundle.json`) or opt-in `--target youtube` uploads (`--dry-run` supported). |
+| `screen-kit asset` | Opt-in Imagen / Gemini Image API generator for non-UI assets only (stage wallpapers, YouTube thumbnails). Never synthesizes UI frames. |
+| `screen-kit status` | Read-only inspection of config and manifest provenance. |
 
-The [specification](docs/SPEC.md) describes scope and ownership. Current video support is real
-recording and export. Edited camera/stage composition, cursor overlays, captions, narration,
-Retina cadence acceptance and P3 video acceptance remain future work.
+---
+
+## Terminal Recordings & Stills
+
+`screen-kit` also records real PTY terminal sessions (`.cast` asciicast v2) verified against rendered screen state via `@xterm/headless`, and exports lossless animated WebP, PNG stills, or silent MP4/WebM via `agg` 1.9+ and FFmpeg:
+
+```sh
+screen-kit render --input out/screens/takes/navigation.cast --out demo.webp --fps 1
+screen-kit render --input out/screens/takes/navigation.cast --out still.png --at 4
+screen-kit render --input out/screens/takes/navigation.cast --out demo.mp4 --fps 30
+```
+
+---
+
+## Documentation & Verification
+
+- **Architecture & Contracts:** [`docs/SPEC.md`](docs/SPEC.md)
+- **End-to-End Benchmarks:** [`docs/benchmarks.md`](docs/benchmarks.md)
+- **Example Recipes:** [`examples/straylight.screen-kit.mjs`](examples/straylight.screen-kit.mjs), [`examples/data-grid.screen-kit.mjs`](examples/data-grid.screen-kit.mjs)
+- **Verification Gate:** `bun run verify` runs `repo-kit check`, syntax checks, and the full test suite (`110` tests) on both macOS and Linux CI. Real browser tests are opt-in (`SCREEN_KIT_BROWSER_TESTS=1`).
+
+## License
+
+[MIT](LICENSE)
