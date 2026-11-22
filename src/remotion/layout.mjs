@@ -85,12 +85,12 @@ export function buildSquirclePath(width, height, radius, smoothness = 0.6) {
  * `projectViewportToStage` and `projectViewportToScreen` remain exact for every frame style.
  */
 export function computeWindowChrome(win) {
-  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 24);
+  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 26);
   const shadow = win.shadow ?? win.frame !== 'none';
 
   switch (win.frame) {
     case 'macos': {
-      const topBarHeight = 36;
+      const topBarHeight = 38;
       return {
         frame: 'macos',
         title: win.title ?? '',
@@ -115,7 +115,7 @@ export function computeWindowChrome(win) {
       };
     }
     case 'browser': {
-      const topBarHeight = 44;
+      const topBarHeight = 50;
       return {
         frame: 'browser',
         title: win.title ?? '',

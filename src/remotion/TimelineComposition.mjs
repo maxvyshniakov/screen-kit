@@ -20,9 +20,9 @@ const MONO_FONT =
 
 function renderTrafficLights() {
   const lights = [
-    { fill: '#ff5f57', border: 'rgba(224, 68, 62, 0.72)' },
-    { fill: '#febc2e', border: 'rgba(222, 161, 35, 0.72)' },
-    { fill: '#28c840', border: 'rgba(26, 171, 41, 0.72)' },
+    { fill: '#ff5f57', border: 'rgba(224, 68, 62, 0.68)' },
+    { fill: '#febc2e', border: 'rgba(222, 161, 35, 0.68)' },
+    { fill: '#28c840', border: 'rgba(26, 171, 41, 0.68)' },
   ];
   return h(
     'div',
@@ -31,7 +31,7 @@ function renderTrafficLights() {
         display: 'flex',
         alignItems: 'center',
         gap: 8,
-        paddingLeft: 16,
+        paddingLeft: 20,
         flexShrink: 0,
       },
     },
@@ -43,7 +43,7 @@ function renderTrafficLights() {
           height: 12,
           borderRadius: '50%',
           backgroundColor: light.fill,
-          boxShadow: `inset 0 0 0 0.75px ${light.border}, 0 0.5px 1px rgba(0, 0, 0, 0.35)`,
+          boxShadow: `inset 0 0 0 0.75px ${light.border}`,
           display: 'inline-block',
         },
       })
@@ -51,40 +51,96 @@ function renderTrafficLights() {
   );
 }
 
+const GLASS_PILL_STYLE = {
+  backgroundColor: 'rgba(255, 255, 255, 0.075)',
+  boxShadow: 'inset 0 0.75px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 0.75px rgba(255, 255, 255, 0.06)',
+  borderRadius: 999,
+};
+
 function renderBrowserNavIcons() {
-  const iconStyle = { display: 'block', opacity: 0.32 };
   return h(
     'div',
     {
       style: {
         display: 'flex',
         alignItems: 'center',
-        gap: 10,
-        marginLeft: 18,
+        gap: 8,
+        marginLeft: 16,
         flexShrink: 0,
       },
     },
     h(
-      'svg',
-      { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: iconStyle },
-      h('path', {
-        d: 'M7.75 2.25L4 6L7.75 9.75',
-        stroke: '#e2e8f0',
-        strokeWidth: 1.4,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-      })
-    ),
+      'div',
+      {
+        style: {
+          ...GLASS_PILL_STYLE,
+          width: 32,
+          height: 32,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        },
+      },
+      h(
+        'svg',
+        { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: { opacity: 0.72 } },
+        h('path', {
+          d: 'M7.5 2.25L3.75 6L7.5 9.75',
+          stroke: '#f1f5f9',
+          strokeWidth: 1.5,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        })
+      )
+    )
+  );
+}
+
+function renderBrowserRightActions() {
+  return h(
+    'div',
+    {
+      style: {
+        marginLeft: 'auto',
+        paddingRight: 16,
+        display: 'flex',
+        alignItems: 'center',
+        flexShrink: 0,
+      },
+    },
     h(
-      'svg',
-      { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: { display: 'block', opacity: 0.18 } },
-      h('path', {
-        d: 'M4.25 2.25L8 6L4.25 9.75',
-        stroke: '#e2e8f0',
-        strokeWidth: 1.4,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-      })
+      'div',
+      {
+        style: {
+          ...GLASS_PILL_STYLE,
+          height: 32,
+          padding: '0 12px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 14,
+        },
+      },
+      h(
+        'svg',
+        { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', style: { opacity: 0.72 } },
+        h('path', {
+          d: 'M6 2.25V9.75M2.25 6H9.75',
+          stroke: '#f1f5f9',
+          strokeWidth: 1.4,
+          strokeLinecap: 'round',
+        })
+      ),
+      h(
+        'svg',
+        { width: 13, height: 13, viewBox: '0 0 14 14', fill: 'none', style: { opacity: 0.68 } },
+        h('rect', { x: 2.2, y: 4.2, width: 7.4, height: 7.4, rx: 1.8, stroke: '#f1f5f9', strokeWidth: 1.25 }),
+        h('path', {
+          d: 'M4.8 4.2V3.2C4.8 2.54 5.34 2 6 2H10.8C11.46 2 12 2.54 12 3.2V8C12 8.66 11.46 9.2 10.8 9.2H9.6',
+          stroke: '#f1f5f9',
+          strokeWidth: 1.25,
+          strokeLinecap: 'round',
+        })
+      )
     )
   );
 }
@@ -100,9 +156,8 @@ function renderTopChromeBar(windowChrome) {
           top: 0,
           width: windowChrome.outerRect.width,
           height: windowChrome.topBarHeight,
-          background: 'linear-gradient(180deg, #27292e 0%, #1d1f24 100%)',
-          borderBottom: '1px solid rgba(0, 0, 0, 0.55)',
-          boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.08)',
+          backgroundColor: '#17181c',
+          borderBottom: '1px solid rgba(255, 255, 255, 0.05)',
           display: 'flex',
           alignItems: 'center',
           boxSizing: 'border-box',
@@ -116,8 +171,8 @@ function renderTopChromeBar(windowChrome) {
             {
               style: {
                 position: 'absolute',
-                left: 88,
-                right: 88,
+                left: 96,
+                right: 96,
                 textAlign: 'center',
                 color: 'rgba(241, 245, 249, 0.82)',
                 fontFamily: UI_FONT,
@@ -146,9 +201,7 @@ function renderTopChromeBar(windowChrome) {
           top: 0,
           width: windowChrome.outerRect.width,
           height: windowChrome.topBarHeight,
-          background: 'linear-gradient(180deg, #25272d 0%, #1c1e23 100%)',
-          borderBottom: '1px solid rgba(0, 0, 0, 0.58)',
-          boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.07)',
+          backgroundColor: '#16171a',
           display: 'flex',
           alignItems: 'center',
           boxSizing: 'border-box',
@@ -161,24 +214,21 @@ function renderTopChromeBar(windowChrome) {
         'div',
         {
           style: {
+            ...GLASS_PILL_STYLE,
             position: 'absolute',
             left: '50%',
             transform: 'translateX(-50%)',
-            minWidth: Math.min(340, Math.max(160, windowChrome.outerRect.width * 0.34)),
-            maxWidth: Math.max(200, windowChrome.outerRect.width - 260),
-            height: 27,
-            padding: '0 14px',
-            borderRadius: 8,
-            backgroundColor: 'rgba(255, 255, 255, 0.055)',
-            boxShadow:
-              'inset 0 0 0 0.75px rgba(255, 255, 255, 0.075), inset 0 1px 2px rgba(0, 0, 0, 0.25)',
+            minWidth: Math.min(420, Math.max(180, windowChrome.outerRect.width * 0.38)),
+            maxWidth: Math.max(220, windowChrome.outerRect.width - 300),
+            height: 32,
+            padding: '0 18px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            gap: 6,
-            color: 'rgba(226, 232, 240, 0.76)',
+            gap: 7,
+            color: 'rgba(241, 245, 249, 0.82)',
             fontFamily: UI_FONT,
-            fontSize: 12,
+            fontSize: 12.5,
             fontWeight: 450,
             letterSpacing: '-0.005em',
             whiteSpace: 'nowrap',
@@ -192,7 +242,7 @@ function renderTopChromeBar(windowChrome) {
             height: 11,
             viewBox: '0 0 10 11',
             fill: 'none',
-            style: { flexShrink: 0, opacity: 0.48 },
+            style: { flexShrink: 0, opacity: 0.45 },
           },
           h('rect', {
             x: 1.5,
@@ -220,7 +270,8 @@ function renderTopChromeBar(windowChrome) {
           },
           addressText
         )
-      )
+      ),
+      renderBrowserRightActions()
     );
   }
 
@@ -546,7 +597,7 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
   const squircleClipId = 'screen-kit-window-squircle';
   const rimGradId = 'screen-kit-window-rim-grad';
   const windowShadowFilter = windowChrome.shadow
-    ? 'drop-shadow(0 2px 6px rgba(0, 0, 0, 0.38)) drop-shadow(0 18px 36px rgba(0, 0, 0, 0.44)) drop-shadow(0 38px 72px rgba(0, 0, 0, 0.36))'
+    ? 'drop-shadow(0 28px 60px rgba(0, 0, 0, 0.34))'
     : 'none';
 
   return h(
@@ -693,20 +744,15 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
                 h(
                   'linearGradient',
                   { id: rimGradId, x1: '0', y1: '0', x2: '0', y2: '1' },
-                  h('stop', { offset: '0%', stopColor: 'rgba(255, 255, 255, 0.24)' }),
-                  h('stop', { offset: '18%', stopColor: 'rgba(255, 255, 255, 0.11)' }),
-                  h('stop', { offset: '100%', stopColor: 'rgba(255, 255, 255, 0.05)' })
+                  h('stop', { offset: '0%', stopColor: 'rgba(255, 255, 255, 0.18)' }),
+                  h('stop', { offset: '22%', stopColor: 'rgba(255, 255, 255, 0.08)' }),
+                  h('stop', { offset: '100%', stopColor: 'rgba(255, 255, 255, 0.04)' })
                 )
               ),
               h('path', {
                 d: squirclePath,
-                stroke: 'rgba(0, 0, 0, 0.62)',
-                strokeWidth: 2,
-              }),
-              h('path', {
-                d: squirclePath,
                 stroke: `url(#${rimGradId})`,
-                strokeWidth: 1.5,
+                strokeWidth: 1.25,
                 clipPath: `url(#${squircleClipId})`,
               })
             )
