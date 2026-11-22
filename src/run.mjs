@@ -165,7 +165,10 @@ export async function runPipeline({
   previewOnly = false,
   reuseTake = false,
   profiles,
+  colorSpace,
   narration,
+  burnInCaptions,
+  burnCaptions,
   ttsProvider,
   aligner,
   narrationOptions = {},
@@ -202,6 +205,10 @@ export async function runPipeline({
     }
     if (aligner !== undefined && narrationConfig.aligner === undefined) {
       narrationConfig.aligner = aligner;
+    }
+    const explicitBurnIn = burnInCaptions ?? burnCaptions;
+    if (explicitBurnIn !== undefined && narrationConfig.burnInCaptions === undefined) {
+      narrationConfig.burnInCaptions = Boolean(explicitBurnIn);
     }
   }
 
@@ -252,9 +259,14 @@ export async function runPipeline({
       reused = true;
     } else {
       const format = ['mp4', 'webm'].includes(recipe.format) ? recipe.format : 'mp4';
+      const captureColorSpace = colorSpace ?? recipe.colorSpace ?? recipe.presentation?.colorSpace;
       const artifact = await captureBrowserTake({
         name,
-        recipe: { ...recipe, format },
+        recipe: {
+          ...recipe,
+          format,
+          ...(captureColorSpace ? { colorSpace: captureColorSpace } : {}),
+        },
         cwd,
         out: takeDir,
         base: recipe.base,
@@ -278,10 +290,13 @@ export async function runPipeline({
     const relVideo = relative(recipeDir, videoPath);
     const relEventTrack = relative(recipeDir, eventTrackPath);
 
+    const effectiveColorSpace =
+      colorSpace ?? presentation.colorSpace ?? recipe.colorSpace ?? eventTrack.video?.colorSpace;
     let activeTimeline = compileTimeline({
       take: {
         video: relVideo,
         eventTrack: relEventTrack,
+        ...(effectiveColorSpace !== undefined ? { colorSpace: effectiveColorSpace } : {}),
       },
       eventTrack,
       recipe: presentation,
@@ -365,6 +380,7 @@ export async function runPipeline({
         timeline: timelinePath,
         outDir: recipeDir,
         ...(profiles ? { profiles } : {}),
+        ...(colorSpace ? { colorSpace } : {}),
         ...renderOptions,
       });
 

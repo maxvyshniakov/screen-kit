@@ -1296,3 +1296,141 @@ test('renderTimelinePreview, screen-kit preview CLI, and unified screen-kit run 
     await rm(workDir, { recursive: true, force: true });
   }
 });
+
+test('Display P3 wide-gamut timeline rendering preserves smpte432 / iec61966-2-1 CICP metadata and P3 pixels across MP4, WebM, and CLI --color-space p3', async () => {
+  const workDir = await mkdtemp(join(tmpdir(), 'screen-kit-render-p3-'));
+  const scratchDir = join(workDir, 'scratch');
+  try {
+    // 1. Verify resolveRenderTargets precedence: renderTimeline({ colorSpace }) > output.colorSpace > take.colorSpace > 'srgb'
+    const mixedOutputsTimeline = compileTimeline({
+      eventTrack: makeSyntheticEventTrack({
+        video: { file: 'take.mp4', width: 128, height: 64, fps: 10, duration: 0.2, frames: 2, colorSpace: 'p3' },
+      }),
+      recipe: {
+        stage: { width: 128, height: 64, padding: 0 },
+        window: { frame: 'none', width: 128, height: 64 },
+        camera: { outputWidth: 128, outputHeight: 64 },
+        outputs: [
+          'web-loop', // inherits take.colorSpace ('p3')
+          { preset: 'youtube-master', colorSpace: 'srgb' }, // explicit output override ('srgb')
+        ],
+      },
+    });
+    const inheritedPlan = resolveRenderTargets({ timeline: mixedOutputsTimeline, outDir: join(workDir, 'plan') });
+    assert.equal(inheritedPlan.targets.find((t) => t.id === 'web-loop' && t.format === 'webm')?.colorSpace, 'p3');
+    assert.equal(inheritedPlan.targets.find((t) => t.id === 'web-loop' && t.format === 'mp4')?.colorSpace, 'p3');
+    assert.equal(inheritedPlan.targets.find((t) => t.id === 'youtube-master')?.colorSpace, 'srgb');
+
+    const forcedPlan = resolveRenderTargets({
+      timeline: mixedOutputsTimeline,
+      outDir: join(workDir, 'plan'),
+      colorSpace: 'p3',
+    });
+    assert.ok(forcedPlan.targets.every((t) => t.colorSpace === 'p3'));
+
+    // 2. Encode a Display P3 take video: left half pure Display P3 red (255,0,0), right half sRGB red in P3 (234,51,35)
+    for (let i = 0; i < 2; i += 1) {
+      const p3RedHalf = await sharp({
+        create: { width: 64, height: 64, channels: 3, background: { r: 255, g: 0, b: 0 } },
+      })
+        .png()
+        .toBuffer();
+      const srgbRedHalf = await sharp({
+        create: { width: 64, height: 64, channels: 3, background: { r: 234, g: 51, b: 35 } },
+      })
+        .png()
+        .toBuffer();
+      await sharp({
+        create: { width: 128, height: 64, channels: 3, background: { r: 0, g: 0, b: 0 } },
+      })
+        .composite([
+          { input: p3RedHalf, left: 0, top: 0 },
+          { input: srgbRedHalf, left: 64, top: 0 },
+        ])
+        .png()
+        .toFile(join(workDir, `p3-seq-${i}.png`));
+    }
+    const p3TakeVideo = join(workDir, 'p3-take.mp4');
+    await renderVideo({ input: join(workDir, 'p3-seq-%d.png'), output: p3TakeVideo, fps: 10, colorSpace: 'p3' });
+    const srcProbe = await probeVideo(p3TakeVideo);
+    assert.equal(srcProbe.colorPrimaries, 'smpte432');
+    assert.equal(srcProbe.colorTransfer, 'iec61966-2-1');
+
+    // 3. Render timeline inheriting take.colorSpace = 'p3' into web-loop (VP9 WebM + H.264 MP4)
+    const p3Timeline = compileTimeline({
+      take: { video: 'p3-take.mp4', eventTrack: 'event-track.json', colorSpace: 'p3' },
+      eventTrack: makeSyntheticEventTrack({
+        viewport: { width: 128, height: 64, deviceScaleFactor: 1 },
+        video: { file: 'p3-take.mp4', width: 128, height: 64, fps: 10, duration: 0.2, frames: 2 },
+        events: [],
+      }),
+      recipe: {
+        stage: { width: 128, height: 64, padding: 0, background: { type: 'solid', color: 'color(display-p3 1 0 0)' } },
+        window: { frame: 'none', width: 128, height: 64 },
+        camera: { outputWidth: 128, outputHeight: 64 },
+        overlays: { cursor: { enabled: false } },
+        outputs: ['web-loop'],
+      },
+    });
+    const p3TimelinePath = join(workDir, 'p3-timeline.json');
+    await writeFile(p3TimelinePath, JSON.stringify(p3Timeline, null, 2));
+
+    const p3DirOut = join(workDir, 'out-p3');
+    const p3Render = await renderTimeline({
+      timeline: p3TimelinePath,
+      outDir: p3DirOut,
+      profiles: ['web-loop'],
+      scratchDir,
+    });
+
+    const webmOut = p3Render.outputs.find((o) => o.format === 'webm');
+    const mp4Out = p3Render.outputs.find((o) => o.format === 'mp4');
+    assert.ok(webmOut && mp4Out);
+
+    for (const [label, filePath] of [['webm', webmOut.file], ['mp4', mp4Out.file]]) {
+      const probed = await probeVideo(filePath);
+      assert.equal(probed.colorPrimaries, 'smpte432', `${label} colorPrimaries`);
+      assert.equal(probed.colorTransfer, 'iec61966-2-1', `${label} colorTransfer`);
+      assert.equal(probed.colorSpace, 'bt709', `${label} colorSpace`);
+      assert.equal(probed.colorRange, 'tv', `${label} colorRange`);
+    }
+
+    // Verify wide-gamut P3 vs sRGB red separation on decoded BT.709 YUV -> RGB24 frame
+    const rawRgb = execFileSync('ffmpeg', [
+      '-v', 'error', '-i', mp4Out.file, '-frames:v', '1',
+      '-vf', 'scale=in_color_matrix=bt709:in_range=tv',
+      '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-',
+    ]);
+    const samplePx = (x, y) => {
+      const idx = (y * 128 + x) * 3;
+      return [rawRgb[idx], rawRgb[idx + 1], rawRgb[idx + 2]];
+    };
+    const leftP3 = samplePx(24, 32);
+    const rightSrgb = samplePx(104, 32);
+    const gamutDist = Math.hypot(leftP3[0] - rightSrgb[0], leftP3[1] - rightSrgb[1], leftP3[2] - rightSrgb[2]);
+    assert.ok(
+      gamutDist >= 20,
+      `expected distinct Display P3 red (${leftP3}) vs sRGB red (${rightSrgb}), dist=${gamutDist}`
+    );
+
+    // 4. Verify CLI `screen-kit render --input srgb-timeline.json --out cli-p3.mp4 --color-space p3`
+    const srgbTimeline = structuredClone(p3Timeline);
+    delete srgbTimeline.take.colorSpace;
+    const srgbTimelinePath = join(workDir, 'srgb-timeline.json');
+    await writeFile(srgbTimelinePath, JSON.stringify(srgbTimeline, null, 2));
+
+    const cliP3Mp4 = join(workDir, 'cli-p3.mp4');
+    await execFile(
+      process.execPath,
+      [CLI_PATH, 'render', '--input', srgbTimelinePath, '--out', cliP3Mp4, '--color-space', 'p3'],
+      { cwd: REPO_ROOT, timeout: 120000 }
+    );
+    const cliProbed = await probeVideo(cliP3Mp4);
+    assert.equal(cliProbed.colorPrimaries, 'smpte432');
+    assert.equal(cliProbed.colorTransfer, 'iec61966-2-1');
+    assert.equal(cliProbed.colorSpace, 'bt709');
+    assert.equal(cliProbed.colorRange, 'tv');
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+});

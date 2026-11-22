@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 
 export const DEFAULT_LYRIA_MODEL = 'lyria-3-clip-preview';
 export const DEFAULT_MUSIC_LUFS = -18;
-export const DEFAULT_SPEECH_MUSIC_LUFS = -26;
+export const DEFAULT_SPEECH_MUSIC_LUFS = -30;
 export const DEFAULT_DUCK_UNDER_SPEECH_DB = -10;
 export const DEFAULT_DUCK_ATTACK_SEC = 0.18;
 export const DEFAULT_DUCK_RELEASE_SEC = 0.45;
@@ -1143,7 +1143,7 @@ export async function mixTimelineAudio({
   duckAttack = DEFAULT_DUCK_ATTACK_SEC,
   duckRelease = DEFAULT_DUCK_RELEASE_SEC,
   duckingMode = 'envelope',
-  musicLufs = DEFAULT_MUSIC_LUFS,
+  musicLufs,
   musicVolume,
   sfxVolume = 1,
   narrationVolume = 1,
@@ -1338,6 +1338,11 @@ export async function mixTimelineAudio({
 
       const fadeIn = musicConfig.fadeIn ?? DEFAULT_MUSIC_FADE_IN_SEC;
       const fadeOut = musicConfig.fadeOut ?? DEFAULT_MUSIC_FADE_OUT_SEC;
+      const hasSpeech = narrationList.length > 0 || speechWindows.length > 0;
+      const effectiveMusicLufs =
+        musicConfig.targetLufs ??
+        musicLufs ??
+        (hasSpeech ? DEFAULT_SPEECH_MUSIC_LUFS : DEFAULT_MUSIC_LUFS);
       const preparedBedFile = join(scratchDir, 'music-prepared.wav');
       const prepared = await prepareMusicBed({
         src: rawMusicSource,
@@ -1345,7 +1350,7 @@ export async function mixTimelineAudio({
         duration,
         fadeIn,
         fadeOut,
-        targetLufs: musicConfig.targetLufs ?? musicLufs,
+        targetLufs: effectiveMusicLufs,
         volume: musicConfig.volume ?? musicVolume,
         normalize: musicConfig.normalize !== false,
         loop: musicConfig.loop !== false,

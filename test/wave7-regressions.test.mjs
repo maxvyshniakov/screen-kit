@@ -9,6 +9,8 @@ import { promisify } from 'node:util';
 import sharp from 'sharp';
 import { mixTimelineAudio, prepareMusicBed } from '../src/audio-mix.mjs';
 import {
+  DEFAULT_STEP_LEAD_IN,
+  DEFAULT_STEP_LEAD_OUT,
   alignWithGemini,
   buildNarrationTracks,
   encodePcm16Wav,
@@ -1171,8 +1173,9 @@ test('Finding #12 & #17: 9:16 portrait captions & HUD use explicit left/width wi
       outDir: join(dir, 'narr'),
       timeline: shortTimeline,
     });
-    assert.equal(built.timeline.take.duration, 3.0);
-    assert.equal(built.timeline.take.frames, 90);
+    const expectedBuiltDur = Number((DEFAULT_STEP_LEAD_IN + 2.4 + DEFAULT_STEP_LEAD_OUT).toFixed(4));
+    assert.equal(built.timeline.take.duration, expectedBuiltDur);
+    assert.equal(built.timeline.take.frames, Math.round(expectedBuiltDur * 30));
 
     // 4. callGeminiMultimodalReview trims apiKey and treats whitespace-only key as skipped
     const vid = join(dir, 'mm.mp4');

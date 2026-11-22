@@ -20,13 +20,16 @@ const exec = promisify(execFile);
 
 export const TTS_PROVIDERS = ['gemini', 'kokoro'];
 export const WORD_ALIGNERS = ['auto', 'whisper', 'gemini', 'proportional'];
-export const DEFAULT_GEMINI_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+export const DEFAULT_GEMINI_TTS_MODEL = 'gemini-2.5-pro-preview-tts';
 export const DEFAULT_GEMINI_ALIGN_MODEL = 'gemini-2.5-flash';
 export const DEFAULT_MLX_WHISPER_MODEL = 'mlx-community/whisper-tiny';
 export const DEFAULT_GEMINI_VOICE = 'Kore';
+export const DEFAULT_GEMINI_STYLE_PROMPT =
+  'Speak in a brisk, natural, energetic product-demo tone with clear pacing.';
 export const DEFAULT_KOKORO_VOICE = 'af_heart';
-export const DEFAULT_STEP_LEAD_IN = 0.2;
-export const DEFAULT_STEP_LEAD_OUT = 0.4;
+export const DEFAULT_SPEECH_SPEED = 1.1;
+export const DEFAULT_STEP_LEAD_IN = 0.12;
+export const DEFAULT_STEP_LEAD_OUT = 0.22;
 
 export const NETFLIX_CAPTION_RULES = Object.freeze({
   maxLines: 2,
@@ -234,6 +237,68 @@ function buildGeminiTtsPrompt({ text, language, style, tone, pacing, instruction
 }
 
 /**
+ * Build a safe pitch-preserving FFmpeg `atempo` filter chain for `speed`.
+ * FFmpeg's `atempo` filter requires each stage in `[0.5, 2.0]`, so speeds outside
+ * `[0.5, 2.0]` are chained across multiple stages and extreme values are clamped to `[0.1, 16]`.
+ */
+export function buildAtempoFilterChain(speed) {
+  if (!isFiniteNumber(speed) || speed <= 0) {
+    throw Error(`Speech speed must be a positive finite number (received ${String(speed)})`);
+  }
+  const clamped = Math.min(16, Math.max(0.1, speed));
+  if (Math.abs(clamped - 1) <= 1e-6) return '';
+  const stages = [];
+  let remaining = clamped;
+  while (remaining > 2.0 + 1e-6) {
+    stages.push('atempo=2.0');
+    remaining /= 2.0;
+  }
+  while (remaining < 0.5 - 1e-6) {
+    stages.push('atempo=0.5');
+    remaining /= 0.5;
+  }
+  if (Math.abs(remaining - 1) > 1e-6 || stages.length === 0) {
+    const stageVal = Math.min(2.0, Math.max(0.5, remaining));
+    stages.push(`atempo=${Number(stageVal.toFixed(6))}`);
+  }
+  return stages.join(',');
+}
+
+async function applyAtempoToWavBuffer(
+  wavBuffer,
+  { atempoFilter, sampleRate, channels, signal } = {}
+) {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'screen-kit-atempo-'));
+  const tempIn = join(scratchDir, 'in.wav');
+  const tempOut = join(scratchDir, 'out.wav');
+  try {
+    await writeFile(tempIn, wavBuffer);
+    await exec(
+      'ffmpeg',
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-i',
+        tempIn,
+        '-af',
+        atempoFilter,
+        ...(sampleRate ? ['-ar', String(sampleRate)] : []),
+        ...(channels ? ['-ac', String(channels)] : []),
+        '-c:a',
+        'pcm_s16le',
+        tempOut,
+      ],
+      { timeout: 60000, maxBuffer: 10e6, ...(signal ? { signal } : {}) }
+    );
+    return await readFile(tempOut);
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Primary cloud TTS provider: Gemini native TTS audio generation API.
  * Strictly opt-in; throws clearly if credentials (`GEMINI_API_KEY` / `GOOGLE_API_KEY` / `apiKey`) are missing.
  */
@@ -249,6 +314,7 @@ export async function synthesizeWithGemini({
   tone,
   pacing,
   instructions,
+  speed = DEFAULT_SPEECH_SPEED,
   sampleRate,
   fetchImpl = globalThis.fetch,
   env = process.env,
@@ -257,6 +323,8 @@ export async function synthesizeWithGemini({
   if (!isNonEmptyString(text)) {
     throw Error('synthesizeWithGemini requires non-empty text');
   }
+  const atempoFilter = buildAtempoFilterChain(speed);
+  const clampedSpeed = Math.min(16, Math.max(0.1, speed));
 
   const resolvedKey = apiKey ?? env.GEMINI_API_KEY ?? env.GOOGLE_API_KEY;
   if (!isNonEmptyString(resolvedKey)) {
@@ -269,7 +337,12 @@ export async function synthesizeWithGemini({
   }
 
   const languageCode = language ? normalizeLanguageCode(language) : undefined;
-  const effectiveStyle = stylePrompt ?? style;
+  const effectiveStyle =
+    stylePrompt !== undefined
+      ? stylePrompt
+      : style !== undefined
+        ? style
+        : DEFAULT_GEMINI_STYLE_PROMPT;
   const promptText = buildGeminiTtsPrompt({
     text,
     language: languageCode,
@@ -351,6 +424,24 @@ export async function synthesizeWithGemini({
     duration = round(rawBuffer.length / (resolvedSampleRate * resolvedChannels * bytesPerSample), 4);
   }
 
+  if (atempoFilter) {
+    finalBuffer = await applyAtempoToWavBuffer(finalBuffer, {
+      atempoFilter,
+      sampleRate: finalMimeType === 'audio/wav' ? resolvedSampleRate : undefined,
+      channels: finalMimeType === 'audio/wav' ? resolvedChannels : undefined,
+      signal,
+    });
+    finalMimeType = 'audio/wav';
+    const spedWavMeta = parseWavHeader(finalBuffer);
+    if (spedWavMeta) {
+      resolvedSampleRate = spedWavMeta.sampleRate || resolvedSampleRate;
+      resolvedChannels = spedWavMeta.channels || resolvedChannels;
+      duration = spedWavMeta.duration;
+    } else {
+      duration = 0;
+    }
+  }
+
   let resolvedFile = null;
   if (outputFile) {
     resolvedFile = resolve(outputFile);
@@ -371,6 +462,7 @@ export async function synthesizeWithGemini({
     model,
     voice,
     language: languageCode ?? 'en-US',
+    speed: clampedSpeed,
     file: resolvedFile,
     mimeType: finalMimeType,
     sampleRate: resolvedSampleRate,
@@ -459,7 +551,7 @@ export async function synthesizeWithKokoro({
   outputFile,
   voice = DEFAULT_KOKORO_VOICE,
   language = 'en-US',
-  speed = 1.0,
+  speed = DEFAULT_SPEECH_SPEED,
   executable,
   python = 'python3',
   runner,
@@ -1883,6 +1975,7 @@ export async function buildNarrationTracks({
   captionRules = {},
   timeline,
   writeSubtitles = true,
+  burnInCaptions = true,
   volume = 1,
 } = {}) {
   if (!Array.isArray(steps) || steps.length === 0) {
@@ -2096,7 +2189,7 @@ export async function buildNarrationTracks({
     updatedTimeline.overlays = {
       ...updatedTimeline.overlays,
       captions: {
-        enabled: true,
+        enabled: Boolean(burnInCaptions),
         tracks: captionTracks,
       },
     };
@@ -2166,6 +2259,7 @@ async function padTakeVideoWithHolds({
   scheduledSteps,
   finalDuration,
   fps,
+  colorSpace,
   signal,
 }) {
   const srcInfo = await probeVideo(sourceVideo);
@@ -2173,6 +2267,7 @@ async function padTakeVideoWithHolds({
   const targetFps = isFiniteNumber(fps) && fps > 0 ? fps : srcInfo.fps || 30;
   const minSlice = Math.max(0.02, 1.05 / targetFps);
   const format = extname(outputVideo).toLowerCase() === '.webm' ? 'webm' : 'mp4';
+  const isP3 = colorSpace === 'p3' || srcInfo.colorPrimaries === 'smpte432';
 
   // Collect lead hold (cut < minSlice) and internal hold points (minSlice <= cut <= srcDuration - minSlice)
   const internalHolds = [];
@@ -2200,17 +2295,21 @@ async function padTakeVideoWithHolds({
   await mkdir(dirname(outputVideo), { recursive: true });
   const tempOut = join(dirname(outputVideo), `.${basename(outputVideo)}-${randomUUID().slice(0, 8)}.${format}`);
 
+  const colorTailFilter = isP3
+    ? ',scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
+    : '';
+  const colorFlags = isP3
+    ? ['-color_range', 'tv', '-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709']
+    : ['-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'];
+
   const codecArgs = format === 'webm'
-    ? ['-c:v', 'libvpx-vp9', '-crf', '22', '-b:v', '0', '-deadline', 'good', '-row-mt', '1']
+    ? ['-c:v', 'libvpx-vp9', '-crf', '22', '-b:v', '0', '-deadline', 'good', '-row-mt', '1', ...(isP3 ? colorFlags : [])]
     : [
         '-c:v', 'libx264',
         '-crf', '15',
         '-preset', 'fast',
         '-movflags', '+faststart',
-        '-color_range', 'tv',
-        '-color_primaries', 'bt709',
-        '-color_trc', 'bt709',
-        '-colorspace', 'bt709',
+        ...colorFlags,
       ];
 
   try {
@@ -2222,7 +2321,7 @@ async function padTakeVideoWithHolds({
       const vf = [
         `tpad=${tpadArgs}`,
         `fps=${targetFps}`,
-        'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+        `pad=ceil(iw/2)*2:ceil(ih/2)*2${colorTailFilter}`,
       ].join(',');
       await exec(
         'ffmpeg',
@@ -2267,7 +2366,7 @@ async function padTakeVideoWithHolds({
         concatInputs.push(`[v${idx}]`);
       });
       filterParts.push(
-        `${concatInputs.join('')}concat=n=${slices.length}:v=1:a=0,fps=${targetFps},pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p[outv]`
+        `${concatInputs.join('')}concat=n=${slices.length}:v=1:a=0,fps=${targetFps},pad=ceil(iw/2)*2:ceil(ih/2)*2${colorTailFilter},format=yuv420p[outv]`
       );
 
       await exec(
@@ -2538,6 +2637,8 @@ export async function narrateTimeline({
   pacing,
   instructions,
   voice,
+  model,
+  ttsModel,
   speed,
   apiKey,
   fetchImpl,
@@ -2553,6 +2654,8 @@ export async function narrateTimeline({
   leadOut = DEFAULT_STEP_LEAD_OUT,
   captionRules = {},
   volume = 1,
+  burnInCaptions,
+  burnCaptions,
   padVideo = true,
   writeSubtitles = true,
   writeTimeline = true,
@@ -2741,6 +2844,21 @@ export async function narrateTimeline({
     voice ??
     recipeInput?.narrationVoice ??
     (isObject(recipeInput?.narration) ? recipeInput.narration.voice : undefined);
+  const effectiveTtsModel =
+    ttsModel ??
+    model ??
+    recipeInput?.narrationModel ??
+    (isObject(recipeInput?.narration) ? recipeInput.narration.model : undefined);
+  const effectiveSpeed =
+    speed ??
+    recipeInput?.narrationSpeed ??
+    (isObject(recipeInput?.narration) ? recipeInput.narration.speed : undefined);
+  const effectiveBurnInCaptions = Boolean(
+    burnInCaptions ??
+      burnCaptions ??
+      recipeInput?.burnInCaptions ??
+      (isObject(recipeInput?.narration) ? recipeInput.narration.burnInCaptions : false)
+  );
 
   const effectiveTtsRunner =
     providerOptions.runner ?? ttsRunner ?? (provider === 'kokoro' ? runner : undefined);
@@ -2798,12 +2916,13 @@ export async function narrateTimeline({
           text,
           language: lang,
           outputFile: audioOutputFile,
+          ...(effectiveTtsModel ? { model: effectiveTtsModel } : {}),
           ...(effectiveVoice ? { voice: effectiveVoice } : {}),
-          ...(effectiveStyle ? { style: effectiveStyle } : {}),
+          ...(effectiveStyle !== undefined ? { style: effectiveStyle } : {}),
           ...(tone ? { tone } : {}),
           ...(pacing ? { pacing } : {}),
           ...(instructions ? { instructions } : {}),
-          ...(speed !== undefined ? { speed } : {}),
+          ...(effectiveSpeed !== undefined ? { speed: effectiveSpeed } : {}),
           ...(apiKey ? { apiKey } : {}),
           ...(fetchImpl ? { fetchImpl } : {}),
           ...(effectiveTtsRunner ? { runner: effectiveTtsRunner } : {}),
@@ -3037,6 +3156,7 @@ export async function narrateTimeline({
       scheduledSteps,
       finalDuration,
       fps: baseTimeline.take.fps,
+      colorSpace: baseTimeline.take.colorSpace,
       signal,
     });
     finalDuration = round(paddedInfo.duration, 4);
@@ -3196,7 +3316,7 @@ export async function narrateTimeline({
   updatedTimeline.overlays = {
     ...updatedTimeline.overlays,
     captions: {
-      enabled: true,
+      enabled: effectiveBurnInCaptions,
       tracks: captionTracks,
     },
   };
@@ -3750,7 +3870,10 @@ export async function reviewNarration({
     }
   } else if (Array.isArray(cues)) {
     tracksToValidate.push({ language: 'default', cues });
-  } else if (timeline?.overlays?.captions?.enabled && Array.isArray(timeline.overlays.captions.tracks)) {
+  } else if (
+    Array.isArray(timeline?.overlays?.captions?.tracks) &&
+    timeline.overlays.captions.tracks.length > 0
+  ) {
     for (const track of timeline.overlays.captions.tracks) {
       tracksToValidate.push({ language: track.language ?? 'default', cues: track.cues ?? [] });
     }

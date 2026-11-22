@@ -10,6 +10,7 @@ import {
   DEFAULT_DUCK_UNDER_SPEECH_DB,
   DEFAULT_LYRIA_MODEL,
   DEFAULT_MUSIC_LUFS,
+  DEFAULT_SPEECH_MUSIC_LUFS,
   buildDuckingVolumeExpression,
   collectUiSfxEvents,
   computeMusicCacheKey,
@@ -96,6 +97,7 @@ test('audio-mix exports cleanly from subpath ./audio-mix and root src/index.mjs'
   assert.equal(rootApi.prepareMusicBed, prepareMusicBed);
   assert.equal(rootApi.muxAudioIntoVideo, muxAudioIntoVideo);
   assert.equal(DEFAULT_MUSIC_LUFS, -18);
+  assert.equal(DEFAULT_SPEECH_MUSIC_LUFS, -30);
   assert.equal(DEFAULT_DUCK_UNDER_SPEECH_DB, -10);
 });
 
@@ -527,6 +529,58 @@ test('Google Lyria opt-in music bed generation enforces x-goog-api-key header, p
   } finally {
     if (prevGemini !== undefined) process.env.GEMINI_API_KEY = prevGemini;
     if (prevGoogle !== undefined) process.env.GOOGLE_API_KEY = prevGoogle;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('mixTimelineAudio defaults music bed to quiet -30 LUFS under narration while keeping music-only videos at -18 LUFS', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-speech-music-lufs-'));
+  try {
+    const musicSrc = join(dir, 'bed.wav');
+    const speechSrc = join(dir, 'speech.wav');
+    await Promise.all([
+      runFfmpeg([
+        '-f', 'lavfi', '-i', 'sine=frequency=200:duration=4.0:sample_rate=48000',
+        '-c:a', 'pcm_s16le', musicSrc,
+      ]),
+      runFfmpeg([
+        '-f', 'lavfi', '-i', 'sine=frequency=520:duration=1.2:sample_rate=24000',
+        '-af', 'volume=+6dB',
+        '-c:a', 'pcm_s16le', speechSrc,
+      ]),
+    ]);
+
+    // 1. Music-only timeline uses DEFAULT_MUSIC_LUFS (-18 LUFS)
+    const silentVisualTimeline = makeInteractiveTimeline({ duration: 4.0 });
+    const musicOnlyMix = await mixTimelineAudio({
+      timeline: silentVisualTimeline,
+      music: musicSrc,
+      outDir: join(dir, 'music-only'),
+      keepStems: true,
+    });
+    assert.equal(musicOnlyMix.ok, true);
+
+    // 2. Narrated timeline uses DEFAULT_SPEECH_MUSIC_LUFS (-30 LUFS) when targetLufs/musicLufs is omitted
+    const narratedTimeline = makeInteractiveTimeline({ duration: 4.0 });
+    narratedTimeline.audio.tracks = [
+      { id: 'narr-0', kind: 'narration', src: speechSrc, start: 0.4, volume: 1 },
+    ];
+    const narratedMix = await mixTimelineAudio({
+      timeline: narratedTimeline,
+      music: musicSrc,
+      outDir: join(dir, 'narrated'),
+      keepStems: true,
+    });
+    assert.equal(narratedMix.ok, true);
+
+    // Compare unducked tail segment [2.4..3.3s] of the music stem: narrated music stem is ~12 dB quieter (-30 vs -18 LUFS)!
+    const musicOnlyGapRms = await measureSegmentRmsDb(musicOnlyMix.music.stemFile, 2.4, 3.3);
+    const narratedGapRms = await measureSegmentRmsDb(narratedMix.music.stemFile, 2.4, 3.3);
+    assert.ok(
+      musicOnlyGapRms - narratedGapRms >= 10.5 && musicOnlyGapRms - narratedGapRms <= 13.5,
+      `expected ~12 dB quieter default music bed with speech (-30 vs -18 LUFS), got musicOnly=${musicOnlyGapRms} dB vs narrated=${narratedGapRms} dB`
+    );
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

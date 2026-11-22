@@ -16,15 +16,20 @@ import { reviewVideo } from '../src/review-video.mjs';
 import * as rootApi from '../src/index.mjs';
 import {
   DEFAULT_GEMINI_ALIGN_MODEL,
+  DEFAULT_GEMINI_STYLE_PROMPT,
   DEFAULT_GEMINI_TTS_MODEL,
   DEFAULT_GEMINI_VOICE,
   DEFAULT_KOKORO_VOICE,
+  DEFAULT_SPEECH_SPEED,
+  DEFAULT_STEP_LEAD_IN,
+  DEFAULT_STEP_LEAD_OUT,
   NETFLIX_CAPTION_RULES,
   WORD_ALIGNERS,
   alignAudioWords,
   alignWithGemini,
   alignWithWhisper,
   alignWords,
+  buildAtempoFilterChain,
   buildNarrationTracks,
   computeStepDuration,
   detectLocalWhisper,
@@ -125,6 +130,15 @@ test('narration module is exported cleanly from src/index.mjs', () => {
   assert.equal(rootApi.verifyStepSpeechFit, verifyStepSpeechFit);
   assert.equal(rootApi.reviewNarration, reviewNarration);
   assert.equal(rootApi.validateStepNarration, validateStepNarration);
+  assert.equal(rootApi.buildAtempoFilterChain, buildAtempoFilterChain);
+  assert.equal(DEFAULT_GEMINI_TTS_MODEL, 'gemini-2.5-pro-preview-tts');
+  assert.equal(
+    DEFAULT_GEMINI_STYLE_PROMPT,
+    'Speak in a brisk, natural, energetic product-demo tone with clear pacing.'
+  );
+  assert.equal(DEFAULT_SPEECH_SPEED, 1.1);
+  assert.equal(DEFAULT_STEP_LEAD_IN, 0.12);
+  assert.equal(DEFAULT_STEP_LEAD_OUT, 0.22);
 });
 
 test('Gemini TTS provider fails cleanly without API key and makes zero network calls', async () => {
@@ -209,47 +223,68 @@ test('Gemini TTS provider sends natural-language steering and decodes PCM16 to p
     assert.match(capturedBody.contents[0].parts[0].text, /Откройте редактор/);
 
     assert.equal(result.provider, 'gemini');
+    assert.equal(result.model, 'gemini-2.5-pro-preview-tts');
     assert.equal(result.voice, 'Aoede');
     assert.equal(result.language, 'ru-RU');
+    assert.equal(result.speed, DEFAULT_SPEECH_SPEED);
     assert.equal(result.mimeType, 'audio/wav');
     assert.equal(result.sampleRate, 24000);
     assert.equal(result.channels, 1);
-    assert.equal(result.duration, 1.25);
+    const expectedSpedDuration = 1.25 / DEFAULT_SPEECH_SPEED;
+    assert.ok(
+      Math.abs(result.duration - expectedSpedDuration) < 0.03,
+      `expected ~${expectedSpedDuration.toFixed(4)}s after default speed=${DEFAULT_SPEECH_SPEED} atempo, got ${result.duration}`
+    );
 
-    // Verify the written WAV file is genuinely decodable by ffprobe
+    // Verify the written WAV file is genuinely decodable by ffprobe at post-atempo duration
     await access(outputFile);
     const probed = await probeAudio(outputFile);
     assert.equal(probed.hasAudio, true);
     assert.equal(probed.sampleRate, 24000);
     assert.equal(probed.channels, 1);
-    assert.ok(Math.abs(probed.duration - 1.25) < 0.02);
+    assert.ok(Math.abs(probed.duration - expectedSpedDuration) < 0.03);
 
-    // Also verify already-wrapped WAV response bytes pass through cleanly
+    // Verify default energetic stylePrompt is injected when stylePrompt/style are omitted, and speed: 1.0 skips atempo
     const wavBytes = encodePcm16Wav(makeSinePcm16Buffer({ duration: 0.5, sampleRate: 16000 }), {
       sampleRate: 16000,
       channels: 1,
     });
+    let defaultPromptText = '';
     const wavRes = await synthesizeSpeech({
       provider: 'gemini',
       text: 'Hello world.',
+      speed: 1.0,
+      model: 'gemini-2.5-flash-preview-tts',
       apiKey: 'fake-test-key',
-      fetchImpl: async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          candidates: [
-            {
-              content: {
-                parts: [{ inline_data: { mime_type: 'audio/wav', data: wavBytes.toString('base64') } }],
+      fetchImpl: async (_url, init) => {
+        defaultPromptText = JSON.parse(init.body).contents[0].parts[0].text;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [{ inline_data: { mime_type: 'audio/wav', data: wavBytes.toString('base64') } }],
+                },
               },
-            },
-          ],
-        }),
-      }),
+            ],
+          }),
+        };
+      },
     });
+    assert.match(defaultPromptText, /brisk, natural, energetic product-demo tone/i);
+    assert.equal(wavRes.model, 'gemini-2.5-flash-preview-tts');
     assert.equal(wavRes.voice, DEFAULT_GEMINI_VOICE);
     assert.equal(wavRes.sampleRate, 16000);
     assert.equal(wavRes.duration, 0.5);
+
+    // Verify buildAtempoFilterChain safely chains speeds outside [0.5, 2.0]
+    assert.equal(buildAtempoFilterChain(1.0), '');
+    assert.equal(buildAtempoFilterChain(1.1), 'atempo=1.1');
+    assert.equal(buildAtempoFilterChain(2.5), 'atempo=2.0,atempo=1.25');
+    assert.equal(buildAtempoFilterChain(0.4), 'atempo=0.5,atempo=0.8');
+    assert.throws(() => buildAtempoFilterChain(0), /positive finite/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -300,10 +335,11 @@ test('Kokoro offline fallback synthesizes real WAV via injectable runner and rep
   }
 });
 
-test('computeStepDuration enforces max(actionDuration, 0.2 + speechDuration + 0.4)', () => {
-  assert.equal(computeStepDuration({ actionDuration: 1.0, speechDuration: 2.0 }), 2.6);
+test('computeStepDuration enforces max(actionDuration, DEFAULT_STEP_LEAD_IN + speechDuration + DEFAULT_STEP_LEAD_OUT)', () => {
+  const pad = DEFAULT_STEP_LEAD_IN + DEFAULT_STEP_LEAD_OUT; // 0.12 + 0.22 = 0.34
+  assert.equal(computeStepDuration({ actionDuration: 1.0, speechDuration: 2.0 }), Number((2.0 + pad).toFixed(4)));
   assert.equal(computeStepDuration({ actionDuration: 3.5, speechDuration: 2.0 }), 3.5);
-  assert.equal(computeStepDuration({ actionDuration: 0.4, speechDuration: 0.5 }), 1.1);
+  assert.equal(computeStepDuration({ actionDuration: 0.4, speechDuration: 0.5 }), Number((0.5 + pad).toFixed(4)));
   assert.equal(computeStepDuration({ actionDuration: 1.2, speechDuration: 0 }), 1.2);
   assert.equal(computeStepDuration({ actionDuration: 0.5, speechDuration: 1.0, leadIn: 0.3, leadOut: 0.5 }), 1.8);
 
@@ -470,11 +506,12 @@ test('buildNarrationTracks creates multi-language audio, SRT/VTT files, and vali
 
     assert.equal(built.languages.length, 2);
     assert.equal(built.steps.length, 2);
-    // Step duration uses max speech duration across languages: max(1.5, 0.2 + 2.4 + 0.4) = 3.0
-    assert.equal(built.steps[0].duration, 3.0);
-    assert.equal(built.steps[1].start, 3.0);
-    assert.equal(built.steps[1].duration, 3.0);
-    assert.equal(built.totalDuration, 6.0);
+    // Step duration uses max speech duration across languages: max(1.5, 0.12 + 2.4 + 0.22) = 2.74
+    const expectedStepDur = Number((DEFAULT_STEP_LEAD_IN + 2.4 + DEFAULT_STEP_LEAD_OUT).toFixed(4));
+    assert.equal(built.steps[0].duration, expectedStepDur);
+    assert.equal(built.steps[1].start, expectedStepDur);
+    assert.equal(built.steps[1].duration, expectedStepDur);
+    assert.equal(built.totalDuration, Number((expectedStepDur * 2).toFixed(4)));
 
     // Validated timeline populated with audio tracks and multi-language caption tracks
     assert.ok(built.timeline);
@@ -484,8 +521,8 @@ test('buildNarrationTracks creates multi-language audio, SRT/VTT files, and vali
     assert.equal(built.timeline.overlays.captions.tracks.length, 2);
     assert.equal(built.timeline.audio.tracks.length, 2);
     assert.equal(built.timeline.audio.tracks[0].kind, 'narration');
-    assert.equal(built.timeline.audio.tracks[0].start, 0.2);
-    assert.equal(built.timeline.audio.tracks[1].start, 3.2);
+    assert.equal(built.timeline.audio.tracks[0].start, DEFAULT_STEP_LEAD_IN);
+    assert.equal(built.timeline.audio.tracks[1].start, Number((expectedStepDur + DEFAULT_STEP_LEAD_IN).toFixed(4)));
 
     // SRT & VTT written per language
     for (const lang of ['en', 'ru']) {
@@ -1190,14 +1227,19 @@ test('screen-kit narrate CLI and screen-kit run --narration en render muxed-audi
     assert.equal(narrateSummary.provider, 'kokoro');
     assert.equal(narrateSummary.aligner, 'proportional'); // auto fell back cleanly with no whisper/key
     assert.deepEqual(narrateSummary.languages, ['en', 'ru']);
-    assert.ok(narrateSummary.paddedSeconds >= 2.2, `expected padded timeline, got ${narrateSummary.paddedSeconds}`);
-    assert.ok(narrateSummary.totalDuration >= 3.2);
+    assert.ok(narrateSummary.paddedSeconds >= 1.8, `expected padded timeline, got ${narrateSummary.paddedSeconds}`);
+    assert.ok(narrateSummary.totalDuration >= 2.8);
     await access(narrateSummary.timelineFile);
     await access(narrateSummary.paddedVideoFile);
     await access(narrateSummary.subtitles.en.srtFile);
     await access(narrateSummary.subtitles.en.vttFile);
     await access(narrateSummary.subtitles.ru.srtFile);
     await access(narrateSummary.subtitles.ru.vttFile);
+
+    // Burned-in captions are OFF by default on narrated timelines while sidecar tracks & Netflix validation stay ON!
+    const persistedNarratedTimeline = JSON.parse(await readFile(narrateSummary.timelineFile, 'utf8'));
+    assert.equal(persistedNarratedTimeline.overlays.captions.enabled, false);
+    assert.equal(persistedNarratedTimeline.overlays.captions.tracks.length, 2);
 
     // Render the narrated timeline via Remotion into a muxed-audio MP4 and verify with ffprobe + reviewVideo
     const narratedMp4Out = join(narratedDir, 'narrated-demo.mp4');
@@ -1213,7 +1255,7 @@ test('screen-kit narrate CLI and screen-kit run --narration en render muxed-audi
     const probedMp4Audio = await probeAudio(narratedMp4Out);
     assert.equal(probedMp4.audio, true);
     assert.equal(probedMp4Audio.hasAudio, true);
-    assert.ok(probedMp4.duration >= 3.2);
+    assert.ok(probedMp4.duration >= 2.8);
 
     const narratedReview = await reviewVideo({
       video: narratedMp4Out,
@@ -1379,6 +1421,87 @@ test('screen-kit narrate CLI and screen-kit run --narration en render muxed-audi
     assert.equal(cliRunResult.review.checks.find((c) => c.name === 'step-speech-fit')?.ok, true);
     await access(cliRunResult.narration.subtitles.en.srtFile);
     await access(cliRunResult.narration.subtitles.en.vttFile);
+    const defaultRunTimeline = JSON.parse(await readFile(cliRunResult.timeline.file, 'utf8'));
+    assert.equal(defaultRunTimeline.overlays.captions.enabled, false);
+
+    // Explicit `--burn-captions` on `screen-kit narrate` enables burned-in captions cleanly
+    const burnedNarrateDir = join(workDir, 'out-narrated-burned');
+    const { stdout: burnedNarrateStdout } = await exec(
+      process.execPath,
+      [
+        CLI_PATH,
+        'narrate',
+        '--input', inputTimelinePath,
+        '--out', burnedNarrateDir,
+        '--lang', 'en',
+        '--provider', 'kokoro',
+        '--aligner', 'proportional',
+        '--burn-captions',
+      ],
+      { cwd: REPO_ROOT, env: cliEnv, timeout: 60000, maxBuffer: 10e6 }
+    );
+    const burnedSummary = JSON.parse(burnedNarrateStdout);
+    const burnedTimeline = JSON.parse(await readFile(burnedSummary.timelineFile, 'utf8'));
+    assert.equal(burnedTimeline.overlays.captions.enabled, true);
+
+    // Verify reviewNarration still enforces Netflix caption rules even when overlays.captions.enabled === false
+    const unburnedViolationTl = structuredClone(persistedNarratedTimeline);
+    unburnedViolationTl.overlays.captions.enabled = false;
+    unburnedViolationTl.overlays.captions.tracks[0].cues[0].text =
+      'This unburned sidecar caption cue intentionally exceeds forty-two characters on one line';
+    const unburnedCheck = await reviewNarration({
+      timeline: unburnedViolationTl,
+      baseDir: narratedDir,
+    });
+    assert.equal(unburnedCheck.ok, false);
+    assert.equal(unburnedCheck.checks.find((c) => c.name === 'caption-rules')?.ok, false);
+
+    // Verify Gemini TTS inside narrateTimeline applies FFmpeg atempo BEFORE word alignment
+    const rawTwoSecPcm = makeSinePcm16Buffer({ duration: 2.0, sampleRate: 24000, amplitude: 0.25 });
+    let alignInputDuration = null;
+    const geminiFastNarrated = await narrateTimeline({
+      timeline: baseCompiled,
+      eventTrack,
+      outDir: join(workDir, 'gemini-atempo-align'),
+      padVideo: false,
+      provider: 'gemini',
+      aligner: 'whisper',
+      speed: 2.2, // outside [0.5, 2.0] -> chains atempo=2.0,atempo=1.1 -> ~0.9091s!
+      apiKey: 'fake-gemini-key',
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'audio/L16;codec=pcm;rate=24000',
+                      data: rawTwoSecPcm.toString('base64'),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      }),
+      alignRunner: async ({ audioFile }) => {
+        const p = await probeAudio(audioFile);
+        alignInputDuration = p.duration;
+        return {
+          backend: 'mlx-whisper',
+          segments: [{ id: 0, start: 0, end: p.duration, words: [{ word: 'click', start: 0, end: p.duration * 0.5 }] }],
+        };
+      },
+    });
+    assert.ok(
+      alignInputDuration > 0.85 && alignInputDuration < 0.96,
+      `expected whisper aligner to receive post-atempo ~0.91s WAV, got ${alignInputDuration}s`
+    );
+    assert.equal(geminiFastNarrated.timeline.overlays.captions.enabled, false);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }

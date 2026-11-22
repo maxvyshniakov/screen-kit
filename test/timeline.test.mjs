@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   TIMELINE_VERSION,
+  CAMERA_EASINGS,
+  COLOR_SPACES,
+  DEFAULT_STEP_CAMERA_LEAD,
+  DEFAULT_STEP_CAMERA_EASING,
   applyEasing,
   sampleCamera,
   cameraViewportRect,
@@ -848,4 +852,71 @@ test('compileTimeline compiles per-step camera hints (wide, focus target/pointer
   assert.equal(check.ok, false);
   assert.ok(check.errors.some((e) => /\.zoom/.test(e)));
   assert.ok(check.errors.some((e) => /\.focus/.test(e)));
+});
+
+test('sine-in-out easing, smooth 1.3s / sine-in-out default step camera glides (with quint-in-out still supported), and optional colorSpace validation', () => {
+  assert.ok(CAMERA_EASINGS.includes('sine-in-out'));
+  assert.ok(CAMERA_EASINGS.includes('quint-in-out'));
+  assert.equal(DEFAULT_STEP_CAMERA_LEAD, 1.3);
+  assert.equal(DEFAULT_STEP_CAMERA_EASING, 'sine-in-out');
+  assert.deepEqual(COLOR_SPACES, ['srgb', 'p3']);
+
+  // Verify exact sine-in-out curve -(cos(pi * u) - 1) / 2 and gentler mid-curve slope vs quint-in-out
+  assert.equal(applyEasing('sine-in-out', 0), 0);
+  assert.equal(Object.is(applyEasing('sine-in-out', 0), -0), false);
+  assert.ok(Math.abs(applyEasing('sine-in-out', 0.25) - (-(Math.cos(Math.PI * 0.25) - 1) / 2)) < 1e-12);
+  assert.ok(Math.abs(applyEasing('sine-in-out', 0.5) - 0.5) < 1e-12);
+  assert.equal(applyEasing('sine-in-out', 1), 1);
+  // At u=0.25, sine-in-out (~0.1464) has already smoothly begun moving instead of lingering near 0 (~0.0156) like quintic
+  assert.ok(applyEasing('sine-in-out', 0.25) > applyEasing('quint-in-out', 0.25) * 5);
+
+  const stepTrack = makeFixtureEventTrack({
+    video: { file: 'take.mp4', width: 2880, height: 1620, fps: 60, duration: 5.0, frames: 300, colorSpace: 'p3' },
+    events: [
+      { t: 0.0, type: 'pointermove', x: 720, y: 405 },
+      { t: 2.0, type: 'step', index: 0, label: 'Zoom in', target: [500, 350], camera: { zoom: 1.6, focus: 'target' } },
+      { t: 4.2, type: 'step', index: 1, label: 'Back wide', camera: 'wide' },
+    ],
+  });
+
+  const compiled = compileTimeline({
+    eventTrack: stepTrack,
+    recipe: {
+      outputs: [
+        { preset: 'web-loop', colorSpace: 'p3' },
+        { preset: 'youtube-master', colorSpace: 'srgb' },
+      ],
+    },
+  });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+  assert.equal(compiled.take.colorSpace, 'p3');
+  assert.equal(compiled.outputs[0].colorSpace, 'p3');
+  assert.equal(compiled.outputs[1].colorSpace, 'srgb');
+
+  // Default step camera lead = 1.3s (depart at 2.0 - 1.3 = 0.7s) and default easing = 'sine-in-out'
+  const arriveZoom = compiled.camera.keyframes.find((kf) => kf.t === 2);
+  const departZoom = compiled.camera.keyframes.find((kf) => kf.t === 0.7);
+  const arriveWide = compiled.camera.keyframes.find((kf) => kf.t === 4.2);
+  assert.ok(departZoom, 'expected 1.3s lead departure keyframe at t=0.7');
+  assert.equal(arriveZoom?.easing, 'sine-in-out');
+  assert.equal(arriveWide?.easing, 'sine-in-out');
+
+  // Explicit quint-in-out recipe step still compiles cleanly
+  const explicitQuint = compileTimeline({
+    eventTrack: makeFixtureEventTrack({
+      events: [
+        { t: 1.5, type: 'step', index: 0, label: 'Quint zoom', target: [720, 405], camera: { zoom: 1.5, easing: 'quint-in-out', lead: 0.85 } },
+      ],
+    }),
+  });
+  assert.equal(explicitQuint.camera.keyframes.at(-1).easing, 'quint-in-out');
+
+  // Invalid colorSpace values are rejected on eventTrack, timeline.take, and timeline.outputs
+  assert.equal(validateEventTrack(makeFixtureEventTrack({ video: { ...stepTrack.video, colorSpace: 'rec2100' } })).ok, false);
+  const badTakeCs = structuredClone(compiled);
+  badTakeCs.take.colorSpace = 'adobe-rgb';
+  assert.equal(validateTimeline(badTakeCs).ok, false);
+  const badOutCs = structuredClone(compiled);
+  badOutCs.outputs[0].colorSpace = 'bt601';
+  assert.equal(validateTimeline(badOutCs).ok, false);
 });

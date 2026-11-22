@@ -58,6 +58,93 @@ export function minimumJerk(u) {
   return u * u * u * (10 - 15 * u + 6 * u * u);
 }
 
+const normalizeZero = (value) => (Object.is(value, -0) ? 0 : value);
+
+/**
+ * Distribute `deltaX`, `deltaY`, and optional `scaleFactor` across smooth 60 Hz sub-steps
+ * (`Math.max(12, Math.round(duration * sampleRate))` by default) weighted by a symmetric
+ * sine bell velocity curve `sin(pi * u)` so cumulative totals match `deltaX`, `deltaY`,
+ * and `scaleFactor` with zero drift.
+ */
+export function computeSmoothSubSteps({
+  deltaX = 0,
+  deltaY = 0,
+  scaleFactor,
+  duration = 0.28,
+  steps,
+  sampleRate = 60,
+} = {}) {
+  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
+    throw Error('computeSmoothSubSteps requires finite deltaX and deltaY');
+  }
+  if (!Number.isFinite(duration) || duration < 0) {
+    throw Error(`Invalid smooth step duration: ${duration}`);
+  }
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || sampleRate > 240) {
+    throw Error(`Invalid smooth step sampleRate: ${sampleRate}`);
+  }
+  const hasScale = scaleFactor !== undefined;
+  if (hasScale && (!Number.isFinite(scaleFactor) || scaleFactor <= 0)) {
+    throw Error(`Invalid pinch scaleFactor: ${scaleFactor}`);
+  }
+
+  let count;
+  if (steps !== undefined) {
+    if (!Number.isFinite(steps) || steps < 1) {
+      throw Error(`Invalid smooth steps count: ${steps}`);
+    }
+    count = Math.max(1, Math.round(steps));
+  } else {
+    count = Math.max(12, Math.round(duration * sampleRate));
+  }
+
+  const rawWeights = Array.from({ length: count }, (_, i) =>
+    count === 1 ? 1 : Math.sin(Math.PI * ((i + 0.5) / count))
+  );
+  const weightSum = rawWeights.reduce((acc, w) => acc + w, 0) || 1;
+  const weights = rawWeights.map((w) => w / weightSum);
+  const totalLogScale = hasScale ? Math.log(scaleFactor) : 0;
+
+  const subSteps = [];
+  let accWeight = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let prodScale = 1;
+
+  for (let i = 0; i < count; i += 1) {
+    const isLast = i === count - 1;
+    const u = count === 1 ? 0.5 : (i + 0.5) / count;
+    const w = weights[i];
+    accWeight += w;
+
+    const stepDx = isLast
+      ? normalizeZero(Number((deltaX - sumX).toFixed(6)))
+      : normalizeZero(Number((deltaX * accWeight - sumX).toFixed(4)));
+    const stepDy = isLast
+      ? normalizeZero(Number((deltaY - sumY).toFixed(6)))
+      : normalizeZero(Number((deltaY * accWeight - sumY).toFixed(4)));
+    sumX = Number((sumX + stepDx).toFixed(6));
+    sumY = Number((sumY + stepDy).toFixed(6));
+
+    let stepScale;
+    if (hasScale) {
+      stepScale = isLast ? scaleFactor / prodScale : Math.exp(totalLogScale * w);
+      prodScale *= stepScale;
+    }
+
+    subSteps.push({
+      index: i,
+      u: Number(u.toFixed(6)),
+      weight: Number(w.toFixed(6)),
+      deltaX: stepDx,
+      deltaY: stepDy,
+      ...(hasScale ? { scaleFactor: stepScale } : {}),
+    });
+  }
+
+  return subSteps;
+}
+
 function toPointTuple(point, label = 'point') {
   if (Array.isArray(point) && point.length === 2 && point.every(Number.isFinite)) {
     return [point[0], point[1]];
@@ -1451,18 +1538,48 @@ export async function createBrowserTakeCapture({
             if (!Number.isFinite(totalDx) || !Number.isFinite(totalDy)) {
               throw Error('Wheel step requires finite deltaX/deltaY');
             }
-            const wheelSteps = Math.max(1, Math.round(rawStep.steps ?? 1));
-            const stepDelayMs = wheelSteps > 1 ? ((rawStep.duration ?? 0.2) * 1000) / wheelSteps : 0;
-            for (let s = 0; s < wheelSteps; s++) {
-              const dx = Number((totalDx / wheelSteps).toFixed(2));
-              const dy = Number((totalDy / wheelSteps).toFixed(2));
-              const rawPhase = rawStep.phase ?? (wheelSteps === 1 ? 'changed' : s === 0 ? 'began' : s === wheelSteps - 1 ? 'ended' : 'changed');
-              if (!WHEEL_PHASES.has(rawPhase)) throw Error(`Invalid wheel phase: ${rawPhase}`);
-              const phase = rawPhase === 'maybegin' ? 'mayBegin' : rawPhase;
-              await page.mouse.wheel(dx, dy);
-              emit({ type: 'wheel', x: pointerX, y: pointerY, deltaX: dx, deltaY: dy, phase });
-              if (stepDelayMs > 0 && s + 1 < wheelSteps) await sleep(stepDelayMs);
+            const rawPhase = rawStep.phase ?? 'changed';
+            if (!WHEEL_PHASES.has(rawPhase)) throw Error(`Invalid wheel phase: ${rawPhase}`);
+            const phase = rawPhase === 'maybegin' ? 'mayBegin' : rawPhase;
+            const plannedWheelDur = rawStep.duration ?? 0.25;
+            if (!Number.isFinite(plannedWheelDur) || plannedWheelDur < 0) {
+              throw Error(`Invalid wheel duration: ${plannedWheelDur}`);
             }
+            const wheelSubSteps = computeSmoothSubSteps({
+              deltaX: totalDx,
+              deltaY: totalDy,
+              duration: plannedWheelDur,
+              steps: rawStep.steps,
+              sampleRate: 60,
+            });
+            const wheelStartT = nowT();
+            const beforeWheelMs = performance.now();
+            for (let s = 0; s < wheelSubSteps.length; s++) {
+              const sub = wheelSubSteps[s];
+              await page.mouse.wheel(sub.deltaX, sub.deltaY);
+              if (plannedWheelDur > 0 && s + 1 < wheelSubSteps.length) {
+                const targetElapsedMs = ((s + 1) / wheelSubSteps.length) * plannedWheelDur * 1000;
+                const waitMs = targetElapsedMs - (performance.now() - beforeWheelMs);
+                if (waitMs > 0.5) await sleep(waitMs);
+              }
+            }
+            const measuredWheelDur = roundTime((performance.now() - beforeWheelMs) / 1000);
+            const wheelDuration = Math.max(
+              0.05,
+              rawStep.duration !== undefined ? roundTime(rawStep.duration) : Math.max(roundTime(plannedWheelDur), measuredWheelDur),
+            );
+            emit({
+              t: wheelStartT,
+              type: 'wheel',
+              x: pointerX,
+              y: pointerY,
+              deltaX: totalDx,
+              deltaY: totalDy,
+              phase,
+              duration: wheelDuration,
+            });
+            nowT();
+            if (rawStep.settle) await sleep(rawStep.settle * 1000);
             break;
           }
           case 'gesture':
@@ -1494,52 +1611,97 @@ export async function createBrowserTakeCapture({
               if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
                 throw Error(`Invalid pinch scaleFactor: ${scaleFactor}`);
               }
-              const totalDy = rawStep.deltaY ?? roundCoord(-Math.log(scaleFactor) * 240);
+              const totalDy = rawStep.deltaY ?? Number((-Math.log(scaleFactor) * 240).toFixed(4));
               const totalDx = rawStep.deltaX ?? 0;
               if (!Number.isFinite(totalDx) || !Number.isFinite(totalDy)) {
                 throw Error('Pinch gesture requires finite deltaX/deltaY or positive scaleFactor');
               }
-              const pinchSteps = Math.max(1, Math.round(rawStep.steps ?? 8));
               const plannedDurSec = rawStep.duration ?? 0.28;
-              const stepDelayMs = pinchSteps > 1 ? (plannedDurSec * 1000) / pinchSteps : 0;
-              for (let s = 0; s < pinchSteps; s++) {
-                const stepDx = Number((totalDx / pinchSteps).toFixed(2));
-                const stepDy = Number((totalDy / pinchSteps).toFixed(2));
+              if (!Number.isFinite(plannedDurSec) || plannedDurSec < 0) {
+                throw Error(`Invalid pinch duration: ${plannedDurSec}`);
+              }
+              const pinchSubSteps = computeSmoothSubSteps({
+                deltaX: totalDx,
+                deltaY: totalDy,
+                scaleFactor,
+                duration: plannedDurSec,
+                steps: rawStep.steps,
+                sampleRate: 60,
+              });
+              const pinchStartMs = performance.now();
+              for (let s = 0; s < pinchSubSteps.length; s++) {
+                const sub = pinchSubSteps[s];
                 await activeCdp.send('Input.dispatchMouseEvent', {
                   type: 'mouseWheel',
                   x: pointerX,
                   y: pointerY,
-                  deltaX: stepDx,
-                  deltaY: stepDy,
+                  deltaX: sub.deltaX,
+                  deltaY: sub.deltaY,
                   modifiers: 2,
                 });
-                if (stepDelayMs > 0 && s + 1 < pinchSteps) await sleep(stepDelayMs);
+                if (plannedDurSec > 0 && s + 1 < pinchSubSteps.length) {
+                  const targetElapsedMs = ((s + 1) / pinchSubSteps.length) * plannedDurSec * 1000;
+                  const waitMs = targetElapsedMs - (performance.now() - pinchStartMs);
+                  if (waitMs > 0.5) await sleep(waitMs);
+                }
               }
               emittedDeltaX = totalDx;
-              emittedDeltaY = totalDy;
+              emittedDeltaY = roundCoord(totalDy);
             } else {
               const deltaX = rawStep.deltaX ?? rawStep.xDistance ?? 0;
               const deltaY = rawStep.deltaY ?? rawStep.yDistance ?? 0;
               if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
                 throw Error('Scroll gesture requires finite deltaX/deltaY');
               }
-              const distance = Math.hypot(deltaX, deltaY);
-              const speed = rawStep.speed ?? (
-                rawStep.duration && rawStep.duration > 0 && distance > 0
-                  ? Math.max(50, Math.round(distance / rawStep.duration))
-                  : 900
-              );
-              await activeCdp.send('Input.synthesizeScrollGesture', {
-                x: pointerX,
-                y: pointerY,
-                xDistance: deltaX,
-                yDistance: deltaY,
-                gestureSourceType: rawStep.gestureSourceType ?? 'mouse',
-                speed,
-                preventFling: rawStep.preventFling ?? false,
-                ...(rawStep.repeatCount !== undefined ? { repeatCount: rawStep.repeatCount } : {}),
-                ...(rawStep.repeatDelayMs !== undefined ? { repeatDelayMs: rawStep.repeatDelayMs } : {}),
-              });
+              if (rawStep.repeatCount !== undefined) {
+                const distance = Math.hypot(deltaX, deltaY);
+                const speed = rawStep.speed ?? (
+                  rawStep.duration && rawStep.duration > 0 && distance > 0
+                    ? Math.max(50, Math.round(distance / rawStep.duration))
+                    : 900
+                );
+                await activeCdp.send('Input.synthesizeScrollGesture', {
+                  x: pointerX,
+                  y: pointerY,
+                  xDistance: deltaX,
+                  yDistance: deltaY,
+                  gestureSourceType: rawStep.gestureSourceType ?? 'mouse',
+                  speed,
+                  preventFling: rawStep.preventFling ?? false,
+                  repeatCount: rawStep.repeatCount,
+                  ...(rawStep.repeatDelayMs !== undefined ? { repeatDelayMs: rawStep.repeatDelayMs } : {}),
+                });
+              } else {
+                const plannedScrollDur = rawStep.duration ?? 0.35;
+                if (!Number.isFinite(plannedScrollDur) || plannedScrollDur < 0) {
+                  throw Error(`Invalid scroll gesture duration: ${plannedScrollDur}`);
+                }
+                const scrollSubSteps = computeSmoothSubSteps({
+                  deltaX,
+                  deltaY,
+                  duration: plannedScrollDur,
+                  steps: rawStep.steps,
+                  sampleRate: 60,
+                });
+                const scrollStartMs = performance.now();
+                for (let s = 0; s < scrollSubSteps.length; s++) {
+                  const sub = scrollSubSteps[s];
+                  // Trackpad scroll gestures use finger-drag delta convention (opposite wheel sign).
+                  await activeCdp.send('Input.dispatchMouseEvent', {
+                    type: 'mouseWheel',
+                    x: pointerX,
+                    y: pointerY,
+                    deltaX: normalizeZero(-sub.deltaX),
+                    deltaY: normalizeZero(-sub.deltaY),
+                    modifiers: 0,
+                  });
+                  if (plannedScrollDur > 0 && s + 1 < scrollSubSteps.length) {
+                    const targetElapsedMs = ((s + 1) / scrollSubSteps.length) * plannedScrollDur * 1000;
+                    const waitMs = targetElapsedMs - (performance.now() - scrollStartMs);
+                    if (waitMs > 0.5) await sleep(waitMs);
+                  }
+                }
+              }
               emittedDeltaX = deltaX;
               emittedDeltaY = deltaY;
             }
@@ -1729,6 +1891,7 @@ export async function createBrowserTakeCapture({
           encodedFps,
           duration: Number(encoded.duration.toFixed(4)),
           frames: encoded.frames,
+          ...(colorSpace === 'p3' ? { colorSpace: 'p3' } : {}),
           capture: rawCapture,
         },
         startedAt,

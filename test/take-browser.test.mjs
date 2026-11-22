@@ -13,6 +13,7 @@ import {
   CAPTURE_MODES,
   captureBrowserTake,
   computeRawCaptureStats,
+  computeSmoothSubSteps,
   createMacFocusController,
   encodeScreencastFrames,
   minimumJerk,
@@ -1229,4 +1230,139 @@ test('failed browser take closes Chromium cleanly and leaves an inspectable fail
   assert.equal(report.status, 'failed');
   assert.equal(report.recipes.broken.status, 'failed');
   assert.match(report.recipes.broken.error, /matched no visible element/);
+});
+
+test('computeSmoothSubSteps and captureBrowserTake dispatch smooth 60 Hz sine-bell sub-steps for wheel, scroll gesture, and pinch with exact total deltas', async (t) => {
+  // 1. Unit checks on computeSmoothSubSteps
+  const minSubSteps = computeSmoothSubSteps({ deltaX: 180, deltaY: -90, duration: 0.05 });
+  assert.equal(minSubSteps.length, 12, 'short durations clamp to >= 12 smooth sub-steps');
+
+  const halfSecSubSteps = computeSmoothSubSteps({ deltaX: -360, deltaY: 240, scaleFactor: 1.5, duration: 0.5 });
+  assert.equal(halfSecSubSteps.length, 30, '0.5s at 60 Hz yields 30 sub-steps');
+
+  const sumDx = halfSecSubSteps.reduce((acc, s) => acc + s.deltaX, 0);
+  const sumDy = halfSecSubSteps.reduce((acc, s) => acc + s.deltaY, 0);
+  const prodScale = halfSecSubSteps.reduce((acc, s) => acc * s.scaleFactor, 1);
+  assert.ok(Math.abs(sumDx - -360) < 1e-6, `expected exact deltaX -360, got ${sumDx}`);
+  assert.ok(Math.abs(sumDy - 240) < 1e-6, `expected exact deltaY 240, got ${sumDy}`);
+  assert.ok(Math.abs(prodScale - 1.5) < 1e-9, `expected exact scaleFactor 1.5, got ${prodScale}`);
+
+  // Symmetric sin(pi * u) bell velocity profile: edge steps are gentle, mid-curve step is peak
+  assert.equal(halfSecSubSteps[0].weight, halfSecSubSteps.at(-1).weight);
+  assert.ok(halfSecSubSteps[14].weight > halfSecSubSteps[0].weight * 5);
+
+  // 2. Integration check through captureBrowserTake (wheel + scroll gesture + pinch + P3 video tag)
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-smooth-wheel-pinch-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const dummyFrame = (
+    await sharp({ create: { width: 32, height: 24, channels: 3, background: '#0f172a' } }).png().toBuffer()
+  ).toString('base64');
+
+  const wheelDispatches = [];
+  const cdpWheelDispatches = [];
+
+  const mockPw = {
+    chromium: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                return {
+                  viewportSize: () => ({ width: 640, height: 360 }),
+                  async goto() {},
+                  async evaluate() { return true; },
+                  mouse: {
+                    async move() {},
+                    async down() {},
+                    async up() {},
+                    async wheel(dx, dy) { wheelDispatches.push({ dx, dy }); },
+                  },
+                  keyboard: { async press() {}, async down() {}, async up() {} },
+                };
+              },
+              async newCDPSession() {
+                let listener = null;
+                return {
+                  on(ev, fn) { if (ev === 'Page.screencastFrame') listener = fn; },
+                  async send(method, params) {
+                    if (method === 'Input.dispatchMouseEvent' && params?.type === 'mouseWheel') {
+                      cdpWheelDispatches.push(params);
+                    }
+                    if (method === 'Page.captureScreenshot') return { data: dummyFrame };
+                    if (method === 'Page.startScreencast' && listener) {
+                      listener({ data: dummyFrame, metadata: { timestamp: 1.0 }, sessionId: 1 });
+                      listener({ data: dummyFrame, metadata: { timestamp: 1.05 }, sessionId: 2 });
+                    }
+                    return {};
+                  },
+                  async detach() {},
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+  };
+
+  const captured = await captureBrowserTake({
+    out: join(dir, 'take'),
+    captureMode: 'headless',
+    playwright: mockPw,
+    encodeFrames: async ({ outputFile, targetDuration, colorSpace }) => {
+      await writeFile(outputFile, Buffer.from('mp4'));
+      return {
+        width: 640,
+        height: 360,
+        fps: 60,
+        duration: Math.max(0.4, targetDuration),
+        frames: Math.max(24, Math.round(targetDuration * 60)),
+        measuredFps: 60,
+        capturedFrames: 2,
+        codec: 'h264',
+        audio: false,
+        colorSpace: colorSpace === 'p3' ? 'bt709' : 'bt709',
+        colorPrimaries: colorSpace === 'p3' ? 'smpte432' : 'bt709',
+        colorTransfer: colorSpace === 'p3' ? 'iec61966-2-1' : 'bt709',
+      };
+    },
+    recipe: {
+      url: 'https://example.test/smooth',
+      viewport: [640, 360],
+      colorSpace: 'p3',
+      fps: 60,
+      tail: 0.01,
+      steps: [
+        { type: 'wheel', x: 200, y: 180, moveDuration: 0, deltaX: 240, deltaY: -120, duration: 0.05 },
+        { type: 'gesture', kind: 'scroll', x: 200, y: 180, deltaX: -300, deltaY: 60, duration: 0.05 },
+        { type: 'gesture', kind: 'pinch', x: 320, y: 180, scaleFactor: 1.4, duration: 0.05 },
+      ],
+    },
+  });
+
+  // Wheel dispatched >= 12 smooth sub-steps summing to exact (240, -120)
+  assert.equal(wheelDispatches.length, 12);
+  assert.ok(Math.abs(wheelDispatches.reduce((a, d) => a + d.dx, 0) - 240) < 1e-5);
+  assert.ok(Math.abs(wheelDispatches.reduce((a, d) => a + d.dy, 0) - -120) < 1e-5);
+
+  // Scroll gesture (modifiers: 0) and pinch gesture (modifiers: 2) each dispatched 12 smooth sub-steps
+  const scrollDispatches = cdpWheelDispatches.filter((d) => d.modifiers === 0);
+  const pinchDispatches = cdpWheelDispatches.filter((d) => d.modifiers === 2);
+  assert.equal(scrollDispatches.length, 12);
+  assert.equal(pinchDispatches.length, 12);
+  // Trackpad finger drag (-300, +60) maps to wheel delta (+300, -60)
+  assert.ok(Math.abs(scrollDispatches.reduce((a, d) => a + d.deltaX, 0) - 300) < 1e-5);
+  assert.ok(Math.abs(scrollDispatches.reduce((a, d) => a + d.deltaY, 0) - -60) < 1e-5);
+  // Pinch wheel deltas reconstruct exact scaleFactor 1.4 via exp(-sum(deltaY) / 240)
+  const reconstructedScale = Math.exp(-pinchDispatches.reduce((a, d) => a + d.deltaY, 0) / 240);
+  assert.ok(Math.abs(reconstructedScale - 1.4) < 1e-4, `expected pinch scale 1.4, got ${reconstructedScale}`);
+
+  // Event track records exactly 1 wheel event and 2 gesture events (no HUD pill spam) + P3 colorSpace
+  assert.equal(captured.eventTrackData.video.colorSpace, 'p3');
+  assert.equal(captured.eventTrackData.events.filter((e) => e.type === 'wheel').length, 1);
+  assert.equal(captured.eventTrackData.events.filter((e) => e.type === 'gesture').length, 2);
 });

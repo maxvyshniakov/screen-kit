@@ -2,6 +2,7 @@ import React from 'react';
 import {
   AbsoluteFill,
   Audio,
+  Html5Video,
   Img,
   OffthreadVideo,
   Sequence,
@@ -631,9 +632,11 @@ function renderCaptions(captions, hudAnchor, gestures = [], keystrokes = []) {
 /**
  * Remotion 4 composition reading ONLY a validated `timeline` prop and staged media assets.
  */
-export function TimelineComposition({ timeline, renderVideoElement = true }) {
+export function TimelineComposition({ timeline, output, renderVideoElement = true }) {
   const frame = useCurrentFrame();
   const { fps, width, height } = useVideoConfig();
+  const isDisplayP3 = (output?.colorSpace ?? timeline?.take?.colorSpace) === 'p3';
+  const VideoElement = isDisplayP3 ? Html5Video : OffthreadVideo;
 
   const scene = computeFrameScene(timeline, {
     frame,
@@ -762,7 +765,7 @@ export function TimelineComposition({ timeline, renderVideoElement = true }) {
               },
             },
             renderVideoElement && videoSrc
-              ? h(OffthreadVideo, {
+              ? h(VideoElement, {
                   src: videoSrc,
                   muted: true,
                   style: {

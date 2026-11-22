@@ -1,8 +1,11 @@
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readdirSync } from 'node:fs';
 import { access, copyFile, link, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import sharp from 'sharp';
 import { bundle } from '@remotion/bundler';
 import {
@@ -12,11 +15,13 @@ import {
   renderStill,
   selectComposition,
 } from '@remotion/renderer';
-import { SAFE_OUTPUT_ID_RE, assertValidTimeline } from './timeline.mjs';
+import { COLOR_SPACES, SAFE_OUTPUT_ID_RE, assertValidTimeline } from './timeline.mjs';
 import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
 import { computeFrameScene, projectViewportToRender, screenToRender } from './remotion/layout.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
+
+const exec = promisify(execFile);
 
 export { computeFrameScene, projectViewportToRender, screenToRender };
 
@@ -149,9 +154,13 @@ export function resolveRenderTargets({
   posterFormat = 'png',
   posterTime = 0,
   fps,
+  colorSpace,
 } = {}) {
   assertValidTimeline(timeline);
 
+  if (colorSpace !== undefined && !COLOR_SPACES.includes(colorSpace)) {
+    throw Error(`colorSpace must be one of ${COLOR_SPACES.join(', ')} (received ${String(colorSpace)})`);
+  }
   if (!POSTER_FORMATS.has(posterFormat)) {
     throw Error(`posterFormat must be png or webp (received ${String(posterFormat)})`);
   }
@@ -169,6 +178,14 @@ export function resolveRenderTargets({
   const requestedProfiles = normalizeProfilesInput(profiles);
   const ext = !outDir && out ? extname(out).toLowerCase().slice(1) : '';
   const isSingleFile = Boolean(!outDir && out && SINGLE_FILE_EXTENSIONS.has(ext));
+
+  const resolveTargetColorSpace = (specColorSpace) => {
+    const resolved = colorSpace ?? specColorSpace ?? timeline.take.colorSpace ?? 'srgb';
+    if (!COLOR_SPACES.includes(resolved)) {
+      throw Error(`colorSpace must be one of ${COLOR_SPACES.join(', ')} (received ${String(resolved)})`);
+    }
+    return resolved;
+  };
 
   if (isSingleFile) {
     const file = resolve(out);
@@ -196,6 +213,7 @@ export function resolveRenderTargets({
     }
 
     const targetFps = fps ?? baseSpec.fps ?? timeline.take.fps;
+    const targetColorSpace = resolveTargetColorSpace(baseSpec.colorSpace);
     const singleOutDir = dirname(file);
     assertPathInsideDir(file, singleOutDir, 'output file');
     if (ext === 'png' || ext === 'webp') {
@@ -212,6 +230,7 @@ export function resolveRenderTargets({
             width: Math.max(1, Math.round(baseSpec.width ?? timeline.camera.outputWidth)),
             height: Math.max(1, Math.round(baseSpec.height ?? timeline.camera.outputHeight)),
             fps: targetFps,
+            colorSpace: targetColorSpace,
             posterTime,
             file,
           },
@@ -235,6 +254,7 @@ export function resolveRenderTargets({
           width,
           height,
           fps: targetFps,
+          colorSpace: targetColorSpace,
           loop: Boolean(baseSpec.loop),
           file,
         },
@@ -260,6 +280,7 @@ export function resolveRenderTargets({
   for (const spec of specs) {
     assertSafeOutputId(spec.id, 'output.id');
     const targetFps = fps ?? spec.fps ?? timeline.take.fps;
+    const targetColorSpace = resolveTargetColorSpace(spec.colorSpace);
     if (spec.id === 'web-loop') {
       const width = evenDimension(spec.width ?? timeline.camera.outputWidth);
       const height = evenDimension(spec.height ?? timeline.camera.outputHeight);
@@ -273,6 +294,7 @@ export function resolveRenderTargets({
         width,
         height,
         fps: targetFps,
+        colorSpace: targetColorSpace,
         loop: spec.loop ?? true,
         file: join(targetDir, 'web-loop.webm'),
       });
@@ -285,6 +307,7 @@ export function resolveRenderTargets({
         width,
         height,
         fps: targetFps,
+        colorSpace: targetColorSpace,
         loop: spec.loop ?? true,
         file: join(targetDir, 'web-loop.mp4'),
       });
@@ -297,6 +320,7 @@ export function resolveRenderTargets({
           width,
           height,
           fps: targetFps,
+          colorSpace: targetColorSpace,
           posterTime,
           file: join(targetDir, `web-loop-poster.${posterFormat}`),
         });
@@ -317,6 +341,7 @@ export function resolveRenderTargets({
         width,
         height,
         fps: masterFps,
+        colorSpace: targetColorSpace,
         loop: false,
         file: join(targetDir, 'youtube-master.mp4'),
       });
@@ -329,6 +354,7 @@ export function resolveRenderTargets({
           width,
           height,
           fps: masterFps,
+          colorSpace: targetColorSpace,
           posterTime,
           file: join(targetDir, `youtube-master-poster.${posterFormat}`),
         });
@@ -349,6 +375,7 @@ export function resolveRenderTargets({
         width,
         height,
         fps: shortsFps,
+        colorSpace: targetColorSpace,
         loop: Boolean(spec.loop),
         file: join(targetDir, 'shorts.mp4'),
       });
@@ -361,6 +388,7 @@ export function resolveRenderTargets({
           width,
           height,
           fps: shortsFps,
+          colorSpace: targetColorSpace,
           posterTime,
           file: join(targetDir, `shorts-poster.${posterFormat}`),
         });
@@ -377,6 +405,7 @@ export function resolveRenderTargets({
         width: Math.max(1, Math.round(spec.width ?? timeline.camera.outputWidth)),
         height: Math.max(1, Math.round(spec.height ?? timeline.camera.outputHeight)),
         fps: targetFps,
+        colorSpace: targetColorSpace,
         posterTime,
         file: join(targetDir, `${spec.id}.${spec.format}`),
       });
@@ -394,6 +423,7 @@ export function resolveRenderTargets({
       width,
       height,
       fps: targetFps,
+      colorSpace: targetColorSpace,
       loop: Boolean(spec.loop),
       file: join(targetDir, `${spec.id}.${spec.format}`),
     });
@@ -406,6 +436,7 @@ export function resolveRenderTargets({
         width,
         height,
         fps: targetFps,
+        colorSpace: targetColorSpace,
         posterTime,
         file: join(targetDir, `${spec.id}-poster.${posterFormat}`),
       });
@@ -550,6 +581,146 @@ async function loadTimelineInput(timelineInput, cwd) {
   throw Error('renderTimeline requires a timeline object or path to timeline.json');
 }
 
+function findLocalFullChromiumExecutable(env = process.env) {
+  const explicit = env.SCREEN_KIT_CHROMIUM_PATH ?? env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  if (explicit && existsSync(resolve(explicit))) {
+    return resolve(explicit);
+  }
+  const home = homedir();
+  const relCandidates =
+    process.platform === 'darwin'
+      ? [
+          'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+          'chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+          'chrome-mac/Chromium.app/Contents/MacOS/Chromium',
+        ]
+      : process.platform === 'linux'
+        ? ['chrome-linux64/chrome', 'chrome-linux/chrome', 'chrome']
+        : ['chrome-win64/chrome.exe', 'chrome-win/chrome.exe'];
+
+  const cacheRoots = [
+    env.PLAYWRIGHT_BROWSERS_PATH,
+    join(home, 'Library', 'Caches', 'ms-playwright'),
+    join(home, '.cache', 'ms-playwright'),
+    join(home, '.agent-browser', 'browsers'),
+  ].filter(Boolean);
+
+  for (const root of cacheRoots) {
+    if (!existsSync(root)) continue;
+    let subdirs = [];
+    try {
+      subdirs = readdirSync(root, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && (d.name.startsWith('chromium-') || d.name.startsWith('chrome-')))
+        .map((d) => d.name)
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    } catch {
+      subdirs = [];
+    }
+    for (const dir of subdirs) {
+      for (const rel of relCandidates) {
+        const candidate = join(root, dir, rel);
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+  }
+
+  const systemCandidates =
+    process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ]
+      : process.platform === 'linux'
+        ? ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+        : [];
+  for (const sysPath of systemCandidates) {
+    if (existsSync(sysPath)) return sysPath;
+  }
+  return null;
+}
+
+function buildDisplayP3FfmpegOverride() {
+  return ({ args }) => {
+    const out = [...args];
+    const setOpt = (names, val) => {
+      for (let i = 0; i < out.length; i += 1) {
+        if (names.includes(out[i]) && i + 1 < out.length) {
+          out[i + 1] = val;
+          return true;
+        }
+      }
+      return false;
+    };
+    const isStreamCopy = out.some(
+      (arg, idx) => (arg === '-c:v' || arg === '-vcodec' || arg === '-codec:v') && out[idx + 1] === 'copy'
+    );
+    if (!isStreamCopy) {
+      setOpt(['-vf', '-filter:v'], 'scale=out_color_matrix=bt709:out_range=tv');
+    }
+    if (!setOpt(['-color_primaries', '-color_primaries:v'], 'smpte432')) {
+      out.splice(out.length - 1, 0, '-color_primaries:v', 'smpte432');
+    }
+    if (!setOpt(['-color_trc', '-color_trc:v'], 'iec61966-2-1')) {
+      out.splice(out.length - 1, 0, '-color_trc:v', 'iec61966-2-1');
+    }
+    if (!setOpt(['-colorspace', '-colorspace:v'], 'bt709')) {
+      out.splice(out.length - 1, 0, '-colorspace:v', 'bt709');
+    }
+    if (!setOpt(['-color_range', '-color_range:v'], 'tv')) {
+      out.splice(out.length - 1, 0, '-color_range:v', 'tv');
+    }
+    return out;
+  };
+}
+
+async function tagMp4DisplayP3Cicp(filePath, codec, signal) {
+  const taggedTemp = `${filePath}.${randomUUID().slice(0, 8)}.p3.mp4`;
+  const bsfArgs =
+    codec === 'h265'
+      ? [
+          '-bsf:v',
+          'hevc_metadata=colour_primaries=12:transfer_characteristics=13:matrix_coefficients=1:video_full_range_flag=0',
+        ]
+      : [
+          '-bsf:v',
+          'h264_metadata=colour_primaries=12:transfer_characteristics=13:matrix_coefficients=1:video_full_range_flag=0',
+        ];
+  try {
+    await exec(
+      'ffmpeg',
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-i',
+        filePath,
+        '-map',
+        '0',
+        '-c',
+        'copy',
+        ...bsfArgs,
+        '-color_primaries',
+        'smpte432',
+        '-color_trc',
+        'iec61966-2-1',
+        '-colorspace',
+        'bt709',
+        '-color_range',
+        'tv',
+        '-movflags',
+        '+faststart',
+        taggedTemp,
+      ],
+      { timeout: 60000, maxBuffer: 10e6, ...(signal ? { signal } : {}) }
+    );
+    await rename(taggedTemp, filePath);
+  } finally {
+    await rm(taggedTemp, { force: true }).catch(() => {});
+  }
+}
+
 /**
  * Headlessly render a validated `timeline.json` (or timeline object) and its referenced take media
  * via Remotion 4 into `web-loop`, `youtube-master`, or explicit output targets.
@@ -563,6 +734,7 @@ export async function renderTimeline({
   posterFormat = 'png',
   posterTime = 0,
   fps,
+  colorSpace,
   cwd,
   concurrency,
   browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
@@ -579,6 +751,7 @@ export async function renderTimeline({
     posterFormat,
     posterTime,
     fps,
+    colorSpace,
   });
 
   const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
@@ -588,7 +761,33 @@ export async function renderTimeline({
   const bundleOutDir = join(tempDir, 'bundle');
   const tempOutputsDir = join(tempDir, 'outputs');
 
-  let browser = null;
+  const browsers = new Map();
+  const getBrowserForColorSpace = async (targetColorSpace) => {
+    const key = targetColorSpace === 'p3' ? 'p3' : 'srgb';
+    if (browsers.has(key)) return browsers.get(key);
+    if (key === 'p3') {
+      const p3Executable = browserExecutable ?? findLocalFullChromiumExecutable();
+      const p3ChromiumOptions = {
+        flags: {
+          'force-color-profile': 'display-p3-d65',
+        },
+      };
+      const instance = await openBrowser('chrome', {
+        ...(p3Executable ? { browserExecutable: p3Executable, chromeMode: 'chrome-for-testing' } : {}),
+        chromiumOptions: p3ChromiumOptions,
+        logLevel,
+      });
+      browsers.set(key, instance);
+      return instance;
+    }
+    const instance = await openBrowser('chrome', {
+      ...(browserExecutable ? { browserExecutable } : {}),
+      logLevel,
+    });
+    browsers.set(key, instance);
+    return instance;
+  };
+
   try {
     await mkdir(publicDir, { recursive: true });
     await mkdir(tempOutputsDir, { recursive: true });
@@ -604,11 +803,6 @@ export async function renderTimeline({
       rspack: true,
     });
 
-    browser = await openBrowser('chrome', {
-      ...(browserExecutable ? { browserExecutable } : {}),
-      logLevel,
-    });
-
     if (signal?.aborted) {
       throw Error('Timeline render aborted');
     }
@@ -619,11 +813,18 @@ export async function renderTimeline({
 
     const hasAudio = stagedTimeline.audio.tracks.length > 0;
     const stagedOutputs = [];
+    const p3FfmpegOverride = buildDisplayP3FfmpegOverride();
 
     for (const target of plan.targets) {
       if (signal?.aborted) {
         throw Error('Timeline render aborted');
       }
+      const isP3 = target.colorSpace === 'p3';
+      const browser = await getBrowserForColorSpace(target.colorSpace);
+      const p3ChromiumOptions = isP3
+        ? { flags: { 'force-color-profile': 'display-p3-d65' } }
+        : undefined;
+
       const inputProps = {
         timeline: stagedTimeline,
         output: {
@@ -631,6 +832,7 @@ export async function renderTimeline({
           width: target.width,
           height: target.height,
           fps: target.fps,
+          colorSpace: target.colorSpace,
         },
       };
 
@@ -639,6 +841,7 @@ export async function renderTimeline({
         id: COMPOSITION_ID,
         inputProps,
         puppeteerInstance: browser,
+        ...(p3ChromiumOptions ? { chromiumOptions: p3ChromiumOptions } : {}),
         logLevel,
       });
 
@@ -660,6 +863,7 @@ export async function renderTimeline({
           imageFormat: target.format,
           output: tempFile,
           puppeteerInstance: browser,
+          ...(p3ChromiumOptions ? { chromiumOptions: p3ChromiumOptions } : {}),
           ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
           overwrite: true,
           logLevel,
@@ -699,11 +903,22 @@ export async function renderTimeline({
           muted: !hasAudio,
           outputLocation: tempFile,
           puppeteerInstance: browser,
+          ...(isP3
+            ? {
+                disableSharedMemoryCapture: true,
+                chromiumOptions: p3ChromiumOptions,
+                ffmpegOverride: p3FfmpegOverride,
+              }
+            : {}),
           ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
           overwrite: true,
           ...(concurrency !== undefined ? { concurrency } : {}),
           logLevel,
         });
+
+        if (isP3 && target.format === 'mp4') {
+          await tagMp4DisplayP3Cicp(tempFile, target.codec, signal);
+        }
 
         const info = await probeVideo(tempFile);
         if (!info.frames || !(info.duration > 0)) {
@@ -755,8 +970,8 @@ export async function renderTimeline({
       outputs: renderedOutputs,
     };
   } finally {
-    if (browser) {
-      await browser.close({ silent: true }).catch(() => {});
+    for (const instance of browsers.values()) {
+      await instance.close({ silent: true }).catch(() => {});
     }
     await rm(tempDir, { recursive: true, force: true });
   }

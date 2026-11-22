@@ -17,6 +17,7 @@ export const TIMELINE_VERSION = 1;
 export const EVENT_TRACK_VERSION = 1;
 
 export const CAPTURE_MODES = ['quality', 'headless'];
+export const COLOR_SPACES = ['srgb', 'p3'];
 export const WINDOW_FRAMES = ['none', 'macos', 'browser', 'device'];
 export const BACKGROUND_TYPES = ['solid', 'gradient', 'image'];
 export const IMAGE_FITS = ['cover', 'contain', 'fill'];
@@ -25,6 +26,7 @@ export const CAMERA_EASINGS = [
   'ease-in',
   'ease-out',
   'ease-in-out',
+  'sine-in-out',
   'quint-in-out',
   'expo-out',
   'smoothstep',
@@ -37,8 +39,9 @@ export const OUTPUT_FORMATS = ['mp4', 'webm', 'png', 'webp'];
 export const SAFE_OUTPUT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 export const AUDIO_TRACK_KINDS = ['narration', 'sfx', 'music'];
 export const STEP_CAMERA_FOCUSES = ['target', 'pointer', 'window'];
-export const DEFAULT_STEP_CAMERA_LEAD = 0.85;
+export const DEFAULT_STEP_CAMERA_LEAD = 1.3;
 export const DEFAULT_STEP_CAMERA_HOLD = 0.35;
+export const DEFAULT_STEP_CAMERA_EASING = 'sine-in-out';
 export const DEFAULT_PORTRAIT_ASPECT_RATIO = 9 / 16;
 
 const EVENT_TYPES = new Set([
@@ -71,6 +74,12 @@ const EASING_ALIASES = {
   easeOut: 'ease-out',
   'ease-in-out': 'ease-in-out',
   easeInOut: 'ease-in-out',
+  'sine-in-out': 'sine-in-out',
+  sineInOut: 'sine-in-out',
+  'quint-in-out': 'quint-in-out',
+  quintInOut: 'quint-in-out',
+  'expo-out': 'expo-out',
+  expoOut: 'expo-out',
   smoothstep: 'smoothstep',
   hold: 'hold',
   step: 'hold',
@@ -128,6 +137,8 @@ export function applyEasing(easing, u) {
       return 1 - (1 - clamped) ** 3;
     case 'ease-in-out':
       return clamped < 0.5 ? 4 * clamped * clamped * clamped : 1 - ((-2 * clamped + 2) ** 3) / 2;
+    case 'sine-in-out':
+      return normalizeZero(-(Math.cos(Math.PI * clamped) - 1) / 2);
     case 'quint-in-out':
       return clamped < 0.5 ? 16 * clamped ** 5 : 1 - ((-2 * clamped + 2) ** 5) / 2;
     case 'expo-out':
@@ -435,6 +446,12 @@ export function validateEventTrack(eventTrack) {
       if (eventTrack.video.frames !== undefined && !isPositiveInteger(eventTrack.video.frames)) {
         errors.push('eventTrack.video.frames must be a positive integer');
       }
+      if (
+        eventTrack.video.colorSpace !== undefined &&
+        !COLOR_SPACES.includes(eventTrack.video.colorSpace)
+      ) {
+        errors.push(`eventTrack.video.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
+      }
       if (eventTrack.video.capture !== undefined) {
         const cap = eventTrack.video.capture;
         if (!isObject(cap)) {
@@ -688,6 +705,9 @@ export function validateTimeline(timeline) {
     if (!isPositiveInteger(take.frames)) errors.push('timeline.take.frames must be a positive integer');
     if (!CAPTURE_MODES.includes(take.captureMode)) {
       errors.push(`timeline.take.captureMode must be one of ${CAPTURE_MODES.join(', ')}`);
+    }
+    if (take.colorSpace !== undefined && !COLOR_SPACES.includes(take.colorSpace)) {
+      errors.push(`timeline.take.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
     }
     if (!isObject(take.viewport)) {
       errors.push('timeline.take.viewport must be an object');
@@ -1201,6 +1221,9 @@ export function validateTimeline(timeline) {
       if (output.poster !== undefined && typeof output.poster !== 'boolean') {
         errors.push(`${prefix}.poster must be a boolean`);
       }
+      if (output.colorSpace !== undefined && !COLOR_SPACES.includes(output.colorSpace)) {
+        errors.push(`${prefix}.colorSpace must be one of ${COLOR_SPACES.join(', ')}`);
+      }
     });
   }
 
@@ -1368,6 +1391,9 @@ function buildOutputProfiles(recipeOutputs, camera, take) {
       fps: entry.fps ?? base.fps ?? take.fps,
       ...(entry.loop !== undefined || base.loop !== undefined ? { loop: entry.loop ?? base.loop } : {}),
       ...(entry.poster !== undefined || base.poster !== undefined ? { poster: entry.poster ?? base.poster } : {}),
+      ...(entry.colorSpace !== undefined || base.colorSpace !== undefined
+        ? { colorSpace: entry.colorSpace ?? base.colorSpace }
+        : {}),
     };
     return profile;
   });
@@ -1788,7 +1814,7 @@ export function compileStepCameraKeyframes({
       return {
         t: roundTime(event.t),
         ...pose,
-        easing: 'quint-in-out',
+        easing: DEFAULT_STEP_CAMERA_EASING,
         lead: DEFAULT_STEP_CAMERA_LEAD,
         hold: DEFAULT_STEP_CAMERA_HOLD,
       };
@@ -1830,7 +1856,7 @@ export function compileStepCameraKeyframes({
     return {
       t: roundTime(event.t),
       ...pose,
-      easing: normalizeEasing(hint.easing, 'quint-in-out'),
+      easing: normalizeEasing(hint.easing, DEFAULT_STEP_CAMERA_EASING),
       lead: hint.lead ?? DEFAULT_STEP_CAMERA_LEAD,
       hold: hint.hold ?? DEFAULT_STEP_CAMERA_HOLD,
     };
@@ -1977,6 +2003,8 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     ? { ...recipe, ...recipe.presentation }
     : recipe;
 
+  const takeColorSpace =
+    take?.colorSpace ?? effectiveRecipe.colorSpace ?? eventTrack.video?.colorSpace;
   const resolvedTake = {
     video: take?.video ?? eventTrack.video?.file,
     eventTrack: take?.eventTrack ?? (typeof eventTrack.file === 'string' ? eventTrack.file : 'event-track.json'),
@@ -1986,6 +2014,7 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     duration: take?.duration ?? eventTrack.video?.duration,
     frames: take?.frames ?? eventTrack.video?.frames,
     captureMode: take?.captureMode ?? eventTrack.captureMode,
+    ...(takeColorSpace !== undefined ? { colorSpace: takeColorSpace } : {}),
     viewport: {
       width: take?.viewport?.width ?? eventTrack.viewport?.width,
       height: take?.viewport?.height ?? eventTrack.viewport?.height,

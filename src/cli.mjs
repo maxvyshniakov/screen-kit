@@ -13,16 +13,16 @@ const help = `screen-kit ${VERSION}
 
 screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
-screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4]
-screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--whisper-model path] [--voice Kore] [--style "..."]
+screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4] [--color-space srgb|p3]
+screen-kit narrate --input timeline.json --out out/narrated --lang en [--provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional] [--whisper-model path] [--voice Kore] [--style "..."] [--speed 1.1] [--burn-captions]
 screen-kit audio-mix --input timeline.json --out out/audio [--music bed.wav] [--sfx] [--duck-mode envelope|sidechain] [--duck-db -10] [--video demo.mp4] [--out-video demo-mixed.mp4]
 screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
-screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--baseline stills-dir] [--multimodal] [--narration en] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
+screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop] [--color-space srgb|p3] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--baseline stills-dir] [--multimodal] [--narration en] [--burn-captions] [--tts-provider gemini|kokoro] [--aligner auto|whisper|gemini|proportional]
 screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json] [--verify-cursor]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
-screen-kit render --input take.gif --out demo.mp4 [--fps 30]
-screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master,shorts] [--poster-format png]
+screen-kit render --input take.gif --out demo.mp4 [--fps 30] [--color-space srgb|p3]
+screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master,shorts] [--poster-format png] [--color-space srgb|p3]
 screen-kit publish --target web --input demo.mp4 --out out/web [--name demo] [--poster poster.png] [--formats vp9,h264] [--fps 30] [--color-space srgb|p3]
 screen-kit publish --target youtube --input demo.mp4 --title "..." [--description "..."] [--privacy unlisted|private|public] [--captions en:subs.srt] [--thumbnail thumb.png] [--dry-run] [--out report.json]
 screen-kit asset --kind thumbnail|wallpaper --prompt "..." --out out/thumb.png [--aspect-ratio 16:9] [--model imagen-3.0-generate-002] [--cache-dir dir]
@@ -138,14 +138,14 @@ const allowed = new Set([
   'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir',
   'verify-cursor', 'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
-  'kind', 'prompt', 'aspect-ratio', 'model', 'whisper-model', 'cache-dir',
+  'kind', 'prompt', 'aspect-ratio', 'model', 'tts-model', 'whisper-model', 'cache-dir',
   'target', 'name', 'poster', 'formats', 'color-space',
   'title', 'description', 'privacy', 'captions', 'thumbnail', 'dry-run',
-  'lang', 'language', 'narration', 'tts-provider', 'aligner', 'voice', 'style', 'style-prompt', 'speed',
+  'lang', 'language', 'narration', 'burn-captions', 'tts-provider', 'aligner', 'voice', 'style', 'style-prompt', 'speed',
   'music', 'sfx', 'duck-mode', 'duck-db', 'out-video', 'music-lufs', 'keep-stems',
 ]);
 const booleanFlags = new Set([
-  'multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor', 'sfx', 'keep-stems',
+  'multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor', 'sfx', 'keep-stems', 'burn-captions',
 ]);
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
@@ -222,6 +222,7 @@ try {
         take: {
           ...(relVideo ? { video: relVideo } : {}),
           eventTrack: relEventTrack,
+          ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}),
         },
         eventTrack,
         recipe: timelineRecipe,
@@ -290,6 +291,7 @@ try {
           out: resolve(flags.out),
           ...(profileArg ? { profiles: profileArg } : {}),
           ...(flags['poster-format'] ? { posterFormat: flags['poster-format'] } : {}),
+          ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}),
           ...(flags.fps ? { fps: Number(flags.fps) } : {}),
           ...(flags.at ? { posterTime: Number(flags.at) } : {}),
         });
@@ -299,7 +301,8 @@ try {
         result=await renderTerminalTake({cast:resolve(flags.input),out:dirname(output),name:basename(output,extension),
           recipe:{format:extension.slice(1),...(flags.fps?{fps:Number(flags.fps)}:{}),...(flags.at?{at:Number(flags.at)}:{})}});
       } else result=await renderVideo({ input: flags.input, output: flags.out,
-        ...(flags.fps ? { fps: Number(flags.fps) } : {}) });
+        ...(flags.fps ? { fps: Number(flags.fps) } : {}),
+        ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}) });
       console.log(JSON.stringify(result, null, 2));
     } else if (command === 'preview') {
       const timelineArg = flags.input ?? flags.timeline;
@@ -349,7 +352,13 @@ try {
         throw Error(`--speed must be a positive finite number (received ${flags.speed})`);
       }
 
-      const alignerModel = flags['whisper-model'] ?? flags.model;
+      const burnInCaptions = parseBoolFlag(flags['burn-captions'], 'burn-captions');
+      const ttsModel =
+        flags['tts-model'] ??
+        (flags.model && !['whisper', 'gemini'].includes(flags.aligner) ? flags.model : undefined);
+      const alignerModel =
+        flags['whisper-model'] ??
+        (['whisper', 'gemini'].includes(flags.aligner) ? flags.model : undefined);
       const { narrateTimeline } = await import('./narration.mjs');
       const narrated = await narrateTimeline({
         ...(timelineArg ? { timeline: resolve(timelineArg) } : {}),
@@ -361,12 +370,14 @@ try {
         ...(langs.length > 1 ? { languages: langs } : {}),
         provider: flags['tts-provider'] ?? flags.provider ?? 'gemini',
         aligner: flags.aligner ?? 'auto',
+        ...(ttsModel ? { ttsModel } : {}),
         ...(flags['whisper-model'] ? { whisperModel: flags['whisper-model'] } : {}),
         ...(flags.aligner === 'gemini' && flags.model ? { geminiModel: flags.model } : {}),
         ...(alignerModel ? { alignerOptions: { model: alignerModel } } : {}),
         ...(flags.voice ? { voice: flags.voice } : {}),
         ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
         ...(speedVal !== undefined ? { speed: speedVal } : {}),
+        ...(flags['burn-captions'] !== undefined ? { burnInCaptions } : {}),
       });
       const { timeline: _fullTimeline, ...summary } = narrated;
       console.log(JSON.stringify(summary, null, 2));
@@ -480,7 +491,13 @@ try {
         ...(flags.baseline ? { baseline: resolve(flags.baseline) } : {}),
         ...(multimodalEnabled ? { multimodal: { enabled: true, provider: 'gemini' } } : {}),
       };
-      const alignerModel = flags['whisper-model'] ?? flags.model;
+      const burnInCaptions = parseBoolFlag(flags['burn-captions'], 'burn-captions');
+      const ttsModel =
+        flags['tts-model'] ??
+        (flags.model && !['whisper', 'gemini'].includes(flags.aligner) ? flags.model : undefined);
+      const alignerModel =
+        flags['whisper-model'] ??
+        (['whisper', 'gemini'].includes(flags.aligner) ? flags.model : undefined);
       const result = await runPipeline({
         config: loaded.config,
         cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
@@ -489,14 +506,18 @@ try {
         previewOnly: parseBoolFlag(flags['preview-only'], 'preview-only'),
         reuseTake: parseBoolFlag(flags['reuse-take'], 'reuse-take'),
         ...(profileArg ? { profiles: profileArg } : {}),
+        ...(flags['color-space'] ? { colorSpace: flags['color-space'] } : {}),
         ...(Object.keys(reviewOptions).length > 0 ? { reviewOptions } : {}),
         ...(flags.narration !== undefined ? { narration: flags.narration } : {}),
+        ...(flags['burn-captions'] !== undefined ? { burnInCaptions } : {}),
         ...((flags['tts-provider'] ?? flags.provider) ? { ttsProvider: flags['tts-provider'] ?? flags.provider } : {}),
         ...(flags.aligner ? { aligner: flags.aligner } : {}),
         narrationOptions: {
+          ...(ttsModel ? { ttsModel } : {}),
           ...(flags.voice ? { voice: flags.voice } : {}),
           ...((flags['style-prompt'] ?? flags.style) ? { stylePrompt: flags['style-prompt'] ?? flags.style } : {}),
           ...(speedVal !== undefined ? { speed: speedVal } : {}),
+          ...(flags['burn-captions'] !== undefined ? { burnInCaptions } : {}),
           ...(flags['whisper-model'] ? { whisperModel: flags['whisper-model'] } : {}),
           ...(alignerModel ? { alignerOptions: { model: alignerModel } } : {}),
         },

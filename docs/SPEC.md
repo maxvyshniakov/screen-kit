@@ -94,11 +94,14 @@ Edited product videos ship in explicit increments behind a replaceable renderer 
 
 ### Separate and subsequent tracks
 
-- **Display P3 video preservation:** separate spike and acceptance gate; Increment 1 accepts
-  sRGB/BT.709 video first.
+- **Display P3 video preservation:** optional `colorSpace: 'srgb' | 'p3'` across browser takes,
+  `timeline.json` (`take.colorSpace` / `outputs[].colorSpace`), headless Remotion rendering,
+  and web publishing; Increment 1 defaults to sRGB/BT.709 when omitted.
 - **Increment 2 — narration and captions:** Gemini TTS via CLI/API as the primary cloud voice
-  provider with local Kokoro as the offline fallback; forced word alignment, Netflix-style
-  captions, `max(action, 0.2 s + speech + 0.4 s)` step timing, and audio/caption review checks.
+  provider (`gemini-2.5-pro-preview-tts` default, `speed: 1.1`) with local Kokoro as the offline
+  fallback; forced word alignment, Netflix-style sidecar captions (burned-in captions opt-in via
+  `--burn-captions`), `max(action, 0.12 s + speech + 0.22 s)` step timing, and audio/caption
+  review checks.
 - **Non-UI generated assets:** image generation may be used for stage wallpapers, covers and
   thumbnails. Generative video (e.g., Veo) is excluded from core UI capture; UI footage always
   comes from real engines.

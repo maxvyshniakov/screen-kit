@@ -2424,7 +2424,10 @@ export async function reviewVideo({
   }
 
   // 6b. Optional narration & caption checks (only when captions/audio tracks are active or explicitly enabled)
-  const hasTimelineCaptions = Boolean(timeline?.overlays?.captions?.enabled);
+  const hasTimelineCaptions =
+    Boolean(timeline?.overlays?.captions?.enabled) ||
+    (Array.isArray(timeline?.overlays?.captions?.tracks) &&
+      timeline.overlays.captions.tracks.length > 0);
   const hasTimelineAudio = Array.isArray(timeline?.audio?.tracks) && timeline.audio.tracks.length > 0;
   const shouldReviewNarration =
     narrationOptions?.enabled !== false &&
