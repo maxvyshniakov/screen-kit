@@ -947,6 +947,12 @@ export function validateTimeline(timeline) {
       if (!CURSOR_STYLES.includes(cursor.style)) {
         errors.push(`timeline.overlays.cursor.style must be one of ${CURSOR_STYLES.join(', ')}`);
       }
+      if (cursor.color !== undefined && !isNonEmptyString(cursor.color)) {
+        errors.push('timeline.overlays.cursor.color must be a non-empty string');
+      }
+      if (cursor.shadow !== undefined && typeof cursor.shadow !== 'boolean') {
+        errors.push('timeline.overlays.cursor.shadow must be a boolean');
+      }
       if (!Array.isArray(cursor.samples)) {
         errors.push('timeline.overlays.cursor.samples must be an array');
       } else {
@@ -1603,6 +1609,8 @@ function compileOverlays(events, recipeOverlays, duration) {
       cursor: {
         enabled: cursorCfg.enabled !== false,
         style: cursorCfg.style ?? 'macos',
+        ...(cursorCfg.color !== undefined ? { color: cursorCfg.color } : {}),
+        ...(cursorCfg.shadow !== undefined ? { shadow: cursorCfg.shadow } : {}),
         samples: cursorSamples,
       },
       ripples,

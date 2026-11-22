@@ -601,6 +601,8 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight, ca
     const projected = projectPoint(rawCursor.x, rawCursor.y);
     cursor = {
       style: timeline.overlays.cursor.style ?? 'macos',
+      ...(timeline.overlays.cursor.color ? { color: timeline.overlays.cursor.color } : {}),
+      ...(timeline.overlays.cursor.shadow !== undefined ? { shadow: timeline.overlays.cursor.shadow } : {}),
       viewportX: rawCursor.x,
       viewportY: rawCursor.y,
       screenX: projected.screenX,

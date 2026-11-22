@@ -488,7 +488,17 @@ export async function locateCursorMarker(image, options = {}) {
       const b = target.data[idx + 2];
 
       let matched = false;
-      if (targetColor) {
+      if (targetColor && cleanData) {
+        const matchesColor =
+          Math.abs(r - targetColor.r) <= tolerance &&
+          Math.abs(g - targetColor.g) <= tolerance &&
+          Math.abs(b - targetColor.b) <= tolerance;
+        const differsFromClean =
+          Math.abs(r - cleanData[idx]) > diffThreshold ||
+          Math.abs(g - cleanData[idx + 1]) > diffThreshold ||
+          Math.abs(b - cleanData[idx + 2]) > diffThreshold;
+        matched = matchesColor && differsFromClean;
+      } else if (targetColor) {
         matched =
           Math.abs(r - targetColor.r) <= tolerance &&
           Math.abs(g - targetColor.g) <= tolerance &&
@@ -574,6 +584,8 @@ export function verifyCursorAccuracy({
   outputWidth,
   outputHeight,
   fps,
+  mode: modeOverride,
+  preferEventTrack = false,
 } = {}) {
   if (!isFiniteNumber(thresholdPx) || thresholdPx <= 0) {
     throw Error('cursorThresholdPx must be a positive finite number');
@@ -596,7 +608,11 @@ export function verifyCursorAccuracy({
 
   const trackCursor = buildCursorFromEventTrack(eventTrack, timeline?.take?.duration ?? 0);
   const referenceCursor =
-    Array.isArray(cursor.samples) && cursor.samples.length > 0 ? cursor : trackCursor;
+    preferEventTrack && trackCursor?.samples?.length > 0
+      ? trackCursor
+      : Array.isArray(cursor.samples) && cursor.samples.length > 0
+        ? cursor
+        : trackCursor;
 
   if (!referenceCursor || referenceCursor.samples.length === 0) {
     return {
@@ -640,7 +656,7 @@ export function verifyCursorAccuracy({
   let pixelVerified = false;
 
   if (Array.isArray(cursorSamples) && cursorSamples.length > 0) {
-    mode = 'observed-samples';
+    mode = modeOverride ?? 'observed-samples';
     pixelVerified = true;
     for (const sample of cursorSamples) {
       if (!isObject(sample) || !isFiniteNumber(sample.t)) continue;
@@ -763,6 +779,431 @@ export function verifyCursorAccuracy({
     violations,
     comparisons,
   };
+}
+
+function formatColorHex({ r, g, b }) {
+  const clampByte = (val) => Math.max(0, Math.min(255, Math.round(val)));
+  return (
+    '#' +
+    [clampByte(r), clampByte(g), clampByte(b)]
+      .map((v) => v.toString(16).padStart(2, '0'))
+      .join('')
+  );
+}
+
+function pickAlternateMarkerColor(primary) {
+  const distToCyan = Math.hypot(primary.r - 0, primary.g - 255, primary.b - 255);
+  return distToCyan > 120 ? { r: 0, g: 255, b: 255 } : { r: 255, g: 0, b: 255 };
+}
+
+function selectCursorVerificationTimes({
+  timeline,
+  cursor,
+  renderFps,
+  maxFrame,
+  maxSamples = 8,
+  renderWidth,
+  renderHeight,
+}) {
+  const candidates = [];
+  const kfs = Array.isArray(timeline?.camera?.keyframes) ? timeline.camera.keyframes : [];
+  for (let i = 0; i < kfs.length; i += 1) {
+    if (isFiniteNumber(kfs[i]?.t)) candidates.push({ t: kfs[i].t, priority: 3 });
+    if (i + 1 < kfs.length && isFiniteNumber(kfs[i + 1]?.t) && kfs[i + 1].t > kfs[i].t) {
+      const a = kfs[i];
+      const b = kfs[i + 1];
+      if (a.zoom !== b.zoom || a.x !== b.x || a.y !== b.y) {
+        candidates.push({ t: (a.t + b.t) / 2, priority: 3 });
+      }
+    }
+  }
+  for (const step of timeline?.steps ?? []) {
+    if (isFiniteNumber(step?.t)) candidates.push({ t: step.t, priority: 2 });
+  }
+  for (const sample of cursor?.samples ?? []) {
+    if (isFiniteNumber(sample?.t)) candidates.push({ t: sample.t, priority: 1 });
+  }
+
+  const byFrame = new Map();
+  for (const item of candidates) {
+    const clampedT = Math.max(0, Math.min(item.t, maxFrame / renderFps));
+    const frame = Math.min(maxFrame, Math.max(0, Math.floor(clampedT * renderFps + 1e-9)));
+    const frameT = snapToFrameBoundary(frame / renderFps, renderFps);
+    const vp = sampleCursor(cursor, frameT);
+    if (!vp || !vp.visible) continue;
+
+    const renderPt = projectViewportToRender(
+      vp.x,
+      vp.y,
+      timeline,
+      frameT,
+      renderWidth,
+      renderHeight
+    );
+    const dotRadius = Math.ceil(9 * (renderPt.cameraState?.renderScale || 1)) + 2;
+    const insideVisibleFrame =
+      renderPt.x >= 1 &&
+      renderPt.x <= renderWidth - 1 &&
+      renderPt.y >= 1 &&
+      renderPt.y <= renderHeight - 1;
+    if (!insideVisibleFrame) continue;
+
+    const unclipped =
+      renderPt.x >= dotRadius &&
+      renderPt.x <= renderWidth - dotRadius &&
+      renderPt.y >= dotRadius &&
+      renderPt.y <= renderHeight - dotRadius;
+    const camSample = renderPt.cameraState?.sample ?? sampleCamera(timeline.camera, frameT);
+    const isZoomed = Math.abs((camSample?.zoom ?? 1) - 1) > 0.02;
+
+    const existing = byFrame.get(frame);
+    const score = item.priority + (unclipped ? 10 : 0);
+    if (!existing || score > existing.score) {
+      byFrame.set(frame, { frame, t: frameT, unclipped, isZoomed, score });
+    }
+  }
+
+  let all = [...byFrame.values()].sort((a, b) => a.frame - b.frame);
+  const unclippedOnly = all.filter((entry) => entry.unclipped);
+  if (unclippedOnly.length > 0) {
+    all = unclippedOnly;
+  }
+
+  if (all.length <= maxSamples) {
+    return all.map((entry) => entry.t);
+  }
+
+  const chosen = new Set();
+  const wideIdx = all.findIndex((entry) => !entry.isZoomed);
+  const zoomedIdx = all.findIndex((entry) => entry.isZoomed);
+  if (wideIdx >= 0) chosen.add(wideIdx);
+  if (zoomedIdx >= 0) chosen.add(zoomedIdx);
+  chosen.add(0);
+  chosen.add(all.length - 1);
+
+  for (let i = 0; i < maxSamples && chosen.size < maxSamples; i += 1) {
+    const idx = maxSamples === 1 ? 0 : Math.round((i * (all.length - 1)) / (maxSamples - 1));
+    chosen.add(idx);
+  }
+  for (let idx = 0; idx < all.length && chosen.size < maxSamples; idx += 1) {
+    chosen.add(idx);
+  }
+
+  return [...chosen]
+    .sort((a, b) => a - b)
+    .slice(0, maxSamples)
+    .map((idx) => all[idx].t);
+}
+
+/**
+ * Automated pixel-level cursor verification pass:
+ * Renders sampled frame-aligned stills from a verification copy of `timeline` with a high-contrast
+ * `dot` cursor marker alongside clean cursorless stills in ONE shared Remotion session, runs
+ * `locateCursorMarker` at `snapToFrameBoundary(t, fps)`, and asserts `maxErrorPx <= thresholdPx`
+ * across both `1x` and zoomed/panned frames.
+ */
+export async function verifyRenderedCursorPixels({
+  timeline: timelineInput,
+  eventTrack: eventTrackInput,
+  outDir,
+  sampleTimes,
+  maxSamples = 8,
+  thresholdPx = DEFAULT_CURSOR_THRESHOLD_PX,
+  markerColor = { r: 255, g: 0, b: 255 },
+  outputWidth,
+  outputHeight,
+  fps,
+  cwd,
+  baseDir,
+  browserExecutable,
+  scratchDir,
+} = {}) {
+  if (!isFiniteNumber(thresholdPx) || thresholdPx <= 0) {
+    throw Error('thresholdPx must be a positive finite number');
+  }
+  if (!Number.isInteger(maxSamples) || maxSamples < 1 || maxSamples > 120) {
+    throw Error('maxSamples must be an integer between 1 and 120');
+  }
+
+  const parsedPrimaryColor = parseColor(markerColor);
+  const parsedAltColor = pickAlternateMarkerColor(parsedPrimaryColor);
+  const primaryHex = formatColorHex(parsedPrimaryColor);
+  const altHex = formatColorHex(parsedAltColor);
+
+  const timeline = await loadJsonOrObject(timelineInput, 'timeline');
+  if (!timeline) {
+    throw Error('verifyRenderedCursorPixels requires a timeline object or path to timeline.json');
+  }
+
+  const resolvedBaseDir =
+    typeof timelineInput === 'string'
+      ? dirname(resolve(cwd ?? process.cwd(), timelineInput))
+      : resolve(baseDir ?? cwd ?? process.cwd());
+
+  let eventTrack = await loadJsonOrObject(eventTrackInput, 'eventTrack');
+  if (
+    !eventTrack &&
+    typeof timeline.take?.eventTrack === 'string' &&
+    timeline.take.eventTrack.length > 0 &&
+    !/^(?:https?:|data:|blob:)/i.test(timeline.take.eventTrack)
+  ) {
+    const candidateTrackPath = resolve(resolvedBaseDir, timeline.take.eventTrack);
+    if (await fileExists(candidateTrackPath)) {
+      try {
+        eventTrack = JSON.parse(await readFile(candidateTrackPath, 'utf8'));
+      } catch {
+        // Optional eventTrack auto-resolution when verifying from timeline alone.
+      }
+    }
+  }
+
+  const cursor = timeline.overlays?.cursor;
+  if (!cursor?.enabled) {
+    return {
+      ok: true,
+      checked: false,
+      skipped: true,
+      mode: 'disabled',
+      thresholdPx,
+      samplesChecked: 0,
+      maxErrorPx: 0,
+      meanErrorPx: 0,
+      violations: [],
+      comparisons: [],
+    };
+  }
+
+  const trackCursor = buildCursorFromEventTrack(eventTrack, timeline.take?.duration ?? 0);
+  const effectiveSamples =
+    Array.isArray(cursor.samples) && cursor.samples.length > 0
+      ? cursor.samples
+      : trackCursor?.samples ?? [];
+
+  if (effectiveSamples.length === 0) {
+    return {
+      ok: true,
+      checked: false,
+      skipped: true,
+      mode: 'no-samples',
+      thresholdPx,
+      samplesChecked: 0,
+      maxErrorPx: 0,
+      meanErrorPx: 0,
+      violations: [],
+      comparisons: [],
+    };
+  }
+
+  const evenDim = (value) => Math.max(2, Math.round(value / 2) * 2);
+  const renderWidth = evenDim(outputWidth ?? timeline.camera?.outputWidth ?? timeline.take?.width ?? 1280);
+  const renderHeight = evenDim(outputHeight ?? timeline.camera?.outputHeight ?? timeline.take?.height ?? 720);
+  const renderFps = Math.max(1, Math.round(fps ?? timeline.take?.fps ?? 30));
+  const durationSeconds = timeline.take?.duration ?? 1;
+  const durationInFrames = Math.max(1, Math.round(durationSeconds * renderFps));
+  const maxFrame = Math.max(0, durationInFrames - 1);
+
+  const cursorForRender = {
+    enabled: true,
+    style: 'dot',
+    samples: effectiveSamples,
+  };
+
+  const resolvedTimes = Array.isArray(sampleTimes) && sampleTimes.length > 0
+    ? sampleTimes.map((rawT) => {
+        const clamped = Math.max(0, Math.min(Number(rawT), maxFrame / renderFps));
+        return snapToFrameBoundary(clamped, renderFps);
+      })
+    : selectCursorVerificationTimes({
+        timeline,
+        cursor: cursorForRender,
+        renderFps,
+        maxFrame,
+        maxSamples,
+        renderWidth,
+        renderHeight,
+      });
+
+  if (resolvedTimes.length === 0) {
+    return {
+      ok: true,
+      checked: false,
+      skipped: true,
+      mode: 'no-visible-samples',
+      thresholdPx,
+      samplesChecked: 0,
+      maxErrorPx: 0,
+      meanErrorPx: 0,
+      violations: [],
+      comparisons: [],
+    };
+  }
+
+  const baseVerificationTimeline = structuredClone(timeline);
+  baseVerificationTimeline.overlays = {
+    cursor: {
+      enabled: false,
+      style: 'dot',
+      samples: effectiveSamples,
+    },
+    ripples: [],
+    gestures: [],
+    keystrokes: [],
+    captions: { enabled: false, tracks: [] },
+  };
+  baseVerificationTimeline.audio = { tracks: [] };
+
+  const markerTimeline = structuredClone(baseVerificationTimeline);
+  markerTimeline.overlays.cursor = {
+    enabled: true,
+    style: 'dot',
+    color: primaryHex,
+    shadow: false,
+    samples: effectiveSamples,
+  };
+
+  const altMarkerTimeline = structuredClone(baseVerificationTimeline);
+  altMarkerTimeline.overlays.cursor = {
+    enabled: true,
+    style: 'dot',
+    color: altHex,
+    shadow: false,
+    samples: effectiveSamples,
+  };
+
+  const { renderTimelineStills } = await import('./render-timeline.mjs');
+  const persistentOutDir = outDir ? resolve(outDir) : null;
+  const ephemeralDir = persistentOutDir ? null : await mkdtemp(join(tmpdir(), 'screen-kit-verify-cursor-'));
+  const targetStillsDir = persistentOutDir ?? ephemeralDir;
+
+  try {
+    const frameSpecs = resolvedTimes.map((rawT, idx) => {
+      const frame = Math.min(maxFrame, Math.max(0, Math.floor(rawT * renderFps + 1e-9)));
+      const frameT = frame / renderFps;
+      return {
+        index: idx,
+        requestedT: rawT,
+        frame,
+        frameT,
+        markerFilename: `cursor-marker-${padIndex(idx)}.png`,
+        cleanFilename: `cursor-clean-${padIndex(idx)}.png`,
+      };
+    });
+
+    const requests = [];
+    for (const spec of frameSpecs) {
+      requests.push({
+        key: `clean-${spec.index}`,
+        variant: 'clean',
+        frame: spec.frame,
+        filename: spec.cleanFilename,
+      });
+      requests.push({
+        key: `marker-${spec.index}`,
+        variant: 'marker',
+        frame: spec.frame,
+        filename: spec.markerFilename,
+      });
+    }
+
+    const rendered = await renderTimelineStills({
+      timeline: markerTimeline,
+      variants: {
+        clean: baseVerificationTimeline,
+        marker: markerTimeline,
+        altMarker: altMarkerTimeline,
+      },
+      requests,
+      outDir: targetStillsDir,
+      width: renderWidth,
+      height: renderHeight,
+      fps: renderFps,
+      baseDir: resolvedBaseDir,
+      browserExecutable,
+      scratchDir,
+    });
+
+    const byKey = new Map(rendered.stills.map((s) => [s.key, s]));
+    const detectedSamples = [];
+
+    for (const spec of frameSpecs) {
+      const cleanStill = byKey.get(`clean-${spec.index}`);
+      const markerStill = byKey.get(`marker-${spec.index}`);
+
+      let located = await locateCursorMarker(markerStill.file, {
+        color: parsedPrimaryColor,
+        cleanImage: cleanStill.file,
+        tolerance: 48,
+        diffThreshold: 18,
+      });
+
+      // Fallback if the background directly behind the cursor matched `markerColor` (e.g. solid #ff00ff UI)
+      if (!located.found) {
+        const altFilename = `cursor-alt-${padIndex(spec.index)}.png`;
+        const altRendered = await renderTimelineStills({
+          timeline: altMarkerTimeline,
+          variants: { altMarker: altMarkerTimeline },
+          requests: [{ key: `alt-${spec.index}`, variant: 'altMarker', frame: spec.frame, filename: altFilename }],
+          outDir: targetStillsDir,
+          width: renderWidth,
+          height: renderHeight,
+          fps: renderFps,
+          baseDir: resolvedBaseDir,
+          browserExecutable,
+          scratchDir,
+        });
+        located = await locateCursorMarker(altRendered.stills[0].file, {
+          color: parsedAltColor,
+          cleanImage: cleanStill.file,
+          tolerance: 48,
+          diffThreshold: 18,
+        });
+      }
+
+      detectedSamples.push({
+        t: spec.frameT,
+        requestedT: round(spec.requestedT, 4),
+        x: located.x,
+        y: located.y,
+        found: located.found,
+      });
+    }
+
+    const accuracy = verifyCursorAccuracy({
+      timeline: {
+        ...timeline,
+        overlays: {
+          ...timeline.overlays,
+          cursor: {
+            ...timeline.overlays.cursor,
+            enabled: true,
+            samples: effectiveSamples,
+          },
+        },
+      },
+      eventTrack,
+      cursorSamples: detectedSamples,
+      thresholdPx,
+      outputWidth: rendered.width,
+      outputHeight: rendered.height,
+      fps: rendered.fps,
+      mode: 'pixel-marker',
+      preferEventTrack: true,
+    });
+
+    return {
+      ...accuracy,
+      mode: 'pixel-marker',
+      markerColor: parsedPrimaryColor,
+      renderWidth: rendered.width,
+      renderHeight: rendered.height,
+      fps: rendered.fps,
+      ...(persistentOutDir ? { outDir: persistentOutDir, stills: rendered.stills } : {}),
+    };
+  } finally {
+    if (ephemeralDir) {
+      await rm(ephemeralDir, { recursive: true, force: true });
+    }
+  }
 }
 
 /**
@@ -1391,6 +1832,7 @@ export async function reviewVideo({
   cursorThresholdPx = DEFAULT_CURSOR_THRESHOLD_PX,
   cursorSamples,
   cursorDetection,
+  verifyCursor = false,
   expected = {},
   outputId,
   gaps: gapOptions = {},
@@ -1775,10 +2217,57 @@ export async function reviewVideo({
     }
   }
 
-  // 6. Cursor accuracy check (observed samples, image-based marker locator, or event-track cross-check)
+  // 6. Cursor accuracy check (pixel-marker verification pass, observed samples, image locator, or event-track fallback)
   const cursorFps = probe.nominalFps || probe.fps || timeline?.take?.fps || 0;
   let resolvedCursorSamples = cursorSamples;
-  if (!resolvedCursorSamples && cursorDetection && timeline?.overlays?.cursor?.enabled) {
+  let cursorModeOverride;
+  let cursorReport = null;
+
+  if (verifyCursor) {
+    if (!timeline) {
+      cursorReport = {
+        ok: false,
+        checked: false,
+        skipped: false,
+        mode: 'missing-timeline',
+        thresholdPx: cursorThresholdPx,
+        samplesChecked: 0,
+        maxErrorPx: 0,
+        meanErrorPx: 0,
+        violations: [{ t: 0, ok: false, reason: '--verify-cursor requires a timeline' }],
+        comparisons: [],
+      };
+    } else {
+      const verifyOpts = isObject(verifyCursor) ? verifyCursor : {};
+      let inferredBaseDir =
+        verifyOpts.baseDir ??
+        (typeof timelineInput === 'string' ? dirname(resolve(timelineInput)) : dirname(videoFile));
+      if (
+        typeof timelineInput !== 'string' &&
+        !verifyOpts.baseDir &&
+        typeof timeline.take?.video === 'string' &&
+        timeline.take.video.length > 0 &&
+        !/^(?:https?:|data:|blob:)/i.test(timeline.take.video)
+      ) {
+        const videoRelCandidate = resolve(dirname(videoFile), timeline.take.video);
+        if (!(await fileExists(videoRelCandidate)) && (await fileExists(resolve(process.cwd(), timeline.take.video)))) {
+          inferredBaseDir = process.cwd();
+        }
+      }
+      cursorReport = await verifyRenderedCursorPixels({
+        ...verifyOpts,
+        timeline: typeof timelineInput === 'string' ? timelineInput : timeline,
+        eventTrack,
+        outDir: verifyOpts.outDir ?? (resolvedOutDir ? join(resolvedOutDir, 'cursor-verify') : undefined),
+        thresholdPx: verifyOpts.thresholdPx ?? cursorThresholdPx,
+        outputWidth: verifyOpts.outputWidth ?? (probe.width || undefined),
+        outputHeight: verifyOpts.outputHeight ?? (probe.height || undefined),
+        fps: verifyOpts.fps ?? (cursorFps || undefined),
+        baseDir: inferredBaseDir,
+      });
+    }
+  } else if (!resolvedCursorSamples && cursorDetection && timeline?.overlays?.cursor?.enabled) {
+    cursorModeOverride = 'pixel-marker';
     const sampleTimes = Array.isArray(cursorDetection.timestamps) && cursorDetection.timestamps.length > 0
       ? cursorDetection.timestamps
       : (timeline.overlays.cursor.samples ?? []).map((s) => s.t);
@@ -1842,15 +2331,18 @@ export async function reviewVideo({
     }
   }
 
-  const cursorReport = verifyCursorAccuracy({
-    timeline,
-    eventTrack,
-    cursorSamples: resolvedCursorSamples,
-    thresholdPx: cursorThresholdPx,
-    outputWidth: probe.width || undefined,
-    outputHeight: probe.height || undefined,
-    fps: cursorFps || undefined,
-  });
+  if (!cursorReport) {
+    cursorReport = verifyCursorAccuracy({
+      timeline,
+      eventTrack,
+      cursorSamples: resolvedCursorSamples,
+      thresholdPx: cursorThresholdPx,
+      outputWidth: probe.width || undefined,
+      outputHeight: probe.height || undefined,
+      fps: cursorFps || undefined,
+      ...(cursorModeOverride ? { mode: cursorModeOverride } : {}),
+    });
+  }
 
   if (cursorReport.checked || !cursorReport.ok) {
     addCheck(
@@ -2008,6 +2500,16 @@ export async function reviewVideo({
     video: videoFile,
     checks,
     metrics,
+    cursor: {
+      checked: cursorReport.checked,
+      skipped: cursorReport.skipped,
+      mode: cursorReport.mode,
+      thresholdPx: cursorReport.thresholdPx,
+      samplesChecked: cursorReport.samplesChecked,
+      maxErrorPx: cursorReport.maxErrorPx,
+      meanErrorPx: cursorReport.meanErrorPx,
+      violations: cursorReport.violations,
+    },
     artifacts,
     findings,
     multimodal: {

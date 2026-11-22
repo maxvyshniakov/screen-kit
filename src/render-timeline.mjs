@@ -392,17 +392,20 @@ async function stageMediaFile(sourcePath, publicDir, index) {
   return relativeAsset;
 }
 
-async function prepareStagedTimeline(timeline, baseDir, publicDir) {
+async function prepareStagedTimeline(timeline, baseDir, publicDir, sharedState = null) {
   const staged = structuredClone(timeline);
+  const stagedMap = sharedState?.stagedMap ?? new Map();
+  const validatedVideos = sharedState?.validatedVideos ?? new Set();
+  const validatedImages = sharedState?.validatedImages ?? new Set();
+  const nextIndex = () => (sharedState ? sharedState.counter++ : counter++);
   let counter = 0;
-  const stagedMap = new Map();
 
   const stageRef = async (ref, label) => {
     if (EXTERNAL_URL_RE.test(ref)) return ref;
     const absPath = resolveLocalPath(ref, baseDir);
     if (stagedMap.has(absPath)) return stagedMap.get(absPath);
     try {
-      const assetRel = await stageMediaFile(absPath, publicDir, counter++);
+      const assetRel = await stageMediaFile(absPath, publicDir, nextIndex());
       stagedMap.set(absPath, assetRel);
       return assetRel;
     } catch (error) {
@@ -413,13 +416,16 @@ async function prepareStagedTimeline(timeline, baseDir, publicDir) {
   if (!EXTERNAL_URL_RE.test(timeline.take.video)) {
     const absVideo = resolveLocalPath(timeline.take.video, baseDir);
     const assetRel = await stageRef(timeline.take.video, 'timeline.take.video');
-    try {
-      const videoInfo = await probeVideo(absVideo);
-      if (!videoInfo.frames || !(videoInfo.duration > 0)) {
-        throw Error('take video has zero frames or non-positive duration');
+    if (!validatedVideos.has(absVideo)) {
+      try {
+        const videoInfo = await probeVideo(absVideo);
+        if (!videoInfo.frames || !(videoInfo.duration > 0)) {
+          throw Error('take video has zero frames or non-positive duration');
+        }
+        validatedVideos.add(absVideo);
+      } catch (error) {
+        throw Error(`Invalid timeline.take.video (${absVideo}): ${error.message}`);
       }
-    } catch (error) {
-      throw Error(`Invalid timeline.take.video (${absVideo}): ${error.message}`);
     }
     staged.take.video = assetRel;
   } else {
@@ -431,11 +437,14 @@ async function prepareStagedTimeline(timeline, baseDir, publicDir) {
     staged.stage.background.src = await stageRef(bgSrc, 'timeline.stage.background.src');
     if (!EXTERNAL_URL_RE.test(bgSrc)) {
       const absBg = resolveLocalPath(bgSrc, baseDir);
-      try {
-        const meta = await sharp(absBg).metadata();
-        if (!meta.width || !meta.height) throw Error('empty image dimensions');
-      } catch (error) {
-        throw Error(`Invalid timeline.stage.background.src (${absBg}): ${error.message}`);
+      if (!validatedImages.has(absBg)) {
+        try {
+          const meta = await sharp(absBg).metadata();
+          if (!meta.width || !meta.height) throw Error('empty image dimensions');
+          validatedImages.add(absBg);
+        } catch (error) {
+          throw Error(`Invalid timeline.stage.background.src (${absBg}): ${error.message}`);
+        }
       }
     }
   }
@@ -694,6 +703,203 @@ export async function renderTimeline({
       mode: plan.mode,
       outDir: plan.outDir,
       outputs: renderedOutputs,
+    };
+  } finally {
+    if (browser) {
+      await browser.close({ silent: true }).catch(() => {});
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Render an explicit batch of frame-indexed PNG stills across one or more timeline variants
+ * in ONE shared Remotion bundle + headless browser session.
+ */
+export async function renderTimelineStills({
+  timeline: timelineInput,
+  variants,
+  requests,
+  outDir,
+  width,
+  height,
+  fps,
+  cwd,
+  baseDir: explicitBaseDir,
+  browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
+  logLevel = 'error',
+  signal,
+  scratchDir,
+} = {}) {
+  if (!outDir) {
+    throw Error('renderTimelineStills requires outDir');
+  }
+  if (!Array.isArray(requests) || requests.length === 0) {
+    throw Error('renderTimelineStills requires a non-empty requests array');
+  }
+
+  const loaded = await loadTimelineInput(timelineInput, cwd);
+  const baseTimeline = loaded.timeline;
+  const baseDir = explicitBaseDir ? resolve(explicitBaseDir) : loaded.baseDir;
+  assertValidTimeline(baseTimeline);
+
+  const variantEntries = variants && typeof variants === 'object' && !Array.isArray(variants)
+    ? Object.entries(variants)
+    : [['default', baseTimeline]];
+  for (const [, variantTimeline] of variantEntries) {
+    assertValidTimeline(variantTimeline);
+  }
+
+  const renderWidth = evenDimension(width ?? baseTimeline.camera.outputWidth);
+  const renderHeight = evenDimension(height ?? baseTimeline.camera.outputHeight);
+  const renderFps = Math.max(1, Math.round(fps ?? baseTimeline.take.fps ?? 30));
+  const targetOutDir = resolve(cwd ?? process.cwd(), outDir);
+
+  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
+  await mkdir(scratchBase, { recursive: true });
+  const tempDir = await mkdtemp(join(scratchBase, 'screen-kit-stills-'));
+  const publicDir = join(tempDir, 'public');
+  const bundleOutDir = join(tempDir, 'bundle');
+  const tempOutputsDir = join(tempDir, 'outputs');
+
+  let browser = null;
+  try {
+    await mkdir(publicDir, { recursive: true });
+    await mkdir(tempOutputsDir, { recursive: true });
+
+    const sharedStaging = {
+      counter: 0,
+      stagedMap: new Map(),
+      validatedVideos: new Set(),
+      validatedImages: new Set(),
+    };
+    const stagedVariants = new Map();
+    for (const [variantId, variantTimeline] of variantEntries) {
+      const staged = await prepareStagedTimeline(variantTimeline, baseDir, publicDir, sharedStaging);
+      stagedVariants.set(variantId, staged);
+    }
+
+    const serveUrl = await bundle({
+      entryPoint: REMOTION_ENTRY,
+      outDir: bundleOutDir,
+      publicDir,
+      symlinkPublicDir: true,
+      enableCaching: false,
+      rspack: true,
+    });
+
+    browser = await openBrowser('chrome', {
+      ...(browserExecutable ? { browserExecutable } : {}),
+      logLevel,
+    });
+
+    if (signal?.aborted) {
+      throw Error('Timeline still render aborted');
+    }
+    const remotionCancel = signal ? makeCancelSignal() : null;
+    if (signal && remotionCancel) {
+      signal.addEventListener('abort', () => remotionCancel.cancel(), { once: true });
+    }
+
+    const compositionCache = new Map();
+    const getVariantContext = async (variantId) => {
+      if (compositionCache.has(variantId)) return compositionCache.get(variantId);
+      const stagedTimeline = stagedVariants.get(variantId);
+      if (!stagedTimeline) {
+        throw Error(`Unknown timeline variant in renderTimelineStills: ${variantId}`);
+      }
+      const inputProps = {
+        timeline: stagedTimeline,
+        output: {
+          id: `still-${variantId}`,
+          width: renderWidth,
+          height: renderHeight,
+          fps: renderFps,
+        },
+      };
+      const composition = await selectComposition({
+        serveUrl,
+        id: COMPOSITION_ID,
+        inputProps,
+        puppeteerInstance: browser,
+        logLevel,
+      });
+      const ctx = { inputProps, composition };
+      compositionCache.set(variantId, ctx);
+      return ctx;
+    };
+
+    const stagedStills = [];
+    for (let i = 0; i < requests.length; i += 1) {
+      if (signal?.aborted) {
+        throw Error('Timeline still render aborted');
+      }
+      const req = requests[i];
+      const variantId = req.variant ?? 'default';
+      const { inputProps, composition } = await getVariantContext(variantId);
+      const maxFrame = Math.max(0, composition.durationInFrames - 1);
+      const requestedFrame = Number.isInteger(req.frame)
+        ? req.frame
+        : Math.floor(Math.max(0, Number(req.t ?? 0)) * composition.fps + 1e-9);
+      const frame = Math.min(maxFrame, Math.max(0, requestedFrame));
+      const filename = req.filename ?? `${variantId}-${String(i).padStart(3, '0')}.png`;
+      const tempStillFile = join(tempOutputsDir, `${String(i).padStart(3, '0')}-${filename}`);
+
+      await renderStill({
+        serveUrl,
+        composition,
+        inputProps,
+        frame,
+        imageFormat: 'png',
+        output: tempStillFile,
+        puppeteerInstance: browser,
+        ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
+        overwrite: true,
+        logLevel,
+      });
+
+      const meta = await sharp(tempStillFile).metadata();
+      if (!meta.width || !meta.height) {
+        throw Error(`Still render produced invalid image for ${filename}`);
+      }
+      const bytes = await readFile(tempStillFile);
+      const destination = join(targetOutDir, filename);
+      stagedStills.push({
+        tempFile: tempStillFile,
+        destination,
+        record: {
+          key: req.key ?? `${variantId}:${frame}`,
+          variant: variantId,
+          frame,
+          t: frame / composition.fps,
+          filename,
+          file: destination,
+          width: meta.width,
+          height: meta.height,
+          bytes: bytes.length,
+          sha256: sha256(bytes),
+        },
+      });
+    }
+
+    if (signal?.aborted) {
+      throw Error('Timeline still render aborted');
+    }
+
+    const stills = [];
+    for (const item of stagedStills) {
+      await moveFileAtomic(item.tempFile, item.destination);
+      stills.push(item.record);
+    }
+
+    return {
+      renderer: 'remotion-4',
+      ...(loaded.timelineFile ? { timelineFile: loaded.timelineFile } : {}),
+      outDir: targetOutDir,
+      width: renderWidth,
+      height: renderHeight,
+      fps: renderFps,
+      stills,
     };
   } finally {
     if (browser) {

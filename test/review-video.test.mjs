@@ -13,6 +13,7 @@ import {
   reviewVideo,
   snapToFrameBoundary,
   verifyCursorAccuracy,
+  verifyRenderedCursorPixels,
 } from '../src/review-video.mjs';
 import { computeFrameScene, screenToRender } from '../src/remotion/layout.mjs';
 import { reviewRun, reviewVideo as reviewVideoFromReview } from '../src/review.mjs';
@@ -1079,6 +1080,177 @@ test('reviewVideo catches CFR-resampled raw capture gaps, excuses intentional qu
         (f) => f.category === 'capture-gap' && /active-motion gap/i.test(f.message)
       )
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('automated pixel-level cursor verification (--verify-cursor & verifyRenderedCursorPixels) proves <= 2 px accuracy across 1x and zoomed/panned Remotion frames', async () => {
+  assert.equal(rootApi.verifyRenderedCursorPixels, verifyRenderedCursorPixels);
+
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-rv-verify-cursor-'));
+  try {
+    // 1. Build a colorful dynamic take that even includes a magenta (#ff00ff) patch on screen
+    // so clean-vs-marker localization proves robustness on ANY background.
+    for (let i = 0; i < 12; i += 1) {
+      const magentaBadge = await sharp({
+        create: { width: 48, height: 32, channels: 3, background: { r: 255, g: 0, b: 255 } },
+      })
+        .png()
+        .toBuffer();
+      const rightCard = await sharp({
+        create: { width: 120, height: 100, channels: 3, background: { r: 16, g: 165 + i * 2, b: 129 } },
+      })
+        .png()
+        .toBuffer();
+      await sharp({
+        create: { width: 320, height: 180, channels: 3, background: { r: 24 + i * 2, g: 40 + i, b: 85 } },
+      })
+        .composite([
+          { input: magentaBadge, left: 16, top: 16 },
+          { input: rightCard, left: 170, top: 40 },
+        ])
+        .png()
+        .toFile(join(dir, `take-frame-${i}.png`));
+    }
+
+    const takeVideo = join(dir, 'take.mp4');
+    await runFfmpeg([
+      '-framerate', '12',
+      '-i', join(dir, 'take-frame-%d.png'),
+      '-pix_fmt', 'yuv420p',
+      '-c:v', 'libx264',
+      '-crf', '14',
+      takeVideo,
+    ]);
+
+    const eventTrack = {
+      version: 1,
+      captureMode: 'headless',
+      viewport: { width: 320, height: 180, deviceScaleFactor: 1 },
+      video: { file: 'take.mp4', width: 320, height: 180, fps: 12, duration: 1.0, frames: 12 },
+      events: [
+        { t: 0.0, type: 'pointermove', x: 70, y: 80 },
+        { t: 0.0, type: 'step', index: 0, label: 'Wide 1x overview', camera: 'wide' },
+        { t: 0.42, type: 'pointermove', x: 220, y: 95 },
+        { t: 0.5, type: 'pointerdown', x: 220, y: 95, button: 'left' },
+        {
+          t: 0.5,
+          type: 'step',
+          index: 1,
+          label: 'Zoomed & panned click',
+          target: [220, 95],
+          camera: { zoom: 2.0, focus: 'target', lead: 0.25, hold: 0.25 },
+        },
+        { t: 0.58, type: 'pointerup', x: 220, y: 95, button: 'left' },
+        { t: 0.9, type: 'pointermove', x: 160, y: 110 },
+        { t: 0.9, type: 'step', index: 2, label: 'Return wide', camera: 'wide' },
+      ],
+    };
+
+    const eventTrackPath = join(dir, 'event-track.json');
+    await writeFile(eventTrackPath, JSON.stringify(eventTrack, null, 2));
+
+    const timeline = compileTimeline({
+      take: { video: 'take.mp4', eventTrack: 'event-track.json' },
+      eventTrack,
+      recipe: {
+        stage: {
+          width: 480,
+          height: 270,
+          padding: 45,
+          background: { type: 'solid', color: '#0f172a' },
+        },
+        window: {
+          frame: 'macos',
+          title: 'Zoom & Pan Verification',
+          width: 320,
+          height: 180,
+        },
+        camera: { outputWidth: 480, outputHeight: 270 },
+        overlays: { cursor: { enabled: true, style: 'macos' } },
+        outputs: ['web-loop'],
+      },
+    });
+    const timelinePath = join(dir, 'timeline.json');
+    await writeFile(timelinePath, JSON.stringify(timeline, null, 2));
+
+    // Render real Remotion output MP4
+    const { renderTimeline } = await import('../src/render-timeline.mjs');
+    const renderedMp4 = join(dir, 'rendered.mp4');
+    await renderTimeline({
+      timeline: timelinePath,
+      out: renderedMp4,
+    });
+
+    // 2. Default reviewVideo stays fast and marks cursor pixel check as skipped
+    const fastDefaultReport = await reviewVideo({
+      video: renderedMp4,
+      timeline: timelinePath,
+      eventTrack: eventTrackPath,
+    });
+    assert.equal(fastDefaultReport.ok, true, JSON.stringify(fastDefaultReport.checks, null, 2));
+    assert.equal(fastDefaultReport.metrics.cursor.checked, false);
+    assert.equal(fastDefaultReport.metrics.cursor.skipped, true);
+
+    // 3. Direct verifyRenderedCursorPixels across 1x (t=0), mid-pan/zoom (t=0.34), zoomed 2x (t=0.5), and wide (t=0.9)
+    const directPixelVerify = await verifyRenderedCursorPixels({
+      timeline: timelinePath,
+      sampleTimes: [0.0, 0.34, 0.5, 0.9],
+      thresholdPx: 2,
+      outDir: join(dir, 'direct-verify-stills'),
+    });
+    assert.equal(directPixelVerify.ok, true, JSON.stringify(directPixelVerify.violations, null, 2));
+    assert.equal(directPixelVerify.checked, true);
+    assert.equal(directPixelVerify.skipped, false);
+    assert.equal(directPixelVerify.mode, 'pixel-marker');
+    assert.equal(directPixelVerify.samplesChecked, 4);
+    assert.ok(directPixelVerify.maxErrorPx <= 2, `expected <= 2 px, got ${directPixelVerify.maxErrorPx}`);
+
+    // 4. CLI `screen-kit review --video ... --timeline ... --verify-cursor --out-dir ...`
+    const cliReviewDir = join(dir, 'cli-verify-out');
+    const { stdout: cliOut } = await exec('node', [
+      CLI_PATH,
+      'review',
+      '--video', renderedMp4,
+      '--timeline', timelinePath,
+      '--event-track', eventTrackPath,
+      '--verify-cursor',
+      '--out-dir', cliReviewDir,
+    ]);
+    const cliReport = JSON.parse(cliOut);
+    assert.equal(cliReport.ok, true, JSON.stringify(cliReport.findings, null, 2));
+    assert.equal(cliReport.metrics.cursor.checked, true);
+    assert.equal(cliReport.metrics.cursor.skipped, false);
+    assert.equal(cliReport.metrics.cursor.mode, 'pixel-marker');
+    assert.ok(cliReport.metrics.cursor.samplesChecked >= 3);
+    assert.ok(cliReport.metrics.cursor.maxErrorPx <= 2);
+    assert.equal(cliReport.cursor.checked, true);
+    assert.equal(cliReport.cursor.mode, 'pixel-marker');
+    assert.equal(cliReport.cursor.violations.length, 0);
+
+    const persistedReview = JSON.parse(await readFile(join(cliReviewDir, 'review.json'), 'utf8'));
+    assert.equal(persistedReview.metrics.cursor.checked, true);
+    assert.equal(persistedReview.metrics.cursor.mode, 'pixel-marker');
+    assert.ok(persistedReview.metrics.cursor.maxErrorPx <= 2);
+
+    // 5. Corrupted timeline cursor coordinates (+12 px drift vs eventTrack) fail --verify-cursor
+    const driftedTimeline = structuredClone(timeline);
+    driftedTimeline.overlays.cursor.samples = driftedTimeline.overlays.cursor.samples.map((s) => ({
+      ...s,
+      x: s.x + 12,
+    }));
+    const driftedReport = await reviewVideo({
+      video: renderedMp4,
+      timeline: driftedTimeline,
+      eventTrack,
+      verifyCursor: { sampleTimes: [0.5], baseDir: dir },
+    });
+    assert.equal(driftedReport.ok, false);
+    assert.equal(driftedReport.checks.find((c) => c.name === 'cursor-accuracy')?.ok, false);
+    assert.equal(driftedReport.metrics.cursor.checked, true);
+    assert.equal(driftedReport.metrics.cursor.mode, 'pixel-marker');
+    assert.ok(driftedReport.metrics.cursor.maxErrorPx > 8);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

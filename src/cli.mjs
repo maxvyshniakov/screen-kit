@@ -15,8 +15,8 @@ screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4]
 screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
 screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop]
-screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json]
-screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
+screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json] [--verify-cursor]
+screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--verify-cursor] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
 screen-kit render --input take.gif --out demo.mp4 [--fps 30]
 screen-kit render --input timeline.json --out out/demo [--profiles web-loop,youtube-master,shorts] [--poster-format png]
@@ -106,12 +106,12 @@ const allowed = new Set([
   'config', 'cwd', 'only', 'recipe', 'out', 'manifest', 'input', 'take', 'fps', 'at',
   'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir',
-  'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
+  'verify-cursor', 'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
   'kind', 'prompt', 'aspect-ratio', 'model', 'cache-dir',
   'target', 'name', 'poster', 'formats', 'color-space',
   'title', 'description', 'privacy', 'captions', 'thumbnail', 'dry-run',
 ]);
-const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take', 'dry-run']);
+const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take', 'dry-run', 'verify-cursor']);
 const toBoolFlag = (val) => val === true || val === 'true' || val === '1';
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
@@ -202,6 +202,7 @@ try {
         }
       }
       const cursorDetection = parseCursorDetectionFlag(flags['cursor-detection'], flags['cursor-color']);
+      const verifyCursor = toBoolFlag(flags['verify-cursor']);
       const multimodalOpt = flags.multimodal
         ? {
             enabled: true,
@@ -216,6 +217,7 @@ try {
             eventTrack: flags['event-track'],
             baseline: flags.baseline,
             outDir: flags['out-dir'],
+            ...(verifyCursor ? { verifyCursor: true } : {}),
             ...(cursorThresholdPx !== undefined ? { cursorThresholdPx } : {}),
             ...(cursorDetection ? { cursorDetection } : {}),
             ...(multimodalOpt ? { multimodal: multimodalOpt } : {}),
@@ -225,9 +227,10 @@ try {
             ...(flags['out-dir'] ? { outDir: flags['out-dir'] } : {}),
             ...(flags.baseline ? { baseline: flags.baseline } : {}),
             ...(multimodalOpt ? { multimodal: multimodalOpt } : {}),
-            ...(cursorThresholdPx !== undefined || cursorDetection
+            ...(verifyCursor || cursorThresholdPx !== undefined || cursorDetection
               ? {
                   videoReview: {
+                    ...(verifyCursor ? { verifyCursor: true } : {}),
                     ...(cursorThresholdPx !== undefined ? { cursorThresholdPx } : {}),
                     ...(cursorDetection ? { cursorDetection } : {}),
                   },
@@ -277,6 +280,7 @@ try {
     } else if (command === 'run') {
       const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
       const profileArg = flags.profiles ?? flags.profile;
+      const verifyCursor = toBoolFlag(flags['verify-cursor']);
       const result = await runPipeline({
         config: loaded.config,
         cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
@@ -285,6 +289,7 @@ try {
         previewOnly: toBoolFlag(flags['preview-only']),
         reuseTake: toBoolFlag(flags['reuse-take']),
         ...(profileArg ? { profiles: profileArg } : {}),
+        ...(verifyCursor ? { reviewOptions: { verifyCursor: true } } : {}),
       });
       console.log(JSON.stringify(result, null, 2));
       if (!result.ok) process.exitCode = 1;

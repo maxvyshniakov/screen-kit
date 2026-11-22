@@ -321,6 +321,7 @@ function renderCursorOverlay(cursor) {
 
   if (cursor.style === 'dot') {
     const size = 18 * combinedScale;
+    const unshadowed = cursor.shadow === false;
     return h('div', {
       'data-overlay': 'cursor',
       style: {
@@ -330,9 +331,11 @@ function renderCursorOverlay(cursor) {
         width: size,
         height: size,
         borderRadius: '50%',
-        backgroundColor: cursor.pressed ? '#38bdf8' : 'rgba(255, 255, 255, 0.95)',
-        border: `${Math.max(1.5, 2 * cursor.scale)}px solid rgba(15, 23, 42, 0.9)`,
-        boxShadow: '0 3px 10px rgba(0, 0, 0, 0.35)',
+        backgroundColor: cursor.color ?? (cursor.pressed ? '#38bdf8' : 'rgba(255, 255, 255, 0.95)'),
+        border: unshadowed
+          ? 'none'
+          : `${Math.max(1.5, 2 * cursor.scale)}px solid rgba(15, 23, 42, 0.9)`,
+        boxShadow: unshadowed ? 'none' : '0 3px 10px rgba(0, 0, 0, 0.35)',
         pointerEvents: 'none',
       },
     });
