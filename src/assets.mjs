@@ -1,7 +1,8 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import sharp from 'sharp';
+import { sha256, writeFileAtomic } from './internal/fs-paths.mjs';
+import { postGoogleGenAiJson } from './internal/google-genai.mjs';
 
 /**
  * Opt-in Imagen / Gemini Image API generator for NON-UI visual assets only
@@ -31,19 +32,6 @@ const FORMAT_BY_MIME = Object.freeze({
 });
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
-const sha256 = (data) => createHash('sha256').update(data).digest('hex');
-
-async function writeFileAtomic(targetPath, data) {
-  const resolved = resolve(targetPath);
-  await mkdir(dirname(resolved), { recursive: true });
-  const tempPath = join(dirname(resolved), `.${basename(resolved)}-${randomUUID()}.tmp`);
-  try {
-    await writeFile(tempPath, data);
-    await rename(tempPath, resolved);
-  } finally {
-    await rm(tempPath, { force: true });
-  }
-}
 
 function resolveOutputFormat(outPath) {
   const ext = extname(outPath).toLowerCase();
@@ -114,7 +102,7 @@ function buildImageRequest({ model, prompt, aspectRatio, mimeType }) {
   const isImagen = /^imagen-/i.test(model);
   if (isImagen) {
     return {
-      endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:predict`,
+      action: 'predict',
       body: {
         instances: [{ prompt }],
         parameters: {
@@ -126,7 +114,7 @@ function buildImageRequest({ model, prompt, aspectRatio, mimeType }) {
     };
   }
   return {
-    endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    action: 'generateContent',
     body: {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: {
@@ -212,6 +200,7 @@ export async function generateAsset({
   out,
   aspectRatio = DEFAULT_ASPECT_RATIO,
   apiKey,
+  env = process.env,
   fetchImpl = globalThis.fetch,
   model = DEFAULT_IMAGE_MODEL,
   cacheDir,
@@ -267,41 +256,26 @@ export async function generateAsset({
     };
   }
 
-  // 2. Strictly opt-in credentials check before any network call
-  const resolvedKey =
-    apiKey !== undefined ? apiKey : (process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY);
-  if (!isNonEmptyString(resolvedKey)) {
-    throw Error(
-      'Image asset generation is opt-in and requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY) or pass apiKey explicitly.'
-    );
-  }
-  if (typeof fetchImpl !== 'function') {
-    throw Error('fetch is not available for image asset generation');
-  }
-
-  const { endpoint, body } = buildImageRequest({
+  // 2. Strictly opt-in credentials check & unified Google GenAI call
+  const { action, body } = buildImageRequest({
     model: trimmedModel,
     prompt: trimmedPrompt,
     aspectRatio: trimmedAspectRatio,
     mimeType: target.mimeType,
   });
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': resolvedKey.trim(),
-    },
-    body: JSON.stringify(body),
-    ...(signal ? { signal } : {}),
+  const payload = await postGoogleGenAiJson({
+    model: trimmedModel,
+    action,
+    body,
+    apiKey,
+    env,
+    fetchImpl,
+    signal,
+    label: 'Image generation',
+    missingKeyMessage:
+      'Image asset generation is opt-in and requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY) or pass apiKey explicitly.',
   });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw Error(`Image generation API returned HTTP ${response.status}: ${errorText.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
   const extracted = extractImageFromPayload(payload);
   if (!extracted) {
     throw Error('Image generation API response did not contain image data');

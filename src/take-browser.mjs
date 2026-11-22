@@ -1,27 +1,71 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import { helpers, storyUrl } from './browser.mjs';
-import { hash } from './run.mjs';
+import { assertPathInsideDir, moveFileAtomic, sha256, writeFileAtomic } from './internal/fs-paths.mjs';
+import { buildColorEncodeArgs, probeVideo } from './internal/media.mjs';
 import {
   GESTURE_KINDS as TIMELINE_GESTURE_KINDS,
   validateEventTrack as checkEventTrackSchema,
   validateStepCameraHint,
   validateStepNarration,
 } from './timeline.mjs';
-import { probeVideo } from './video.mjs';
 
 const exec = promisify(execFile);
-const sleep = (ms) => new Promise((done) => setTimeout(done, Math.max(0, ms)));
+
+function toAbortError(sig) {
+  if (sig?.reason instanceof Error) return sig.reason;
+  const message =
+    typeof sig?.reason === 'string' && sig.reason.length > 0
+      ? sig.reason
+      : 'Browser take capture aborted';
+  return new DOMException(message, 'AbortError');
+}
+
+function throwIfAborted(sig) {
+  if (sig?.aborted) {
+    throw toAbortError(sig);
+  }
+}
+
+function sleep(ms, sig) {
+  throwIfAborted(sig);
+  const waitMs = Math.max(0, ms);
+  if (waitMs === 0) return Promise.resolve();
+  if (!sig) {
+    return new Promise((done) => setTimeout(done, waitMs));
+  }
+  return new Promise((resolvePromise, rejectPromise) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      rejectPromise(toAbortError(sig));
+    };
+    const timer = setTimeout(() => {
+      sig.removeEventListener('abort', onAbort);
+      resolvePromise();
+    }, waitMs);
+    sig.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 const roundTime = (seconds) => Math.max(0, Number(seconds.toFixed(4)));
 const roundCoord = (px) => Number(px.toFixed(2));
 
 export const CAPTURE_MODES = Object.freeze(['quality', 'headless']);
+export const BROWSER_CAPTURE_PHASES = Object.freeze([
+  'idle',
+  'launching',
+  'preparing',
+  'recording',
+  'draining',
+  'encoding',
+  'closed',
+]);
 const BUTTONS = new Set(['left', 'middle', 'right']);
 const WHEEL_PHASES = new Set([
   'began',
@@ -534,6 +578,7 @@ function parseSemanticLocatorObject(target) {
  * viewport CSS pixel coordinates `[vx, vy]`, waiting up to `timeout` and scrolling into view if off-screen.
  */
 export async function resolveTargetPoint(page, target, fallbackPoint, options = {}) {
+  throwIfAborted(options.signal);
   if (target === undefined || target === null) {
     if (fallbackPoint) {
       const [fx, fy] = toPointTuple(fallbackPoint, 'fallbackPoint');
@@ -687,7 +732,7 @@ export async function resolveTargetPoint(page, target, fallbackPoint, options = 
         typeof target === 'string' && parsed.nth === 0 ? target : { selector: normalizedSpec.selector, nth: parsed.nth },
       );
       if (Array.isArray(point) && point.length === 2 && point.every(Number.isFinite)) break;
-      await sleep(50);
+      await sleep(50, options.signal);
     }
     if (!Array.isArray(point) || point.length !== 2 || !point.every(Number.isFinite)) {
       throw Error(`Target selector matched no visible element: ${describeTarget(target)}`);
@@ -698,7 +743,8 @@ export async function resolveTargetPoint(page, target, fallbackPoint, options = 
   throw Error(`Unsupported target specification: ${describeTarget(target)}`);
 }
 
-async function runPrepAction(page, action) {
+async function runPrepAction(page, action, sig) {
+  throwIfAborted(sig);
   if (typeof action === 'string') {
     await page.evaluate(`(async () => { ${helpers}\n${action}\n })()`);
     return;
@@ -706,7 +752,8 @@ async function runPrepAction(page, action) {
   if (Array.isArray(action)) {
     const [cmd, ...rest] = action;
     if (cmd === 'click' && rest[0]) {
-      const [x, y] = await resolveTargetPoint(page, rest[0]);
+      const [x, y] = await resolveTargetPoint(page, rest[0], undefined, { signal: sig });
+      throwIfAborted(sig);
       await page.mouse.click(x, y);
       return;
     }
@@ -722,7 +769,8 @@ async function runPrepAction(page, action) {
       return;
     }
     if (action.click) {
-      const [x, y] = await resolveTargetPoint(page, action.click);
+      const [x, y] = await resolveTargetPoint(page, action.click, undefined, { signal: sig });
+      throwIfAborted(sig);
       await page.mouse.click(x, y);
       return;
     }
@@ -732,11 +780,11 @@ async function runPrepAction(page, action) {
       return;
     }
     if (action.wait !== undefined) {
-      await sleep(action.wait);
+      await sleep(action.wait, sig);
       return;
     }
     if (action.pause !== undefined) {
-      await sleep(action.pause * 1000);
+      await sleep(action.pause * 1000, sig);
       return;
     }
   }
@@ -957,9 +1005,7 @@ export async function encodeScreencastFrames({
   colorSpace = 'srgb',
   signal,
 }) {
-  if (!['srgb', 'p3'].includes(colorSpace)) {
-    throw Error(`Unsupported browser take colorSpace: ${colorSpace}`);
-  }
+  const { vf: colorPadVf, colorFlags } = buildColorEncodeArgs(colorSpace, format);
 
   const ordered = orderRawScreencastFrames(rawFrames);
   const rawStats = computeRawCaptureStats({
@@ -1006,12 +1052,6 @@ export async function encodeScreencastFrames({
   await writeFile(concatFile, lines.join('\n') + '\n');
 
   const temporary = join(framesDir, `encoded-${randomUUID()}.${format}`);
-  const vfColor = colorSpace === 'p3'
-    ? 'scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
-    : 'scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv';
-  const colorFlags = colorSpace === 'p3'
-    ? ['-color_range', 'tv', '-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709']
-    : ['-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'];
   const codec = format === 'mp4'
     ? [
         '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-profile:v', 'high',
@@ -1027,7 +1067,7 @@ export async function encodeScreencastFrames({
     '-f', 'concat', '-safe', '0', '-i', concatFile,
     '-t', targetDuration.toFixed(6),
     '-an',
-    '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2,${vfColor}`,
+    '-vf', `fps=${fps},${colorPadVf}`,
     '-pix_fmt', 'yuv420p',
     ...codec,
     ...colorFlags,
@@ -1039,7 +1079,7 @@ export async function encodeScreencastFrames({
   if (!info.frames || !(info.duration > 0)) {
     throw Error('Video encoder produced an empty take');
   }
-  await rename(temporary, outputFile);
+  await moveFileAtomic(temporary, outputFile);
   return { ...info, measuredFps: rawStats.rawFps, capturedFrames: rawFrames.length, truncated };
 }
 
@@ -1052,6 +1092,8 @@ export async function createBrowserTakeCapture({
   playwright,
   focusController,
   encodeFrames = encodeScreencastFrames,
+  writeFrame = writeFile,
+  onPhaseChange,
   signal,
 } = {}) {
   if (!out) throw Error('Browser take capture needs an output directory');
@@ -1060,9 +1102,20 @@ export async function createBrowserTakeCapture({
   out = resolve(cwd, out);
 
   const focus = focusController ?? createMacFocusController();
+  let phase = 'idle';
+  let runnerClosed = false;
   let activeBrowser = null;
   let activeContext = null;
   let activeCdp = null;
+
+  const setPhase = (nextPhase) => {
+    if (phase === nextPhase) return;
+    const prevPhase = phase;
+    phase = nextPhase;
+    if (typeof onPhaseChange === 'function') {
+      onPhaseChange(nextPhase, prevPhase);
+    }
+  };
 
   async function cleanupActive() {
     const cdp = activeCdp;
@@ -1079,7 +1132,14 @@ export async function createBrowserTakeCapture({
     if (browser) await browser.close().catch(() => {});
   }
 
-  async function capture(name, recipe = {}, base) {
+  async function capture(name, recipe = {}, base, callOptions = {}) {
+    if (runnerClosed || phase === 'closed') {
+      throw Error('Browser take capture runner is closed');
+    }
+    if (phase !== 'idle') {
+      throw Error(`Browser take capture is already in progress (phase: ${phase})`);
+    }
+
     if (name !== undefined && !/^[\w][\w.-]*$/.test(name)) {
       throw Error(`Invalid recipe name: ${name}`);
     }
@@ -1115,35 +1175,94 @@ export async function createBrowserTakeCapture({
     const dsf = recipe.deviceScaleFactor ?? scale ?? recipe.scale ?? defaultDsf;
     const viewport = normalizeViewport(recipe.viewport ?? [1440, 810], dsf);
     const url = storyUrl(base ?? recipe.base, recipe, recipe.themes?.[0] ?? 'dark');
+    const effectiveSignal = callOptions?.signal ?? recipe?.signal ?? signal;
+    throwIfAborted(effectiveSignal);
 
-    await mkdir(out, { recursive: true });
-    const framesDir = join(out, `.frames-${randomUUID()}`);
-    await mkdir(framesDir, { recursive: true });
+    // Transition synchronously to `launching` before the first `await` so concurrent `capture()` calls fail fast.
+    setPhase('launching');
 
-    const pw = playwright ?? await import('playwright-core');
-    const chromium = pw.chromium;
-    const resolvedExecutable = playwright ? executablePath : resolveChromiumExecutable({ playwrightChromium: chromium, executablePath });
+    let framesDir = null;
+    let previousFrontmost = null;
+    let screencasting = false;
+    let screencastCdp = null;
+    let screencastListener = null;
+    const pendingWrites = [];
+    let drained = false;
 
-    const launchArgs = [
-      ...(mode === 'quality'
-        ? [
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--disable-background-timer-throttling',
-          ]
-        : []),
-      ...(colorSpace === 'p3' ? ['--force-color-profile=display-p3-d65'] : []),
-      ...(recipe.browserArgs ?? []),
-    ];
+    const detachScreencastListener = () => {
+      const cdpTarget = screencastCdp ?? activeCdp;
+      const listener = screencastListener;
+      screencastCdp = null;
+      screencastListener = null;
+      if (!cdpTarget || !listener) return;
+      try {
+        if (typeof cdpTarget.off === 'function') {
+          cdpTarget.off('Page.screencastFrame', listener);
+        } else if (typeof cdpTarget.removeListener === 'function') {
+          cdpTarget.removeListener('Page.screencastFrame', listener);
+        }
+      } catch {
+        // Ignore listener detachment errors during teardown.
+      }
+    };
+
+    const drainSession = async ({ checkWriteErrors = false } = {}) => {
+      if (drained) return;
+      drained = true;
+      if (!runnerClosed && phase !== 'closed') {
+        setPhase('draining');
+      }
+      screencasting = false;
+      detachScreencastListener();
+      const writeResults = await Promise.allSettled(pendingWrites);
+      await cleanupActive();
+      if (previousFrontmost) {
+        const frontmostToRestore = previousFrontmost;
+        previousFrontmost = null;
+        await focus.restoreFrontmost(frontmostToRestore);
+      }
+      if (checkWriteErrors) {
+        const rejectedWrite = writeResults.find((entry) => entry.status === 'rejected');
+        if (rejectedWrite) {
+          throw rejectedWrite.reason;
+        }
+      }
+    };
 
     try {
-      const previousFrontmost = mode === 'quality' ? await focus.captureFrontmost() : null;
+      await mkdir(out, { recursive: true });
+      framesDir = assertPathInsideDir(join(out, `.frames-${randomUUID()}`), out, 'frames directory');
+      await mkdir(framesDir, { recursive: true });
+
+      throwIfAborted(effectiveSignal);
+      const pw = playwright ?? await import('playwright-core');
+      const chromium = pw.chromium;
+      const resolvedExecutable = playwright
+        ? executablePath
+        : resolveChromiumExecutable({ playwrightChromium: chromium, executablePath });
+
+      const launchArgs = [
+        ...(mode === 'quality'
+          ? [
+              '--disable-backgrounding-occluded-windows',
+              '--disable-renderer-backgrounding',
+              '--disable-background-timer-throttling',
+            ]
+          : []),
+        ...(colorSpace === 'p3' ? ['--force-color-profile=display-p3-d65'] : []),
+        ...(recipe.browserArgs ?? []),
+      ];
+
+      throwIfAborted(effectiveSignal);
+      previousFrontmost = mode === 'quality' ? await focus.captureFrontmost() : null;
+      throwIfAborted(effectiveSignal);
       activeBrowser = await chromium.launch({
         headless: mode === 'headless',
         ...(resolvedExecutable ? { executablePath: resolvedExecutable } : {}),
         args: launchArgs,
       });
 
+      throwIfAborted(effectiveSignal);
       activeContext = await activeBrowser.newContext({
         viewport: { width: viewport.width, height: viewport.height },
         deviceScaleFactor: viewport.deviceScaleFactor,
@@ -1154,16 +1273,20 @@ export async function createBrowserTakeCapture({
         await focus.restoreFrontmost(previousFrontmost);
       }
 
+      setPhase('preparing');
+      throwIfAborted(effectiveSignal);
       await page.goto(url, { waitUntil: 'load', timeout: recipe.readyTimeout ?? 30000 });
       if (mode === 'quality' && previousFrontmost) {
         await focus.restoreFrontmost(previousFrontmost);
-        await sleep(150);
+        await sleep(150, effectiveSignal);
       }
 
+      throwIfAborted(effectiveSignal);
       await waitForPageReady(page, recipe);
-      for (const prep of recipe.prepare ?? []) await runPrepAction(page, prep);
-      for (const setupAction of recipe.setup ?? []) await runPrepAction(page, setupAction);
+      for (const prep of recipe.prepare ?? []) await runPrepAction(page, prep, effectiveSignal);
+      for (const setupAction of recipe.setup ?? []) await runPrepAction(page, setupAction, effectiveSignal);
       if ((recipe.prepare?.length ?? 0) + (recipe.setup?.length ?? 0) > 0) {
+        throwIfAborted(effectiveSignal);
         await waitForPageReady(page, recipe);
       }
 
@@ -1172,6 +1295,7 @@ export async function createBrowserTakeCapture({
         : [roundCoord(viewport.width / 2), roundCoord(viewport.height / 2)];
       let pointerX = initX;
       let pointerY = initY;
+      throwIfAborted(effectiveSignal);
       await page.mouse.move(pointerX, pointerY);
 
       activeCdp = await activeContext.newCDPSession(page);
@@ -1182,20 +1306,24 @@ export async function createBrowserTakeCapture({
       const screencastQuality = recipe.screencastQuality ?? 94;
       const ext = screencastFormat === 'png' ? 'png' : 'jpg';
 
+      throwIfAborted(effectiveSignal);
       const initialShot = await activeCdp.send('Page.captureScreenshot', {
         format: screencastFormat,
         ...(screencastFormat === 'jpeg' ? { quality: screencastQuality } : {}),
       });
       const initialFrameFile = join(framesDir, `init.${ext}`);
-      await writeFile(initialFrameFile, Buffer.from(initialShot.data, 'base64'));
+      await writeFrame(initialFrameFile, Buffer.from(initialShot.data, 'base64'));
+
+      setPhase('recording');
+      throwIfAborted(effectiveSignal);
 
       const rawFrames = [];
-      const pendingWrites = [];
       let nextFrameIndex = 1;
-      let screencasting = true;
+      screencasting = true;
       let takeStartMs = performance.now();
 
-      activeCdp.on('Page.screencastFrame', ({ data, metadata, sessionId }) => {
+      screencastCdp = activeCdp;
+      screencastListener = ({ data, metadata, sessionId }) => {
         const elapsed = (performance.now() - takeStartMs) / 1000;
         activeCdp?.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
         if (!screencasting) return;
@@ -1207,8 +1335,14 @@ export async function createBrowserTakeCapture({
           cdpTimestamp: metadata?.timestamp,
           elapsed,
         });
-        pendingWrites.push(writeFile(file, Buffer.from(data, 'base64')));
-      });
+        const writeOp = Promise.resolve().then(() =>
+          writeFrame(file, Buffer.from(data, 'base64'))
+        );
+        // Prevent unhandledRejection if `framesDir` is removed or disk write fails mid-flight.
+        writeOp.catch(() => {});
+        pendingWrites.push(writeOp);
+      };
+      activeCdp.on('Page.screencastFrame', screencastListener);
 
       await activeCdp.send('Page.startScreencast', {
         format: screencastFormat,
@@ -1239,6 +1373,7 @@ export async function createBrowserTakeCapture({
 
       const sampleRate = Math.min(requestedFps, 60);
       const glideTo = async (toX, toY, duration, arc = 0.08) => {
+        throwIfAborted(effectiveSignal);
         const distance = Math.hypot(toX - pointerX, toY - pointerY);
         const moveDur = duration ?? defaultMoveDuration(distance);
         if (moveDur <= 0 || distance < 0.5) {
@@ -1261,14 +1396,16 @@ export async function createBrowserTakeCapture({
         });
         const glideStartMs = performance.now();
         for (let i = 0; i < samples.length; i++) {
+          throwIfAborted(effectiveSignal);
           const sample = samples[i];
           const dueMs = glideStartMs + sample.t * 1000;
           const remainingMs = dueMs - performance.now();
           if (remainingMs > 1) {
-            await sleep(remainingMs);
+            await sleep(remainingMs, effectiveSignal);
           } else if (remainingMs < -20 && i < samples.length - 1) {
             continue;
           }
+          throwIfAborted(effectiveSignal);
           pointerX = sample.x;
           pointerY = sample.y;
           await page.mouse.move(pointerX, pointerY);
@@ -1280,46 +1417,56 @@ export async function createBrowserTakeCapture({
       let previousPlannedAt = 0;
 
       for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
+        throwIfAborted(effectiveSignal);
         const rawStep = steps[stepIndex];
         if (rawStep && typeof rawStep === 'object' && !Array.isArray(rawStep) && rawStep.at !== undefined) {
           if (!Number.isFinite(rawStep.at) || rawStep.at < previousPlannedAt || (recipe.duration !== undefined && rawStep.at > recipe.duration)) {
             throw Error('Browser take step `at` times must be ordered and within duration');
           }
           previousPlannedAt = rawStep.at;
-          await sleep(rawStep.at * 1000 - (performance.now() - takeStartMs));
+          await sleep(rawStep.at * 1000 - (performance.now() - takeStartMs), effectiveSignal);
         }
 
         if (typeof rawStep === 'string') {
+          throwIfAborted(effectiveSignal);
           await page.evaluate(`(async () => { ${helpers}\n${rawStep}\n })()`);
           continue;
         }
         if (Array.isArray(rawStep)) {
           const [cmd, arg] = rawStep;
           if (cmd === 'click') {
-            const [tx, ty] = await resolveTargetPoint(page, arg, undefined, { viewport });
+            const [tx, ty] = await resolveTargetPoint(page, arg, undefined, { viewport, signal: effectiveSignal });
             await glideTo(tx, ty);
+            throwIfAborted(effectiveSignal);
             await page.mouse.down({ button: 'left' });
             emit({ type: 'pointerdown', x: pointerX, y: pointerY, button: 'left' });
-            await sleep(70);
+            await sleep(70, effectiveSignal);
             await page.mouse.up({ button: 'left' });
             emit({ type: 'pointerup', x: pointerX, y: pointerY, button: 'left' });
             continue;
           }
           if (cmd === 'press') {
             const { key, modifiers } = parseKeySpec(String(arg));
+            throwIfAborted(effectiveSignal);
             await page.keyboard.press([...modifiers, key].join('+'));
             emit({ type: 'key', key, modifiers, action: 'press' });
             continue;
           }
           if (cmd === 'type') {
             if (typeof arg !== 'string') throw Error('Type command requires a text string');
-            if (typeof page.keyboard.type === 'function') {
+            throwIfAborted(effectiveSignal);
+            if (typeof page.keyboard.type === 'function' && !effectiveSignal) {
               await page.keyboard.type(arg, { delay: 65 });
             } else {
               const chars = [...arg];
               for (let c = 0; c < chars.length; c++) {
-                await page.keyboard.press(chars[c]);
-                if (c + 1 < chars.length) await sleep(65);
+                throwIfAborted(effectiveSignal);
+                if (typeof page.keyboard.type === 'function') {
+                  await page.keyboard.type(chars[c]);
+                } else {
+                  await page.keyboard.press(chars[c]);
+                }
+                if (c + 1 < chars.length) await sleep(65, effectiveSignal);
               }
             }
             nowT();
@@ -1360,6 +1507,7 @@ export async function createBrowserTakeCapture({
 
         const locatorOpts = {
           viewport,
+          ...(effectiveSignal ? { signal: effectiveSignal } : {}),
           ...(rawStep.timeout !== undefined
             ? { timeout: rawStep.timeout }
             : recipe.stepTimeout !== undefined
@@ -1428,14 +1576,17 @@ export async function createBrowserTakeCapture({
             if (rawStep.move !== false) {
               await glideTo(tx, ty, rawStep.moveDuration, rawStep.arc ?? 0.08);
             } else {
+              throwIfAborted(effectiveSignal);
               pointerX = roundCoord(tx);
               pointerY = roundCoord(ty);
               await page.mouse.move(pointerX, pointerY);
               emit({ type: 'pointermove', x: pointerX, y: pointerY });
             }
+            throwIfAborted(effectiveSignal);
             for (const mod of clickModifiers) await page.keyboard.down(mod);
             try {
               for (let c = 1; c <= clickCount; c++) {
+                throwIfAborted(effectiveSignal);
                 await page.mouse.down({ button, clickCount: c });
                 emit({
                   type: 'pointerdown',
@@ -1444,15 +1595,19 @@ export async function createBrowserTakeCapture({
                   button,
                   ...(clickModifiers.length > 0 ? { modifiers: [...clickModifiers] } : {}),
                 });
-                await sleep((rawStep.hold ?? 0.07) * 1000);
+                await sleep((rawStep.hold ?? 0.07) * 1000, effectiveSignal);
                 await page.mouse.up({ button, clickCount: c });
                 emit({ type: 'pointerup', x: pointerX, y: pointerY, button });
-                if (c < clickCount) await sleep(50);
+                if (c < clickCount) await sleep(50, effectiveSignal);
               }
             } finally {
-              for (const mod of [...clickModifiers].reverse()) await page.keyboard.up(mod);
+              if (!effectiveSignal?.aborted) {
+                for (const mod of [...clickModifiers].reverse()) {
+                  await page.keyboard.up(mod).catch(() => {});
+                }
+              }
             }
-            if (rawStep.settle) await sleep(rawStep.settle * 1000);
+            if (rawStep.settle) await sleep(rawStep.settle * 1000, effectiveSignal);
             break;
           }
           case 'pointerdown':
@@ -1474,6 +1629,7 @@ export async function createBrowserTakeCapture({
               if (!canonical) throw Error(`Unsupported pointer modifier: ${mod}`);
               if (!pointerModifiers.includes(canonical)) pointerModifiers.push(canonical);
             }
+            throwIfAborted(effectiveSignal);
             if (kind === 'pointerdown') {
               for (const mod of pointerModifiers) await page.keyboard.down(mod);
               await page.mouse.down({ button });
@@ -1506,6 +1662,7 @@ export async function createBrowserTakeCapture({
             }
 
             await glideTo(fromX, fromY, dragSpec.moveDuration, dragSpec.arc ?? 0.08);
+            throwIfAborted(effectiveSignal);
             const dragStartT = nowT();
             emit({
               t: dragStartT,
@@ -1516,9 +1673,10 @@ export async function createBrowserTakeCapture({
             });
             await page.mouse.down({ button });
             emit({ type: 'pointerdown', x: pointerX, y: pointerY, button });
-            await sleep(25);
+            await sleep(25, effectiveSignal);
             await glideTo(toX, toY, dragDuration, dragSpec.dragArc ?? 0.03);
-            await sleep((dragSpec.releaseHold ?? 0.03) * 1000);
+            await sleep((dragSpec.releaseHold ?? 0.03) * 1000, effectiveSignal);
+            throwIfAborted(effectiveSignal);
             await page.mouse.up({ button });
             emit({ type: 'pointerup', x: pointerX, y: pointerY, button });
             break;
@@ -1540,7 +1698,7 @@ export async function createBrowserTakeCapture({
             }
             const rawPhase = rawStep.phase ?? 'changed';
             if (!WHEEL_PHASES.has(rawPhase)) throw Error(`Invalid wheel phase: ${rawPhase}`);
-            const phase = rawPhase === 'maybegin' ? 'mayBegin' : rawPhase;
+            const phaseVal = rawPhase === 'maybegin' ? 'mayBegin' : rawPhase;
             const plannedWheelDur = rawStep.duration ?? 0.25;
             if (!Number.isFinite(plannedWheelDur) || plannedWheelDur < 0) {
               throw Error(`Invalid wheel duration: ${plannedWheelDur}`);
@@ -1555,12 +1713,13 @@ export async function createBrowserTakeCapture({
             const wheelStartT = nowT();
             const beforeWheelMs = performance.now();
             for (let s = 0; s < wheelSubSteps.length; s++) {
+              throwIfAborted(effectiveSignal);
               const sub = wheelSubSteps[s];
               await page.mouse.wheel(sub.deltaX, sub.deltaY);
               if (plannedWheelDur > 0 && s + 1 < wheelSubSteps.length) {
                 const targetElapsedMs = ((s + 1) / wheelSubSteps.length) * plannedWheelDur * 1000;
                 const waitMs = targetElapsedMs - (performance.now() - beforeWheelMs);
-                if (waitMs > 0.5) await sleep(waitMs);
+                if (waitMs > 0.5) await sleep(waitMs, effectiveSignal);
               }
             }
             const measuredWheelDur = roundTime((performance.now() - beforeWheelMs) / 1000);
@@ -1575,11 +1734,11 @@ export async function createBrowserTakeCapture({
               y: pointerY,
               deltaX: totalDx,
               deltaY: totalDy,
-              phase,
+              phase: phaseVal,
               duration: wheelDuration,
             });
             nowT();
-            if (rawStep.settle) await sleep(rawStep.settle * 1000);
+            if (rawStep.settle) await sleep(rawStep.settle * 1000, effectiveSignal);
             break;
           }
           case 'gesture':
@@ -1593,6 +1752,7 @@ export async function createBrowserTakeCapture({
               emitStepMarker([tx, ty]);
               if (rawStep.move === true) await glideTo(tx, ty, rawStep.moveDuration);
               else {
+                throwIfAborted(effectiveSignal);
                 pointerX = roundCoord(tx);
                 pointerY = roundCoord(ty);
                 await page.mouse.move(pointerX, pointerY);
@@ -1630,6 +1790,7 @@ export async function createBrowserTakeCapture({
               });
               const pinchStartMs = performance.now();
               for (let s = 0; s < pinchSubSteps.length; s++) {
+                throwIfAborted(effectiveSignal);
                 const sub = pinchSubSteps[s];
                 await activeCdp.send('Input.dispatchMouseEvent', {
                   type: 'mouseWheel',
@@ -1642,7 +1803,7 @@ export async function createBrowserTakeCapture({
                 if (plannedDurSec > 0 && s + 1 < pinchSubSteps.length) {
                   const targetElapsedMs = ((s + 1) / pinchSubSteps.length) * plannedDurSec * 1000;
                   const waitMs = targetElapsedMs - (performance.now() - pinchStartMs);
-                  if (waitMs > 0.5) await sleep(waitMs);
+                  if (waitMs > 0.5) await sleep(waitMs, effectiveSignal);
                 }
               }
               emittedDeltaX = totalDx;
@@ -1654,6 +1815,7 @@ export async function createBrowserTakeCapture({
                 throw Error('Scroll gesture requires finite deltaX/deltaY');
               }
               if (rawStep.repeatCount !== undefined) {
+                throwIfAborted(effectiveSignal);
                 const distance = Math.hypot(deltaX, deltaY);
                 const speed = rawStep.speed ?? (
                   rawStep.duration && rawStep.duration > 0 && distance > 0
@@ -1685,6 +1847,7 @@ export async function createBrowserTakeCapture({
                 });
                 const scrollStartMs = performance.now();
                 for (let s = 0; s < scrollSubSteps.length; s++) {
+                  throwIfAborted(effectiveSignal);
                   const sub = scrollSubSteps[s];
                   // Trackpad scroll gestures use finger-drag delta convention (opposite wheel sign).
                   await activeCdp.send('Input.dispatchMouseEvent', {
@@ -1698,7 +1861,7 @@ export async function createBrowserTakeCapture({
                   if (plannedScrollDur > 0 && s + 1 < scrollSubSteps.length) {
                     const targetElapsedMs = ((s + 1) / scrollSubSteps.length) * plannedScrollDur * 1000;
                     const waitMs = targetElapsedMs - (performance.now() - scrollStartMs);
-                    if (waitMs > 0.5) await sleep(waitMs);
+                    if (waitMs > 0.5) await sleep(waitMs, effectiveSignal);
                   }
                 }
               }
@@ -1724,7 +1887,7 @@ export async function createBrowserTakeCapture({
             });
             // Keep timestamp cursor at or after actual completion of the blocking CDP gesture.
             nowT();
-            if (rawStep.settle) await sleep(rawStep.settle * 1000);
+            if (rawStep.settle) await sleep(rawStep.settle * 1000, effectiveSignal);
             break;
           }
           case 'key': {
@@ -1736,6 +1899,7 @@ export async function createBrowserTakeCapture({
             if (!KEY_ACTIONS.has(action)) throw Error(`Invalid key action: ${action}`);
             const { key, modifiers } = parseKeySpec(rawStep.key ?? rawStep.press, rawStep.modifiers);
             const chord = [...modifiers, key].join('+');
+            throwIfAborted(effectiveSignal);
             if (action === 'press') {
               await page.keyboard.press(chord);
             } else if (action === 'down') {
@@ -1746,7 +1910,7 @@ export async function createBrowserTakeCapture({
               for (const mod of [...modifiers].reverse()) await page.keyboard.up(mod);
             }
             emit({ type: 'key', key, modifiers, action });
-            if (rawStep.settle) await sleep(rawStep.settle * 1000);
+            if (rawStep.settle) await sleep(rawStep.settle * 1000, effectiveSignal);
             break;
           }
           case 'type': {
@@ -1769,14 +1933,16 @@ export async function createBrowserTakeCapture({
               if (rawStep.move !== false) {
                 await glideTo(tx, ty, rawStep.moveDuration, rawStep.arc ?? 0.08);
               } else {
+                throwIfAborted(effectiveSignal);
                 pointerX = roundCoord(tx);
                 pointerY = roundCoord(ty);
                 await page.mouse.move(pointerX, pointerY);
                 emit({ type: 'pointermove', x: pointerX, y: pointerY });
               }
+              throwIfAborted(effectiveSignal);
               await page.mouse.down({ button: 'left' });
               emit({ type: 'pointerdown', x: pointerX, y: pointerY, button: 'left' });
-              await sleep((rawStep.hold ?? 0.05) * 1000);
+              await sleep((rawStep.hold ?? 0.05) * 1000, effectiveSignal);
               await page.mouse.up({ button: 'left' });
               emit({ type: 'pointerup', x: pointerX, y: pointerY, button: 'left' });
             } else {
@@ -1784,12 +1950,14 @@ export async function createBrowserTakeCapture({
             }
             const emitKeys = rawStep.emitKeys === true || rawStep.includeKeys === true;
             const chars = [...rawStep.text];
-            if (!emitKeys && typeof page.keyboard.type === 'function') {
+            throwIfAborted(effectiveSignal);
+            if (!emitKeys && !effectiveSignal && typeof page.keyboard.type === 'function') {
               if (chars.length > 0) {
                 await page.keyboard.type(rawStep.text, { delay: delayMs });
               }
             } else {
               for (let c = 0; c < chars.length; c++) {
+                throwIfAborted(effectiveSignal);
                 const ch = chars[c];
                 if (typeof page.keyboard.type === 'function') {
                   await page.keyboard.type(ch);
@@ -1799,11 +1967,11 @@ export async function createBrowserTakeCapture({
                 if (emitKeys) {
                   emit({ type: 'key', key: ch, modifiers: [], action: 'press', typing: true });
                 }
-                if (delayMs > 0 && c + 1 < chars.length) await sleep(delayMs);
+                if (delayMs > 0 && c + 1 < chars.length) await sleep(delayMs, effectiveSignal);
               }
             }
             nowT();
-            if (settle > 0) await sleep(settle * 1000);
+            if (settle > 0) await sleep(settle * 1000, effectiveSignal);
             break;
           }
           case 'pause': {
@@ -1813,7 +1981,7 @@ export async function createBrowserTakeCapture({
             emitStepMarker(explicitTarget);
             const seconds = rawStep.duration ?? rawStep.pause ?? ((rawStep.wait ?? 0) / 1000);
             if (!Number.isFinite(seconds) || seconds < 0) throw Error(`Invalid pause duration: ${seconds}`);
-            await sleep(seconds * 1000);
+            await sleep(seconds * 1000, effectiveSignal);
             break;
           }
           case 'eval': {
@@ -1821,6 +1989,7 @@ export async function createBrowserTakeCapture({
               ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
               : null;
             emitStepMarker(explicitTarget);
+            throwIfAborted(effectiveSignal);
             await page.evaluate(`(async () => { ${helpers}\n${rawStep.eval}\n })()`);
             break;
           }
@@ -1833,22 +2002,22 @@ export async function createBrowserTakeCapture({
       const durationExceeded = recipe.duration !== undefined && stepsElapsed > recipe.duration + 1e-3;
 
       if (recipe.duration !== undefined) {
-        await sleep(recipe.duration * 1000 - (performance.now() - takeStartMs));
+        await sleep(recipe.duration * 1000 - (performance.now() - takeStartMs), effectiveSignal);
       } else {
-        await sleep((recipe.tail ?? 0.2) * 1000);
+        await sleep((recipe.tail ?? 0.2) * 1000, effectiveSignal);
       }
 
       // Allow any in-flight compositor frame from the final action to arrive before stopping.
-      await sleep(40);
+      await sleep(40, effectiveSignal);
       const actualElapsed = Math.max(1 / requestedFps, (performance.now() - takeStartMs) / 1000);
       const targetDuration = recipe.duration !== undefined
         ? (recipe.truncate === true ? recipe.duration : Math.max(recipe.duration, stepsElapsed))
         : actualElapsed;
 
-      screencasting = false;
-      await activeCdp.send('Page.stopScreencast').catch(() => {});
-      await Promise.all(pendingWrites);
-      await cleanupActive();
+      await drainSession({ checkWriteErrors: true });
+
+      setPhase('encoding');
+      throwIfAborted(effectiveSignal);
 
       const preEncodeCapture = computeRawCaptureStats({
         rawFrames,
@@ -1860,7 +2029,7 @@ export async function createBrowserTakeCapture({
       });
 
       const videoFileName = `take.${format}`;
-      const videoPath = join(out, videoFileName);
+      const videoPath = assertPathInsideDir(join(out, videoFileName), out, 'take video');
       const encoded = await encodeFrames({
         initialFrameFile,
         rawFrames,
@@ -1870,7 +2039,7 @@ export async function createBrowserTakeCapture({
         fps: requestedFps,
         targetDuration,
         colorSpace,
-        signal,
+        signal: effectiveSignal,
       });
 
       const rawCapture = {
@@ -1898,12 +2067,12 @@ export async function createBrowserTakeCapture({
         events,
       };
       const serializedTrack = serializeEventTrack(eventTrackData);
-      const eventTrackPath = join(out, 'event-track.json');
-      await writeFile(eventTrackPath, serializedTrack);
+      const eventTrackPath = assertPathInsideDir(join(out, 'event-track.json'), out, 'event track');
+      await writeFileAtomic(eventTrackPath, serializedTrack);
 
       const videoBytes = await readFile(videoPath);
-      const videoSha256 = hash(videoBytes);
-      const eventTrackSha256 = hash(serializedTrack);
+      const videoSha256 = sha256(videoBytes);
+      const eventTrackSha256 = sha256(serializedTrack);
 
       return {
         file: videoPath,
@@ -1939,12 +2108,43 @@ export async function createBrowserTakeCapture({
         source: { url, format, captureMode: mode, colorSpace, deviceScaleFactor: viewport.deviceScaleFactor, kind: 'browser-take' },
       };
     } finally {
+      if (!drained && !runnerClosed && phase !== 'closed') {
+        setPhase('draining');
+      }
+      screencasting = false;
+      detachScreencastListener();
+      await Promise.allSettled(pendingWrites);
       await cleanupActive();
-      await rm(framesDir, { recursive: true, force: true });
+      if (previousFrontmost) {
+        const frontmostToRestore = previousFrontmost;
+        previousFrontmost = null;
+        await focus.restoreFrontmost(frontmostToRestore);
+      }
+      if (framesDir) {
+        await rm(framesDir, { recursive: true, force: true });
+      }
+      setPhase(runnerClosed ? 'closed' : 'idle');
     }
   }
 
-  return { capture, close: cleanupActive };
+  async function close() {
+    runnerClosed = true;
+    await cleanupActive();
+    if (phase === 'idle' || phase === 'closed') {
+      setPhase('closed');
+    }
+  }
+
+  return {
+    capture,
+    close,
+    get phase() {
+      return phase;
+    },
+    getPhase() {
+      return phase;
+    },
+  };
 }
 
 export async function captureBrowserTake({ name, recipe, base, ...options } = {}) {

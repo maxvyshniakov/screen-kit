@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import sharp from 'sharp';
+import { assertPathInsideDir, moveFileAtomic, sha256, writeFileAtomic } from './internal/fs-paths.mjs';
+import { buildColorEncodeArgs } from './internal/media.mjs';
 import { probeVideo, renderVideo } from './video.mjs';
 import { VERSION } from './run.mjs';
 
@@ -45,7 +47,6 @@ const THUMBNAIL_MIME_BY_EXT = Object.freeze({
 });
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
-const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 
 const escapeHtmlAttr = (value) =>
   String(value).replace(/[&<>"']/g, (char) => ({
@@ -55,18 +56,6 @@ const escapeHtmlAttr = (value) =>
     '"': '&quot;',
     "'": '&#39;',
   })[char]);
-
-async function writeFileAtomic(targetPath, data) {
-  const resolved = resolve(targetPath);
-  await mkdir(dirname(resolved), { recursive: true });
-  const tempPath = join(dirname(resolved), `.${basename(resolved)}-${randomUUID()}.tmp`);
-  try {
-    await writeFile(tempPath, data);
-    await rename(tempPath, resolved);
-  } finally {
-    await rm(tempPath, { force: true });
-  }
-}
 
 async function readNonEmptyFile(filePath, label) {
   const resolved = resolve(filePath);
@@ -146,17 +135,9 @@ async function encodeAv1Webm({ input, output, fps, colorSpace = 'srgb' }) {
   if (resolvedInput === resolvedOutput) {
     throw Error('video input and output must differ');
   }
+  const { vf, colorFlags } = buildColorEncodeArgs(colorSpace, 'webm');
   await access(resolvedInput);
   await mkdir(dirname(resolvedOutput), { recursive: true });
-
-  const vf =
-    colorSpace === 'p3'
-      ? 'pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
-      : 'pad=ceil(iw/2)*2:ceil(ih/2)*2';
-  const colorFlags =
-    colorSpace === 'p3'
-      ? ['-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709', '-color_range', 'tv']
-      : [];
 
   const temporary = join(dirname(resolvedOutput), `.${basename(resolvedOutput)}-${randomUUID()}.webm`);
   try {
@@ -192,7 +173,7 @@ async function encodeAv1Webm({ input, output, fps, colorSpace = 'srgb' }) {
     if (!info.frames || !(info.duration > 0)) {
       throw Error('AV1 encoder produced an empty video');
     }
-    await rename(temporary, resolvedOutput);
+    await moveFileAtomic(temporary, resolvedOutput);
     return { file: resolvedOutput, format: 'webm', ...info };
   } finally {
     await rm(temporary, { force: true });
@@ -330,27 +311,30 @@ export async function publishWebBundle({
     if (spec === 'av1') {
       fileName = hasBothWebm ? `${bundleName}.av1.webm` : `${bundleName}.webm`;
       mimeType = 'video/webm; codecs="av01.0.04M.08"';
+      const targetPath = assertPathInsideDir(join(resolvedOutDir, fileName), resolvedOutDir, 'web bundle video');
       encoded = await encodeAv1Webm({
         input: resolvedInput,
-        output: join(resolvedOutDir, fileName),
+        output: targetPath,
         fps,
         colorSpace,
       });
     } else if (spec === 'vp9') {
       fileName = hasBothWebm ? `${bundleName}.vp9.webm` : `${bundleName}.webm`;
       mimeType = 'video/webm; codecs="vp9"';
+      const targetPath = assertPathInsideDir(join(resolvedOutDir, fileName), resolvedOutDir, 'web bundle video');
       encoded = await renderVideo({
         input: resolvedInput,
-        output: join(resolvedOutDir, fileName),
+        output: targetPath,
         fps,
         colorSpace,
       });
     } else {
       fileName = `${bundleName}.mp4`;
       mimeType = 'video/mp4';
+      const targetPath = assertPathInsideDir(join(resolvedOutDir, fileName), resolvedOutDir, 'web bundle video');
       encoded = await renderVideo({
         input: resolvedInput,
-        output: join(resolvedOutDir, fileName),
+        output: targetPath,
         fps,
         colorSpace,
       });

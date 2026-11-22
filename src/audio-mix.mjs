@@ -1,18 +1,32 @@
 import { execFile } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { assertValidTimeline } from './timeline.mjs';
+import { EXTERNAL_MEDIA_RE, fileExists, resolveLocalPath, sha256 } from './internal/fs-paths.mjs';
+import { postGoogleGenAiJson } from './internal/google-genai.mjs';
 import {
   DEFAULT_LOUDNESS_BOUNDS,
   encodePcm16Wav,
+  extractPcm16SamplesStereo,
+  isWavBuffer,
   measureLoudness,
   parsePcmMimeType,
+  parseWavHeader,
   probeAudio,
-} from './narration.mjs';
+} from './internal/media.mjs';
+import { assertValidTimeline } from './timeline.mjs';
+
+export {
+  DEFAULT_LOUDNESS_BOUNDS,
+  encodePcm16Wav,
+  extractPcm16SamplesStereo,
+  measureLoudness,
+  parsePcmMimeType,
+  parseWavHeader,
+  probeAudio,
+};
 
 const exec = promisify(execFile);
 
@@ -38,79 +52,6 @@ function round(value, digits = 4) {
   const factor = 10 ** digits;
   const result = Math.round(value * factor) / factor;
   return Object.is(result, -0) ? 0 : result;
-}
-
-async function fileExists(filePath) {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function resolveLocalPath(ref, baseDir) {
-  if (ref.startsWith('file://')) {
-    return fileURLToPath(ref);
-  }
-  return resolve(baseDir, ref);
-}
-
-function isWavBuffer(buffer) {
-  return (
-    Buffer.isBuffer(buffer) &&
-    buffer.length >= 44 &&
-    buffer.toString('ascii', 0, 4) === 'RIFF' &&
-    buffer.toString('ascii', 8, 12) === 'WAVE'
-  );
-}
-
-function extractPcm16SamplesStereo(wavBuffer) {
-  if (!isWavBuffer(wavBuffer)) {
-    throw Error('Expected standard RIFF WAVE buffer');
-  }
-  let offset = 12;
-  let channels = 0;
-  let sampleRate = 0;
-  let bitsPerSample = 0;
-  let audioFormat = 0;
-  let dataStart = -1;
-  let dataSize = 0;
-
-  while (offset + 8 <= wavBuffer.length) {
-    const chunkId = wavBuffer.toString('ascii', offset, offset + 4);
-    const chunkSize = wavBuffer.readUInt32LE(offset + 4);
-    const bodyStart = offset + 8;
-    if (chunkId === 'fmt ' && bodyStart + 16 <= wavBuffer.length) {
-      audioFormat = wavBuffer.readUInt16LE(bodyStart);
-      channels = wavBuffer.readUInt16LE(bodyStart + 2);
-      sampleRate = wavBuffer.readUInt32LE(bodyStart + 4);
-      bitsPerSample = wavBuffer.readUInt16LE(bodyStart + 14);
-    } else if (chunkId === 'data') {
-      dataStart = bodyStart;
-      dataSize = Math.min(chunkSize, Math.max(0, wavBuffer.length - bodyStart));
-      break;
-    }
-    offset = bodyStart + chunkSize + (chunkSize % 2);
-  }
-
-  if (audioFormat !== 1 || bitsPerSample !== 16 || dataStart < 0 || channels < 1) {
-    throw Error(`Unsupported WAV PCM format (format=${audioFormat}, bits=${bitsPerSample}, channels=${channels})`);
-  }
-
-  const frameStride = channels * 2;
-  const frameCount = Math.floor(dataSize / frameStride);
-  const stereo = new Float32Array(frameCount * 2);
-
-  for (let i = 0; i < frameCount; i += 1) {
-    const base = dataStart + i * frameStride;
-    const left = wavBuffer.readInt16LE(base) / 32768;
-    const right = channels >= 2 ? wavBuffer.readInt16LE(base + 2) / 32768 : left;
-    stereo[i * 2] = left;
-    stereo[i * 2 + 1] = right;
-  }
-
-  return { sampleRate, frameCount, stereo };
 }
 
 async function decodeToPcm16StereoWav(inputFile, outputFile, sampleRate = DEFAULT_MIX_SAMPLE_RATE) {
@@ -376,7 +317,7 @@ export function computeMusicCacheKey({
     bpm: isFiniteNumber(bpm) ? bpm : null,
     duration: isFiniteNumber(duration) ? round(duration, 2) : null,
   });
-  return createHash('sha256').update(canonical).digest('hex');
+  return sha256(canonical);
 }
 
 function extractInlineAudioFromLyriaPayload(payload) {
@@ -433,6 +374,7 @@ export async function generateMusicBed({
   seed,
   bpm,
   apiKey,
+  env = process.env,
   fetchImpl = globalThis.fetch,
   signal,
   force = false,
@@ -483,23 +425,12 @@ export async function generateMusicBed({
     }
   }
 
-  const resolvedKey = apiKey ?? process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
-  if (!isNonEmptyString(resolvedKey)) {
-    throw Error(
-      'Lyria music generation requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or provide a local music file.'
-    );
-  }
-  if (typeof fetchImpl !== 'function') {
-    throw Error('fetch is not available for Lyria music generation');
-  }
-
   const directives = ['Instrumental background music bed for a product demo (no vocals).'];
   if (isFiniteNumber(bpm) && bpm > 0) directives.push(`Tempo: ${bpm} BPM.`);
   if (isFiniteNumber(duration) && duration > 0) directives.push(`Target length: ${round(duration, 1)}s.`);
   if (isNonEmptyString(negativePrompt)) directives.push(`Avoid: ${negativePrompt.trim()}.`);
   const fullPrompt = `${directives.join(' ')}\nPrompt: ${prompt.trim()}`;
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   const requestBody = {
     contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
     generationConfig: {
@@ -508,22 +439,18 @@ export async function generateMusicBed({
     },
   };
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': resolvedKey.trim(),
-    },
-    body: JSON.stringify(requestBody),
-    ...(signal ? { signal } : {}),
+  const payload = await postGoogleGenAiJson({
+    model,
+    action: 'generateContent',
+    body: requestBody,
+    apiKey,
+    env,
+    fetchImpl,
+    signal,
+    label: 'Lyria',
+    missingKeyMessage:
+      'Lyria music generation requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or provide a local music file.',
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw Error(`Lyria API returned HTTP ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
   const extracted = extractInlineAudioFromLyriaPayload(payload);
   if (!extracted) {
     throw Error('Lyria API response did not contain audio data');
@@ -857,7 +784,7 @@ export async function resolveSpeechWindows({
       let trackDuration = isFiniteNumber(track.duration) && track.duration > 0 ? track.duration : null;
       let absFile = null;
 
-      if (isNonEmptyString(track.src) && !/^(?:https?:|data:|blob:)/i.test(track.src)) {
+      if (isNonEmptyString(track.src) && !EXTERNAL_MEDIA_RE.test(track.src)) {
         absFile = resolveLocalPath(track.src, baseDir);
         if (trackDuration === null && (await fileExists(absFile))) {
           const probed = await probeAudio(absFile).catch(() => null);

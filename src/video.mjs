@@ -1,30 +1,14 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { access, mkdir, rename, rm } from 'node:fs/promises';
+import { access, mkdir, rm } from 'node:fs/promises';
 import { dirname, extname, resolve, basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { moveFileAtomic } from './internal/fs-paths.mjs';
+import { buildColorEncodeArgs, probeVideo } from './internal/media.mjs';
+
 const exec = promisify(execFile);
 
-const fraction = value => {
-  const [a, b = 1] = String(value).split('/').map(Number);
-  return b ? a / b : 0;
-};
-
-export async function probeVideo(file) {
-  const { stdout } = await exec('ffprobe', ['-v', 'error', '-count_frames', '-show_streams', '-show_format', '-of', 'json', resolve(file)], { maxBuffer: 5e6 });
-  const info = JSON.parse(stdout);
-  const stream = info.streams.find(s => s.codec_type === 'video');
-  if (!stream) throw Error(`${file}: no video stream`);
-  return { width: stream.width, height: stream.height,
-    frames: Number(stream.nb_read_frames ?? stream.nb_frames),
-    duration: Number(info.format.duration ?? stream.duration),
-    fps: fraction(stream.avg_frame_rate), codec: stream.codec_name,
-    audio: info.streams.some(s => s.codec_type === 'audio'),
-    colorPrimaries: stream.color_primaries ?? null,
-    colorTransfer: stream.color_transfer ?? null,
-    colorSpace: stream.color_space ?? null,
-    colorRange: stream.color_range ?? null };
-}
+export { probeVideo };
 
 /** Encode a real captured take or image sequence. Never records or drives an application. */
 export async function renderVideo({ input, output, fps, colorSpace = 'srgb' } = {}) {
@@ -34,19 +18,13 @@ export async function renderVideo({ input, output, fps, colorSpace = 'srgb' } = 
   if (input === output) throw Error('video input and output must differ');
   const format = extname(output).slice(1);
   if (!['mp4', 'webm'].includes(format)) throw Error('video output must be .mp4 or .webm');
-  if (!['srgb', 'p3'].includes(colorSpace)) throw Error(`unsupported colorSpace: ${colorSpace}`);
+  const { vf, colorFlags } = buildColorEncodeArgs(colorSpace, format);
   if (fps !== undefined && !(Number.isFinite(fps) && fps > 0 && fps <= 120)) throw Error('fps must be between 0 and 120');
   const sequence = /%(?:0\d+)?d/.test(input);
   if (!sequence) await access(input);
   await mkdir(dirname(output), { recursive: true });
   const temporary = join(dirname(output), `.${basename(output)}-${randomUUID()}.${format}`);
   const inputOptions = sequence ? ['-framerate', String(fps ?? 1)] : [];
-  const vf = colorSpace === 'p3'
-    ? 'pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
-    : 'pad=ceil(iw/2)*2:ceil(ih/2)*2';
-  const colorFlags = colorSpace === 'p3'
-    ? ['-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709', '-color_range', 'tv']
-    : [];
   const codec = format === 'mp4'
     ? ['-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-movflags', '+faststart']
     : ['-c:v', 'libvpx-vp9', '-crf', '24', '-b:v', '0', '-deadline', 'good'];
@@ -57,7 +35,7 @@ export async function renderVideo({ input, output, fps, colorSpace = 'srgb' } = 
     { timeout: 300000, maxBuffer: 5e6 });
     const info = await probeVideo(temporary);
     if (!info.frames || !(info.duration > 0)) throw Error('encoder produced an empty video');
-    await rename(temporary, output);
+    await moveFileAtomic(temporary, output);
     return { file: output, format, ...info };
   } finally { await rm(temporary, { force: true }); }
 }

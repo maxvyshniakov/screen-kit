@@ -2,10 +2,32 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { promisify } from 'node:util';
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, dirname, extname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import {
+  EXTERNAL_MEDIA_RE,
+  fileExists,
+  moveFileAtomic,
+  rebaseMediaRef,
+  resolveLocalPath,
+  writeFileAtomic,
+} from './internal/fs-paths.mjs';
+import {
+  postGoogleGenAiJson,
+  resolveGoogleApiKey,
+  stripJsonCodeFence,
+} from './internal/google-genai.mjs';
+import {
+  DEFAULT_LOUDNESS_BOUNDS,
+  buildColorEncodeArgs,
+  encodePcm16Wav,
+  measureLoudness,
+  parsePcmMimeType,
+  parseWavHeader,
+  probeAudio,
+  probeVideo,
+} from './internal/media.mjs';
 import {
   assertValidTimeline,
   compileStepCameraKeyframes,
@@ -14,7 +36,15 @@ import {
   sampleCursor,
   validateEventTrack,
 } from './timeline.mjs';
-import { probeVideo } from './video.mjs';
+
+export {
+  DEFAULT_LOUDNESS_BOUNDS,
+  encodePcm16Wav,
+  measureLoudness,
+  parsePcmMimeType,
+  parseWavHeader,
+  probeAudio,
+};
 
 const exec = promisify(execFile);
 
@@ -40,14 +70,6 @@ export const NETFLIX_CAPTION_RULES = Object.freeze({
   maxDuration: 7.0,
   minGap: 2 / 30, // ~0.0667 s (2 frames at 30fps)
   tail: 0.5,
-});
-
-export const DEFAULT_LOUDNESS_BOUNDS = Object.freeze({
-  minLufs: -30,
-  maxLufs: -6,
-  targetLufs: -14,
-  maxTruePeakDbfs: -0.5,
-  silenceThresholdLufs: -60,
 });
 
 const EPS = 1e-6;
@@ -101,128 +123,6 @@ function resolveKokoroLangCode(language) {
   if (KOKORO_LANG_CODES[lower]) return KOKORO_LANG_CODES[lower];
   const primary = lower.split(/[-_]/)[0];
   return KOKORO_LANG_CODES[primary] ?? 'a';
-}
-
-/**
- * Parse sample rate and channel count from a PCM MIME type such as
- * `audio/L16;codec=pcm;rate=24000;channels=1`.
- */
-export function parsePcmMimeType(mimeType = '') {
-  const text = String(mimeType);
-  const rateMatch = text.match(/(?:^|;\s*)rate=(\d+)/i);
-  const channelsMatch = text.match(/(?:^|;\s*)channels=(\d+)/i);
-  const bitsMatch = text.match(/audio\/l(\d+)/i);
-  return {
-    sampleRate: rateMatch ? Number(rateMatch[1]) : 24000,
-    channels: channelsMatch ? Number(channelsMatch[1]) : 1,
-    bitsPerSample: bitsMatch ? Number(bitsMatch[1]) : 16,
-  };
-}
-
-/**
- * Wrap raw little-endian signed 16-bit PCM bytes into a standard RIFF WAVE buffer.
- */
-export function encodePcm16Wav(
-  pcmBytes,
-  { sampleRate = 24000, channels = 1, bitsPerSample = 16 } = {}
-) {
-  const pcm = Buffer.isBuffer(pcmBytes) ? pcmBytes : Buffer.from(pcmBytes);
-  if (!Number.isInteger(sampleRate) || sampleRate <= 0) {
-    throw Error('sampleRate must be a positive integer');
-  }
-  if (!Number.isInteger(channels) || channels <= 0) {
-    throw Error('channels must be a positive integer');
-  }
-  if (!Number.isInteger(bitsPerSample) || bitsPerSample <= 0 || bitsPerSample % 8 !== 0) {
-    throw Error('bitsPerSample must be a positive multiple of 8');
-  }
-
-  const blockAlign = channels * (bitsPerSample / 8);
-  const byteRate = sampleRate * blockAlign;
-  const header = Buffer.alloc(44);
-
-  header.write('RIFF', 0, 'ascii');
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write('WAVE', 8, 'ascii');
-  header.write('fmt ', 12, 'ascii');
-  header.writeUInt32LE(16, 16); // PCM fmt chunk size
-  header.writeUInt16LE(1, 20); // AudioFormat = 1 (PCM)
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write('data', 36, 'ascii');
-  header.writeUInt32LE(pcm.length, 40);
-
-  return Buffer.concat([header, pcm]);
-}
-
-function parseWavHeader(buffer) {
-  if (!Buffer.isBuffer(buffer) || buffer.length < 44) return null;
-  if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') {
-    return null;
-  }
-  let offset = 12;
-  let channels = 0;
-  let sampleRate = 0;
-  let byteRate = 0;
-  let bitsPerSample = 0;
-  let dataSize = 0;
-
-  while (offset + 8 <= buffer.length) {
-    const chunkId = buffer.toString('ascii', offset, offset + 4);
-    const chunkSize = buffer.readUInt32LE(offset + 4);
-    const bodyStart = offset + 8;
-    if (chunkId === 'fmt ' && bodyStart + 16 <= buffer.length) {
-      channels = buffer.readUInt16LE(bodyStart + 2);
-      sampleRate = buffer.readUInt32LE(bodyStart + 4);
-      byteRate = buffer.readUInt32LE(bodyStart + 8);
-      bitsPerSample = buffer.readUInt16LE(bodyStart + 14);
-    } else if (chunkId === 'data') {
-      dataSize = Math.min(chunkSize, Math.max(0, buffer.length - bodyStart));
-      break;
-    }
-    offset = bodyStart + chunkSize + (chunkSize % 2);
-  }
-
-  const duration = byteRate > 0 ? dataSize / byteRate : 0;
-  return { channels, sampleRate, bitsPerSample, byteRate, dataSize, duration: round(duration, 4) };
-}
-
-/**
- * Probe audio stream metadata of an audio or video file using `ffprobe`.
- */
-export async function probeAudio(mediaPath) {
-  const file = resolve(mediaPath);
-  const { stdout } = await exec(
-    'ffprobe',
-    ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', file],
-    { maxBuffer: 10e6 }
-  );
-  const parsed = JSON.parse(stdout);
-  const stream = (parsed.streams ?? []).find((s) => s.codec_type === 'audio');
-  if (!stream) {
-    return {
-      file,
-      hasAudio: false,
-      duration: 0,
-      sampleRate: 0,
-      channels: 0,
-      codec: '',
-      bitRate: 0,
-    };
-  }
-  const duration = Number(stream.duration ?? parsed.format?.duration ?? 0);
-  return {
-    file,
-    hasAudio: true,
-    duration: Number.isFinite(duration) ? round(duration, 4) : 0,
-    sampleRate: Number(stream.sample_rate ?? 0) || 0,
-    channels: Number(stream.channels ?? 0) || 0,
-    codec: stream.codec_name ?? '',
-    bitRate: Number(stream.bit_rate ?? parsed.format?.bit_rate ?? 0) || 0,
-  };
 }
 
 function buildGeminiTtsPrompt({ text, language, style, tone, pacing, instructions }) {
@@ -326,16 +226,6 @@ export async function synthesizeWithGemini({
   const atempoFilter = buildAtempoFilterChain(speed);
   const clampedSpeed = Math.min(16, Math.max(0.1, speed));
 
-  const resolvedKey = apiKey ?? env.GEMINI_API_KEY ?? env.GOOGLE_API_KEY;
-  if (!isNonEmptyString(resolvedKey)) {
-    throw Error(
-      'Gemini TTS requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use provider="kokoro" for offline synthesis.'
-    );
-  }
-  if (typeof fetchImpl !== 'function') {
-    throw Error('fetch is not available for Gemini TTS');
-  }
-
   const languageCode = language ? normalizeLanguageCode(language) : undefined;
   const effectiveStyle =
     stylePrompt !== undefined
@@ -351,7 +241,6 @@ export async function synthesizeWithGemini({
     pacing,
     instructions,
   });
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
   const requestBody = {
     contents: [{ role: 'user', parts: [{ text: promptText }] }],
@@ -368,22 +257,18 @@ export async function synthesizeWithGemini({
     },
   };
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': resolvedKey.trim(),
-    },
-    body: JSON.stringify(requestBody),
-    ...(signal ? { signal } : {}),
+  const payload = await postGoogleGenAiJson({
+    model,
+    action: 'generateContent',
+    body: requestBody,
+    apiKey,
+    env,
+    fetchImpl,
+    signal,
+    label: 'Gemini TTS',
+    missingKeyMessage:
+      'Gemini TTS requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use provider="kokoro" for offline synthesis.',
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw Error(`Gemini TTS API returned HTTP ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
   const parts = payload?.candidates?.[0]?.content?.parts ?? [];
   const audioPart = parts.find((part) => {
     const inline = part?.inlineData ?? part?.inline_data;
@@ -1323,12 +1208,6 @@ function inferAudioMimeType(filePath = '') {
   return 'audio/wav';
 }
 
-function stripJsonCodeFence(rawText = '') {
-  const trimmed = String(rawText).trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  return fenced ? fenced[1].trim() : trimmed;
-}
-
 /**
  * Zero-install cloud word alignment using Gemini native audio understanding (`x-goog-api-key` header).
  * Makes zero network calls when credentials are absent.
@@ -1350,12 +1229,13 @@ export async function alignWithGemini({
   if (typeof text !== 'string') {
     throw Error('alignWithGemini requires text to be a string');
   }
-  const resolvedKey = apiKey ?? env.GEMINI_API_KEY ?? env.GOOGLE_API_KEY;
-  if (!isNonEmptyString(resolvedKey)) {
-    throw Error(
-      'Gemini audio alignment requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use aligner="whisper" or "proportional".'
-    );
-  }
+  const resolvedKey = resolveGoogleApiKey({
+    apiKey,
+    env,
+    label: 'Gemini audio alignment',
+    missingKeyMessage:
+      'Gemini audio alignment requires API credentials: set GEMINI_API_KEY (or GOOGLE_API_KEY), pass apiKey explicitly, or use aligner="whisper" or "proportional".',
+  });
   if (typeof fetchImpl !== 'function') {
     throw Error('fetch is not available for Gemini audio alignment');
   }
@@ -1393,14 +1273,10 @@ export async function alignWithGemini({
     `Exact script (${tokens.length} words): ${JSON.stringify(tokens)}`,
   ].join('\n');
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': resolvedKey.trim(),
-    },
-    body: JSON.stringify({
+  const data = await postGoogleGenAiJson({
+    model,
+    action: 'generateContent',
+    body: {
       contents: [
         {
           role: 'user',
@@ -1419,16 +1295,13 @@ export async function alignWithGemini({
         responseMimeType: 'application/json',
         temperature: 0,
       },
-    }),
-    ...(signal ? { signal } : {}),
+    },
+    apiKey: resolvedKey,
+    env,
+    fetchImpl,
+    signal,
+    label: 'Gemini audio alignment',
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw Error(`Gemini audio alignment API returned HTTP ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const data = await response.json();
   const rawText = (data?.candidates?.[0]?.content?.parts ?? [])
     .map((p) => p?.text ?? '')
     .join('\n')
@@ -2227,32 +2100,6 @@ export async function buildNarrationTracks({
   };
 }
 
-const EXTERNAL_MEDIA_RE = /^(?:https?:|data:|blob:)/i;
-
-async function fileExistsSafe(filePath) {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function resolveRefPath(ref, baseDir) {
-  if (!isNonEmptyString(ref) || EXTERNAL_MEDIA_RE.test(ref)) return null;
-  if (ref.startsWith('file://')) return fileURLToPath(ref);
-  return resolve(baseDir, ref);
-}
-
-function rebaseMediaRef(ref, fromBaseDir, toBaseDir) {
-  if (!isNonEmptyString(ref) || EXTERNAL_MEDIA_RE.test(ref)) return ref;
-  const abs = resolveRefPath(ref, fromBaseDir);
-  if (!abs) return ref;
-  if (!toBaseDir) return abs;
-  const rel = relative(toBaseDir, abs);
-  return rel || basename(abs);
-}
-
 async function padTakeVideoWithHolds({
   sourceVideo,
   outputVideo,
@@ -2267,7 +2114,8 @@ async function padTakeVideoWithHolds({
   const targetFps = isFiniteNumber(fps) && fps > 0 ? fps : srcInfo.fps || 30;
   const minSlice = Math.max(0.02, 1.05 / targetFps);
   const format = extname(outputVideo).toLowerCase() === '.webm' ? 'webm' : 'mp4';
-  const isP3 = colorSpace === 'p3' || srcInfo.colorPrimaries === 'smpte432';
+  const resolvedColorSpace = colorSpace === 'p3' || srcInfo.colorPrimaries === 'smpte432' ? 'p3' : 'srgb';
+  const { vf: colorPadVf, colorFlags } = buildColorEncodeArgs(resolvedColorSpace, format);
 
   // Collect lead hold (cut < minSlice) and internal hold points (minSlice <= cut <= srcDuration - minSlice)
   const internalHolds = [];
@@ -2295,15 +2143,8 @@ async function padTakeVideoWithHolds({
   await mkdir(dirname(outputVideo), { recursive: true });
   const tempOut = join(dirname(outputVideo), `.${basename(outputVideo)}-${randomUUID().slice(0, 8)}.${format}`);
 
-  const colorTailFilter = isP3
-    ? ',scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=smpte432:color_trc=iec61966-2-1:colorspace=bt709:range=tv'
-    : '';
-  const colorFlags = isP3
-    ? ['-color_range', 'tv', '-color_primaries', 'smpte432', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709']
-    : ['-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'];
-
   const codecArgs = format === 'webm'
-    ? ['-c:v', 'libvpx-vp9', '-crf', '22', '-b:v', '0', '-deadline', 'good', '-row-mt', '1', ...(isP3 ? colorFlags : [])]
+    ? ['-c:v', 'libvpx-vp9', '-crf', '22', '-b:v', '0', '-deadline', 'good', '-row-mt', '1', ...colorFlags]
     : [
         '-c:v', 'libx264',
         '-crf', '15',
@@ -2321,7 +2162,7 @@ async function padTakeVideoWithHolds({
       const vf = [
         `tpad=${tpadArgs}`,
         `fps=${targetFps}`,
-        `pad=ceil(iw/2)*2:ceil(ih/2)*2${colorTailFilter}`,
+        colorPadVf,
       ].join(',');
       await exec(
         'ffmpeg',
@@ -2366,7 +2207,7 @@ async function padTakeVideoWithHolds({
         concatInputs.push(`[v${idx}]`);
       });
       filterParts.push(
-        `${concatInputs.join('')}concat=n=${slices.length}:v=1:a=0,fps=${targetFps},pad=ceil(iw/2)*2:ceil(ih/2)*2${colorTailFilter},format=yuv420p[outv]`
+        `${concatInputs.join('')}concat=n=${slices.length}:v=1:a=0,fps=${targetFps},${colorPadVf},format=yuv420p[outv]`
       );
 
       await exec(
@@ -2392,7 +2233,7 @@ async function padTakeVideoWithHolds({
     if (!probed.frames || !(probed.duration > 0)) {
       throw Error('FFmpeg produced an empty padded take video');
     }
-    await rename(tempOut, outputVideo);
+    await moveFileAtomic(tempOut, outputVideo);
     return probed;
   } finally {
     await rm(tempOut, { force: true }).catch(() => {});
@@ -2718,8 +2559,8 @@ export async function narrateTimeline({
   assertValidTimeline(baseTimeline);
 
   if (!eventTrack && isNonEmptyString(baseTimeline.take?.eventTrack)) {
-    const candidateEtPath = resolveRefPath(baseTimeline.take.eventTrack, timelineSourceDir);
-    if (candidateEtPath && (await fileExistsSafe(candidateEtPath))) {
+    const candidateEtPath = resolveLocalPath(baseTimeline.take.eventTrack, timelineSourceDir);
+    if (candidateEtPath && (await fileExists(candidateEtPath))) {
       try {
         eventTrack = JSON.parse(await readFile(candidateEtPath, 'utf8'));
         eventTrackSourceDir = dirname(candidateEtPath);
@@ -3141,8 +2982,8 @@ export async function narrateTimeline({
 
   // 4. Pad source take video if step speech windows extended timeline duration
   const updatedTimeline = structuredClone(baseTimeline);
-  const absSourceVideo = resolveRefPath(baseTimeline.take.video, timelineSourceDir);
-  const sourceVideoExists = absSourceVideo ? await fileExistsSafe(absSourceVideo) : false;
+  const absSourceVideo = resolveLocalPath(baseTimeline.take.video, timelineSourceDir);
+  const sourceVideoExists = absSourceVideo ? await fileExists(absSourceVideo) : false;
 
   let paddedVideoPath = null;
   let finalFrames = Math.max(1, Math.round(finalDuration * baseTimeline.take.fps));
@@ -3231,7 +3072,7 @@ export async function narrateTimeline({
       const checkEt = validateEventTrack(retimedEventTrack);
       if (checkEt.ok) {
         retimedEventTrackPath = join(resolvedOutDir, 'event-track.narrated.json');
-        await writeFile(retimedEventTrackPath, `${JSON.stringify(retimedEventTrack, null, 2)}\n`, 'utf8');
+        await writeFileAtomic(retimedEventTrackPath, `${JSON.stringify(retimedEventTrack, null, 2)}\n`, 'utf8');
         updatedTimeline.take.eventTrack = timelineTargetDir
           ? rebaseMediaRef(retimedEventTrackPath, workingCwd, timelineTargetDir)
           : retimedEventTrackPath;
@@ -3324,8 +3165,7 @@ export async function narrateTimeline({
   assertValidTimeline(updatedTimeline);
 
   if (resolvedTimelineOut && writeTimeline) {
-    await mkdir(dirname(resolvedTimelineOut), { recursive: true });
-    await writeFile(resolvedTimelineOut, `${JSON.stringify(updatedTimeline, null, 2)}\n`, 'utf8');
+    await writeFileAtomic(resolvedTimelineOut, `${JSON.stringify(updatedTimeline, null, 2)}\n`, 'utf8');
   }
 
   const resolvedAlignerList = [...usedAligners];
@@ -3350,87 +3190,6 @@ export async function narrateTimeline({
     captionTracks,
     subtitles,
     timeline: updatedTimeline,
-  };
-}
-
-/**
- * Measure integrated loudness (LUFS), loudness range (LU), and true peak (dBFS)
- * on an audio or video file using FFmpeg's `ebur128=peak=true` filter.
- */
-export async function measureLoudness(
-  mediaPath,
-  { silenceThresholdLufs = DEFAULT_LOUDNESS_BOUNDS.silenceThresholdLufs } = {}
-) {
-  const file = resolve(mediaPath);
-  const probed = await probeAudio(file);
-  if (!probed.hasAudio) {
-    return {
-      file,
-      hasAudio: false,
-      duration: 0,
-      sampleRate: 0,
-      channels: 0,
-      codec: '',
-      integratedLufs: null,
-      loudnessRangeLu: null,
-      truePeakDbfs: null,
-      isSilent: true,
-    };
-  }
-
-  const { stderr } = await exec(
-    'ffmpeg',
-    [
-      '-hide_banner',
-      '-nostats',
-      '-i', file,
-      '-map', '0:a:0',
-      '-af', 'ebur128=peak=true',
-      '-f', 'null',
-      '-',
-    ],
-    { maxBuffer: 20e6, timeout: 120000 }
-  );
-
-  const summaryIndex = stderr.lastIndexOf('Summary:');
-  const summary = summaryIndex >= 0 ? stderr.slice(summaryIndex) : stderr;
-
-  const iMatch = summary.match(/Integrated loudness:[\s\S]*?\bI:\s*([+-]?\d+(?:\.\d+)?|-inf)\s*LUFS/i);
-  const lraMatch = summary.match(/Loudness range:[\s\S]*?\bLRA:\s*([+-]?\d+(?:\.\d+)?|-inf)\s*LU/i);
-  const peakMatch = summary.match(/True peak:[\s\S]*?\bPeak:\s*([+-]?\d+(?:\.\d+)?|-inf)\s*dBFS/i);
-
-  const parseMetric = (match) => {
-    if (!match) return null;
-    if (match[1].toLowerCase() === '-inf') return -Infinity;
-    const value = Number(match[1]);
-    return Number.isFinite(value) ? round(value, 2) : null;
-  };
-
-  const rawIntegrated = parseMetric(iMatch);
-  const rawLra = parseMetric(lraMatch);
-  const rawPeak = parseMetric(peakMatch);
-
-  const integratedLufs = rawIntegrated === -Infinity ? null : rawIntegrated;
-  const loudnessRangeLu = rawLra === -Infinity ? null : rawLra;
-  const truePeakDbfs = rawPeak === -Infinity ? null : rawPeak;
-
-  const isSilent =
-    rawIntegrated === -Infinity ||
-    rawPeak === -Infinity ||
-    integratedLufs === null ||
-    integratedLufs <= silenceThresholdLufs;
-
-  return {
-    file,
-    hasAudio: true,
-    duration: probed.duration,
-    sampleRate: probed.sampleRate,
-    channels: probed.channels,
-    codec: probed.codec,
-    integratedLufs,
-    loudnessRangeLu,
-    truePeakDbfs,
-    isSilent,
   };
 }
 
