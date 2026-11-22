@@ -431,22 +431,20 @@ function hudPillStyle(scale, { opacity = 1, liftPx = 0, mono = false } = {}) {
   return {
     opacity,
     transform: liftPx ? `translateY(${liftPx}px)` : undefined,
-    padding: `${9 * scale}px ${16 * scale}px`,
-    borderRadius: 12 * scale,
-    backgroundColor: 'rgba(14, 15, 19, 0.88)',
-    border: `${Math.max(1, 1 * scale)}px solid rgba(255, 255, 255, 0.14)`,
-    boxShadow:
-      '0 10px 28px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1)',
+    padding: `${13 * scale}px ${24 * scale}px`,
+    borderRadius: 16 * scale,
+    backgroundColor: 'rgba(12, 13, 16, 0.90)',
+    boxShadow: '0 14px 34px rgba(0, 0, 0, 0.36)',
     color: '#ffffff',
     fontFamily: mono ? MONO_FONT : UI_FONT,
-    fontSize: (mono ? 16 : 15) * scale,
-    fontWeight: mono ? 600 : 500,
-    letterSpacing: mono ? '0.03em' : '-0.005em',
+    fontSize: (mono ? 23 : 20) * scale,
+    fontWeight: 600,
+    letterSpacing: mono ? '0.03em' : '-0.01em',
     lineHeight: 1.15,
     whiteSpace: 'nowrap',
     display: 'inline-flex',
     alignItems: 'center',
-    gap: 8 * scale,
+    gap: 11 * scale,
   };
 }
 
@@ -462,13 +460,13 @@ function renderGesturePill(gesture) {
     h(
       'svg',
       {
-        width: 16 * s,
-        height: 16 * s,
+        width: 22 * s,
+        height: 22 * s,
         viewBox: '0 0 24 24',
         fill: 'none',
         style: {
           flexShrink: 0,
-          opacity: 0.9,
+          opacity: 0.95,
           transform: `rotate(${gesture.angleDeg}deg)`,
         },
       },

@@ -411,11 +411,19 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight) {
     });
   }
 
-  // 3. Wheel / trackpad / drag gesture indicators
+const MIN_HUD_DURATION = 1.0;
+
+  // 3. Wheel / trackpad / drag gesture indicators (minimum 1.0s visible duration; latest active wins)
   const gestures = [];
-  for (const [index, gesture] of (timeline.overlays?.gestures ?? []).entries()) {
-    if (t < gesture.t || t > gesture.t + gesture.duration) continue;
-    const progress = Math.min(1, Math.max(0, (t - gesture.t) / gesture.duration));
+  const rawGestures = timeline.overlays?.gestures ?? [];
+  for (const [index, gesture] of rawGestures.entries()) {
+    const nextStart = index + 1 < rawGestures.length ? rawGestures[index + 1].t : Infinity;
+    const displayDuration = Math.min(
+      Math.max(gesture.duration, MIN_HUD_DURATION),
+      Math.max(gesture.duration, nextStart - gesture.t)
+    );
+    if (t < gesture.t || t > gesture.t + displayDuration) continue;
+    const progress = Math.min(1, Math.max(0, (t - gesture.t) / Math.max(displayDuration, 0.001)));
     const screenPoint = projectViewportToScreen(gesture.x, gesture.y, timeline, t);
     const renderPoint = toRenderPoint(screenPoint);
     const magnitude = Math.hypot(gesture.deltaX, gesture.deltaY);
@@ -434,17 +442,18 @@ export function computeOverlaysAtTime(timeline, t, renderWidth, renderHeight) {
       magnitude,
       angleDeg,
       scale: outputScale,
-      opacity: envelopeOpacity(progress, 0.14, 0.28) * 0.94,
+      opacity: envelopeOpacity(progress, 0.1, 0.22),
     });
   }
 
-  // 4. Keystroke pills
+  // 4. Keystroke pills (minimum 1.0s visible duration so rapid shortcuts never flicker)
   const keystrokes = [];
   for (const [index, ks] of (timeline.overlays?.keystrokes ?? []).entries()) {
-    if (t < ks.t || t > ks.t + ks.duration) continue;
-    const progress = Math.min(1, Math.max(0, (t - ks.t) / ks.duration));
-    const opacity = envelopeOpacity(progress, 0.1, 0.22);
-    const liftPx = (1 - Math.min(1, progress / 0.12)) * 8 * outputScale;
+    const displayDuration = Math.max(ks.duration, MIN_HUD_DURATION);
+    if (t < ks.t || t > ks.t + displayDuration) continue;
+    const progress = Math.min(1, Math.max(0, (t - ks.t) / displayDuration));
+    const opacity = envelopeOpacity(progress, 0.08, 0.2);
+    const liftPx = (1 - Math.min(1, progress / 0.1)) * 6 * outputScale;
     keystrokes.push({
       key: `keystroke-${index}-${ks.t}`,
       label: ks.label,
