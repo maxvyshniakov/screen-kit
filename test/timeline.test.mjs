@@ -722,3 +722,130 @@ test('compileTimeline supports declarative camera target (pointer, window, [vx, 
     /Invalid camera keyframe target/,
   );
 });
+
+test('compileTimeline compiles per-step camera hints (wide, focus target/pointer/window/[vx,vy], lead, hold, clampToWindow) and preserves explicit keyframe precedence', () => {
+  const track = makeFixtureEventTrack({
+    viewport: { width: 1440, height: 810, deviceScaleFactor: 2 },
+    video: { file: 'take.mp4', width: 2880, height: 1620, fps: 60, duration: 4.5, frames: 270 },
+    events: [
+      { t: 0.0, type: 'pointermove', x: 720, y: 405 },
+      // Step 0 at t=0.8: target near top-left corner [30, 20], zoom 2.0 -> clamped flush to window top-left!
+      {
+        t: 0.8,
+        type: 'step',
+        index: 0,
+        label: 'Open Gallery',
+        target: [30, 20],
+        camera: { zoom: 2.0, focus: 'target', lead: 0.2, hold: 0.4, easing: 'ease-in-out' },
+      },
+      { t: 1.0, type: 'pointerdown', x: 30, y: 20, button: 'left' },
+      { t: 1.07, type: 'pointerup', x: 30, y: 20, button: 'left' },
+      // Step 1 at t=2.2: focus on pointer at bottom-right corner [1420, 795], zoom 1.75
+      { t: 2.2, type: 'pointermove', x: 1420, y: 795 },
+      {
+        t: 2.2,
+        type: 'step',
+        index: 1,
+        label: 'Filter Corner',
+        camera: { zoom: 1.75, focus: 'pointer', lead: 0.15, hold: 0.35 },
+      },
+      // Step 2 at t=2.45 (tight gap 0.25s < hold 0.35 + lead 0.15): explicit [vx, vy] focus
+      {
+        t: 2.45,
+        type: 'step',
+        index: 2,
+        label: 'Center Detail',
+        camera: { zoom: 1.5, focus: [720, 405], lead: 0.15, hold: 0.4 },
+      },
+      // Step 3 at t=3.6: reset wide
+      {
+        t: 3.6,
+        type: 'step',
+        index: 3,
+        label: 'Overview',
+        camera: 'wide',
+      },
+    ],
+  });
+
+  assert.deepEqual(validateEventTrack(track), { ok: true, errors: [] });
+
+  const timeline = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      presentation: {
+        stage: { width: 1920, height: 1080, padding: 135 },
+        window: { frame: 'macos', title: 'Gallery Demo', width: 1440, height: 810 },
+        camera: { outputWidth: 1680, outputHeight: 945 },
+      },
+    },
+  });
+
+  assert.deepEqual(validateTimeline(timeline), { ok: true, errors: [] });
+  assert.equal(timeline.window.frame, 'macos');
+  assert.equal(timeline.window.title, 'Gallery Demo');
+
+  // At t=0 and t=0.6 (0.8 - lead 0.2), camera holds wide (960, 540, zoom 1)
+  assert.deepEqual(sampleCamera(timeline.camera, 0), { x: 960, y: 540, zoom: 1 });
+  assert.deepEqual(sampleCamera(timeline.camera, 0.6), { x: 960, y: 540, zoom: 1 });
+
+  // At t=0.8 (Step 0) and through hold t=1.2, camera is at zoom 2.0 clamped flush to window top-left [240, 135]
+  const atStep0 = sampleCamera(timeline.camera, 0.8);
+  assert.equal(atStep0.zoom, 2);
+  const rect0 = cameraViewportRect(timeline.camera, atStep0);
+  assert.equal(rect0.left, timeline.window.x);
+  assert.equal(rect0.top, timeline.window.y);
+  assert.deepEqual(sampleCamera(timeline.camera, 1.2), atStep0);
+
+  // At t=2.2 (Step 1), camera is at zoom 1.75 clamped flush to window bottom-right [1680, 945]
+  const atStep1 = sampleCamera(timeline.camera, 2.2);
+  assert.equal(atStep1.zoom, 1.75);
+  const rect1 = cameraViewportRect(timeline.camera, atStep1);
+  assert.ok(Math.abs(rect1.right - (timeline.window.x + timeline.window.width)) < 1e-6);
+  assert.ok(Math.abs(rect1.bottom - (timeline.window.y + timeline.window.height)) < 1e-6);
+
+  // At t=2.45 (Step 2, tight interval), camera cleanly reaches zoom 1.5 centered at stage (960, 540)
+  assert.deepEqual(sampleCamera(timeline.camera, 2.45), { x: 960, y: 540, zoom: 1.5 });
+
+  // At t=3.6 (Step 3 'wide'), camera returns to zoom 1.0 centered on window
+  assert.deepEqual(sampleCamera(timeline.camera, 3.6), { x: 960, y: 540, zoom: 1 });
+
+  // Explicit recipe.camera.keyframes overrides step camera hints (100% backwards compatible)
+  const explicitOverride = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      stage: { width: 1920, height: 1080, padding: 135 },
+      camera: {
+        outputWidth: 1680,
+        outputHeight: 945,
+        keyframes: [
+          { t: 0, x: 960, y: 540, zoom: 1, easing: 'linear' },
+          { t: 2.0, x: 960, y: 540, zoom: 1.25, easing: 'ease-out' },
+        ],
+      },
+    },
+  });
+  assert.equal(explicitOverride.camera.keyframes.length, 2);
+  assert.ok(Math.abs(sampleCamera(explicitOverride.camera, 0.8).zoom - 1.196) < 1e-6);
+  assert.notEqual(sampleCamera(explicitOverride.camera, 0.8).zoom, 2);
+
+  // Opt-out via fromSteps: false keeps static wide camera
+  const disabledFromSteps = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      stage: { width: 1920, height: 1080, padding: 135 },
+      camera: { outputWidth: 1680, outputHeight: 945, fromSteps: false },
+    },
+  });
+  assert.equal(disabledFromSteps.camera.keyframes.length, 1);
+  assert.equal(disabledFromSteps.camera.keyframes[0].zoom, 1);
+
+  // Malformed step camera hint is rejected by validateEventTrack
+  const invalidTrack = makeFixtureEventTrack({
+    events: [{ t: 0.5, type: 'step', index: 0, label: 'bad', camera: { zoom: -1, focus: 'mars' } }],
+  });
+  const check = validateEventTrack(invalidTrack);
+  assert.equal(check.ok, false);
+  assert.ok(check.errors.some((e) => /\.zoom/.test(e)));
+  assert.ok(check.errors.some((e) => /\.focus/.test(e)));
+});

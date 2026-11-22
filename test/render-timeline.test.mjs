@@ -14,9 +14,12 @@ import {
   computeFrameScene,
   moveFileAtomic,
   renderTimeline,
+  renderTimelinePreview,
+  resolvePreviewTargets,
   resolveRenderTargets,
   screenToRender,
 } from '../src/render-timeline.mjs';
+import { runPipeline } from '../src/run.mjs';
 import { calculateTimelineMetadata } from '../src/remotion/Root.mjs';
 import { buildSquirclePath } from '../src/remotion/layout.mjs';
 import {
@@ -661,5 +664,273 @@ test('buildSquirclePath produces a strictly convex closed clockwise contour with
     const c = unique[(i + 2) % unique.length];
     const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
     assert.ok(cross >= -1e-6, `concave notch/cusp detected at (${b[0]}, ${b[1]}): cross=${cross}`);
+  }
+});
+
+test('renderTimelinePreview, screen-kit preview CLI, and unified screen-kit run (--preview-only & --reuse-take) work end-to-end', async () => {
+  assert.equal(rootApi.renderTimelinePreview, renderTimelinePreview);
+  assert.equal(rootApi.resolvePreviewTargets, resolvePreviewTargets);
+  assert.equal(rootApi.runPipeline, runPipeline);
+
+  // Verify resolvePreviewTargets caps >12 steps down to maxFrames=12 while keeping first & last
+  const manyStepsTimeline = compileTimeline({
+    eventTrack: makeSyntheticEventTrack({
+      video: { file: 'take.mp4', width: 320, height: 180, fps: 10, duration: 5, frames: 50 },
+      events: Array.from({ length: 20 }, (_, i) => ({
+        t: Number((i * 0.2).toFixed(2)),
+        type: 'step',
+        index: i,
+        label: `step-${i}`,
+      })),
+    }),
+  });
+  const capped = resolvePreviewTargets({ timeline: manyStepsTimeline, maxFrames: 12 });
+  assert.equal(capped.length, 12);
+  assert.equal(capped[0].index, 0);
+  assert.equal(capped.at(-1).index, 19);
+
+  const workDir = await mkdtemp(join(tmpdir(), 'screen-kit-preview-run-e2e-'));
+  const scratchDir = join(workDir, 'scratch');
+  try {
+    // Build a real 1.0s 320x180 @ 10fps video (left half emerald #10b981, right half blue #2563eb)
+    // with animated brightness shift across frames so FFmpeg freezedetect never flags a static freeze.
+    for (let i = 0; i < 10; i += 1) {
+      const leftHalf = await sharp({
+        create: { width: 160, height: 180, channels: 3, background: { r: 16, g: 170 + i * 2, b: 120 + i } },
+      })
+        .png()
+        .toBuffer();
+      await sharp({
+        create: { width: 320, height: 180, channels: 3, background: { r: 30 + i * 2, g: 95 + i, b: 230 } },
+      })
+        .composite([{ input: leftHalf, left: 0, top: 0 }])
+        .png()
+        .toFile(join(workDir, `anim-${i}.png`));
+    }
+
+    const baseTakeVideo = join(workDir, 'base-take.mp4');
+    await renderVideo({ input: join(workDir, 'anim-%d.png'), output: baseTakeVideo, fps: 10 });
+    const baseTakeBytes = await readFile(baseTakeVideo);
+
+    // 1. Test CLI `screen-kit preview --input timeline.json --out <dir> --columns 2`
+    const previewTrack = makeSyntheticEventTrack({
+      video: { file: 'base-take.mp4', width: 320, height: 180, fps: 10, duration: 1.0, frames: 10 },
+      events: [
+        { t: 0.0, type: 'pointermove', x: 160, y: 90 },
+        { t: 0.1, type: 'step', index: 0, label: 'Wide Intro', camera: 'wide' },
+        {
+          t: 0.5,
+          type: 'step',
+          index: 1,
+          label: 'Zoom Emerald',
+          target: [40, 90],
+          camera: { zoom: 2.0, focus: 'target', lead: 0.15, hold: 0.2 },
+        },
+        { t: 0.9, type: 'step', index: 2, label: 'Wide Outro', camera: 'wide' },
+      ],
+    });
+    const previewTimelinePath = join(workDir, 'preview-timeline.json');
+    const compiledForPreview = compileTimeline({
+      take: { video: 'base-take.mp4', eventTrack: 'event-track.json' },
+      eventTrack: previewTrack,
+      recipe: {
+        stage: { width: 480, height: 270, padding: 45, background: { type: 'solid', color: '#0f172a' } },
+        window: { frame: 'macos', title: 'Preview Window', width: 320, height: 180 },
+        camera: { outputWidth: 480, outputHeight: 270 },
+      },
+    });
+    await writeFile(previewTimelinePath, JSON.stringify(compiledForPreview, null, 2));
+
+    const cliPreviewDir = join(workDir, 'cli-preview');
+    const { stdout: prevStdout } = await execFile(
+      process.execPath,
+      [CLI_PATH, 'preview', '--input', previewTimelinePath, '--out', cliPreviewDir, '--columns', '2'],
+      { cwd: REPO_ROOT, timeout: 60000 }
+    );
+    const prevResult = JSON.parse(prevStdout);
+    assert.equal(prevResult.renderer, 'remotion-4');
+    assert.equal(prevResult.stills.length, 3);
+    assert.equal(prevResult.contactSheet.columns, 2);
+    assert.equal(prevResult.contactSheet.rows, 2);
+    assert.equal(prevResult.contactSheet.count, 3);
+    const sheetMeta = await sharp(prevResult.contactSheet.file).metadata();
+    assert.equal(sheetMeta.format, 'png');
+    assert.ok(sheetMeta.width > 900);
+
+    // Step 1 still (t=0.5, zoomed 2x onto emerald left half) places emerald green at center (240, 135)
+    const zoomedStillRaw = await sharp(prevResult.stills[1].file)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const centerIdx = (135 * zoomedStillRaw.info.width + 240) * 4;
+    assert.ok(
+      zoomedStillRaw.data[centerIdx + 1] > 140 && zoomedStillRaw.data[centerIdx] < 80,
+      `expected emerald green at center of zoomed preview still, got rgba(${zoomedStillRaw.data[centerIdx]},${zoomedStillRaw.data[centerIdx + 1]},${zoomedStillRaw.data[centerIdx + 2]})`
+    );
+
+    // Programmatic renderTimelinePreview cleans up scratchDir completely
+    const apiPreviewDir = join(workDir, 'api-preview');
+    await renderTimelinePreview({
+      timeline: compiledForPreview,
+      cwd: workDir,
+      outDir: apiPreviewDir,
+      width: 320,
+      columns: 3,
+      scratchDir,
+    });
+    assert.deepEqual(await readdir(scratchDir), []);
+
+    // 2. Test unified `runPipeline` (fresh capture -> CLI `--reuse-take --preview-only` -> CLI `--reuse-take --profiles web-loop`)
+    const dummyJpg = (
+      await sharp({ create: { width: 32, height: 24, channels: 3, background: '#10b981' } }).jpeg().toBuffer()
+    ).toString('base64');
+
+    const mockPw = {
+      chromium: {
+        async launch() {
+          return {
+            async newContext() {
+              return {
+                async newPage() {
+                  return {
+                    viewportSize: () => ({ width: 320, height: 180 }),
+                    async goto() {},
+                    async evaluate() { return true; },
+                    getByRole(role, opts) {
+                      if (role === 'button' && opts?.name === 'Gallery') {
+                        const loc = {
+                          async waitFor() {},
+                          async scrollIntoViewIfNeeded() {},
+                          async boundingBox() { return { x: 20, y: 60, width: 80, height: 40 }; },
+                        };
+                        return { first: () => loc, nth: () => loc };
+                      }
+                      throw Error('unexpected role');
+                    },
+                    mouse: { async move() {}, async down() {}, async up() {}, async wheel() {} },
+                    keyboard: { async press() {}, async down() {}, async up() {}, async type() {} },
+                  };
+                },
+                async newCDPSession() {
+                  let listener = null;
+                  return {
+                    on(ev, fn) { if (ev === 'Page.screencastFrame') listener = fn; },
+                    async send(method) {
+                      if (method === 'Page.captureScreenshot') return { data: dummyJpg };
+                      if (method === 'Page.startScreencast' && listener) {
+                        listener({ data: dummyJpg, metadata: { timestamp: 1.0 }, sessionId: 1 });
+                        listener({ data: dummyJpg, metadata: { timestamp: 1.05 }, sessionId: 2 });
+                      }
+                      return {};
+                    },
+                    async detach() {},
+                  };
+                },
+                async close() {},
+              };
+            },
+            async close() {},
+          };
+        },
+      },
+    };
+
+    const runOutDir = join(workDir, 'out-run');
+    const demoConfig = {
+      recipes: {
+        showcase: {
+          source: 'browser',
+          captureMode: 'headless',
+          url: 'https://example.test/showcase',
+          viewport: [320, 180],
+          fps: 10,
+          tail: 0.05,
+          steps: [
+            {
+              type: 'click',
+              target: { role: 'button', name: 'Gallery' },
+              moveDuration: 0.05,
+              hold: 0.02,
+              label: 'Focus Gallery',
+              camera: { zoom: 1.8, focus: 'target', lead: 0.1, hold: 0.2 },
+            },
+            {
+              type: 'key',
+              key: 'Escape',
+              label: 'Reset Wide',
+              camera: 'wide',
+            },
+          ],
+          presentation: {
+            stage: { width: 480, height: 270, padding: 45, background: { type: 'solid', color: '#0f172a' } },
+            window: { frame: 'macos', title: 'Unified Run', width: 320, height: 180 },
+            camera: { outputWidth: 480, outputHeight: 270 },
+            outputs: ['web-loop'],
+          },
+        },
+      },
+    };
+
+    // Step 2a: Run programmatic pipeline (fresh capture + previewOnly) to populate out-run/takes/showcase/
+    const freshPreviewRun = await runPipeline({
+      config: demoConfig,
+      cwd: workDir,
+      out: runOutDir,
+      previewOnly: true,
+      reuseTake: false,
+      captureOptions: {
+        playwright: mockPw,
+        encodeFrames: async ({ outputFile }) => {
+          await writeFile(outputFile, baseTakeBytes);
+          const info = await probeVideo(outputFile);
+          return { ...info, measuredFps: 10, capturedFrames: 10, truncated: false };
+        },
+      },
+      renderOptions: { scratchDir },
+    });
+
+    assert.equal(freshPreviewRun.ok, true);
+    assert.equal(freshPreviewRun.mode, 'preview');
+    assert.equal(freshPreviewRun.take.reused, false);
+    assert.ok(freshPreviewRun.timeline.cameraKeyframes >= 3);
+    assert.equal(freshPreviewRun.preview.stills.length, 2);
+
+    const savedTakeVideo = freshPreviewRun.take.video;
+    const savedTakeSha = sha256(await readFile(savedTakeVideo));
+    const savedTakeStat = await stat(savedTakeVideo);
+
+    // Step 2b: Write config file with tweaked presentation background & run CLI `screen-kit run --reuse-take --preview-only`
+    const configPath = join(workDir, 'demo.config.mjs');
+    const updatedConfig = structuredClone(demoConfig);
+    updatedConfig.recipes.showcase.presentation.stage.background = { type: 'solid', color: '#1e293b' };
+    await writeFile(configPath, `export default ${JSON.stringify(updatedConfig, null, 2)};\n`);
+
+    const { stdout: reusePreviewStdout } = await execFile(
+      process.execPath,
+      [CLI_PATH, 'run', '--config', configPath, '--out', runOutDir, '--only', 'showcase', '--reuse-take', '--preview-only'],
+      { cwd: REPO_ROOT, timeout: 60000 }
+    );
+    const reusePreviewResult = JSON.parse(reusePreviewStdout);
+    assert.equal(reusePreviewResult.ok, true);
+    assert.equal(reusePreviewResult.mode, 'preview');
+    assert.equal(reusePreviewResult.take.reused, true);
+    assert.equal(sha256(await readFile(savedTakeVideo)), savedTakeSha);
+    assert.equal((await stat(savedTakeVideo)).mtimeMs, savedTakeStat.mtimeMs);
+
+    // Step 2c: Run full CLI `screen-kit run --config demo.config.mjs --out <dir> --reuse-take --profiles web-loop`
+    const { stdout: fullRunStdout } = await execFile(
+      process.execPath,
+      [CLI_PATH, 'run', '--config', configPath, '--out', runOutDir, '--reuse-take', '--profiles', 'web-loop'],
+      { cwd: REPO_ROOT, timeout: 120000 }
+    );
+    const fullRunResult = JSON.parse(fullRunStdout);
+    assert.equal(fullRunResult.ok, true);
+    assert.equal(fullRunResult.mode, 'full');
+    assert.equal(fullRunResult.take.reused, true);
+    assert.equal(fullRunResult.render.outputs.length, 3);
+    assert.equal(fullRunResult.review.ok, true);
+    assert.ok((await stat(fullRunResult.review.contactSheet)).size > 0);
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
   }
 });

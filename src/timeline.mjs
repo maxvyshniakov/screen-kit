@@ -26,6 +26,9 @@ export const MOUSE_BUTTONS = ['left', 'right', 'middle'];
 export const GESTURE_KINDS = ['wheel', 'scroll', 'pinch', 'pan', 'swipe', 'drag', 'touch'];
 export const OUTPUT_FORMATS = ['mp4', 'webm', 'png', 'webp'];
 export const AUDIO_TRACK_KINDS = ['narration', 'sfx', 'music'];
+export const STEP_CAMERA_FOCUSES = ['target', 'pointer', 'window'];
+export const DEFAULT_STEP_CAMERA_LEAD = 0.15;
+export const DEFAULT_STEP_CAMERA_HOLD = 0.4;
 
 const EVENT_TYPES = new Set([
   'pointermove',
@@ -277,6 +280,55 @@ function checkCameraBounds(errors, label, camera, stage, sample) {
       `${label}: visible camera rect [${rect.left.toFixed(2)}..${rect.right.toFixed(2)}, ${rect.top.toFixed(2)}..${rect.bottom.toFixed(2)}] leaves stage [0..${stage.width}, 0..${stage.height}]`
     );
   }
+}
+
+function isValidCameraFocusSpec(focus) {
+  if (STEP_CAMERA_FOCUSES.includes(focus)) return true;
+  if (Array.isArray(focus) && focus.length === 2 && focus.every(isFiniteNumber)) return true;
+  if (isObject(focus) && isFiniteNumber(focus.x) && isFiniteNumber(focus.y)) return true;
+  return false;
+}
+
+/** Validate a per-step declarative `camera` hint (`'wide'` or `{ zoom, focus?, easing?, lead?, hold?, clampToWindow? }`). */
+export function validateStepCameraHint(camera, label = 'camera') {
+  const errors = [];
+  if (camera === 'wide') {
+    return { ok: true, errors };
+  }
+  if (!isObject(camera)) {
+    errors.push(`${label} must be "wide" or an object`);
+    return { ok: false, errors };
+  }
+  const focusVal = camera.focus ?? camera.target;
+  if (camera.zoom === undefined) {
+    if (focusVal !== 'window') {
+      errors.push(`${label}.zoom must be a positive finite number`);
+    }
+  } else if (!isPositiveNumber(camera.zoom)) {
+    errors.push(`${label}.zoom must be a positive finite number`);
+  }
+  if (camera.focus !== undefined && !isValidCameraFocusSpec(camera.focus)) {
+    errors.push(`${label}.focus must be "target", "pointer", "window", or [vx, vy]`);
+  }
+  if (camera.target !== undefined && !isValidCameraFocusSpec(camera.target)) {
+    errors.push(`${label}.target must be "target", "pointer", "window", or [vx, vy]`);
+  }
+  if (camera.easing !== undefined) {
+    const normalized = EASING_ALIASES[camera.easing] ?? camera.easing;
+    if (!CAMERA_EASINGS.includes(normalized)) {
+      errors.push(`${label}.easing must be one of ${CAMERA_EASINGS.join(', ')}`);
+    }
+  }
+  if (camera.lead !== undefined && !isNonNegativeNumber(camera.lead)) {
+    errors.push(`${label}.lead must be a non-negative finite number`);
+  }
+  if (camera.hold !== undefined && !isNonNegativeNumber(camera.hold)) {
+    errors.push(`${label}.hold must be a non-negative finite number`);
+  }
+  if (camera.clampToWindow !== undefined && typeof camera.clampToWindow !== 'boolean') {
+    errors.push(`${label}.clampToWindow must be a boolean`);
+  }
+  return { ok: errors.length === 0, errors };
 }
 
 /** Validate an Event Track v1 object and return `{ ok, errors }`. */
@@ -533,6 +585,19 @@ export function validateEventTrack(eventTrack) {
         }
         if (event.label !== undefined && typeof event.label !== 'string') {
           errors.push(`${prefix}.label must be a string when provided`);
+        }
+        if (event.target !== undefined) {
+          if (
+            !Array.isArray(event.target) ||
+            event.target.length !== 2 ||
+            !event.target.every(isFiniteNumber)
+          ) {
+            errors.push(`${prefix}.target must be a [vx, vy] pair of finite numbers`);
+          }
+        }
+        if (event.camera !== undefined) {
+          const camCheck = validateStepCameraHint(event.camera, `${prefix}.camera`);
+          for (const err of camCheck.errors) errors.push(err);
         }
         break;
     }
@@ -1427,6 +1492,295 @@ function compileOverlays(events, recipeOverlays, duration) {
   };
 }
 
+function clampCameraAxisToBox(center, halfSpan, minBound, maxBound) {
+  const low = minBound + halfSpan;
+  const high = maxBound - halfSpan;
+  if (low <= high) {
+    return Math.min(high, Math.max(low, center));
+  }
+  const coverLow = maxBound - halfSpan;
+  const coverHigh = minBound + halfSpan;
+  return Math.min(coverHigh, Math.max(coverLow, center));
+}
+
+function clampCameraAxisToStage(center, halfSpan, stageSpan) {
+  const low = halfSpan;
+  const high = stageSpan - halfSpan;
+  return low <= high ? Math.min(high, Math.max(low, center)) : stageSpan / 2;
+}
+
+function inferStepTargetViewportPoint(events, stepEventIndex, cursor, viewportWidth, viewportHeight) {
+  const stepEvent = events[stepEventIndex];
+  if (
+    Array.isArray(stepEvent?.target) &&
+    stepEvent.target.length === 2 &&
+    stepEvent.target.every(isFiniteNumber)
+  ) {
+    return [stepEvent.target[0], stepEvent.target[1]];
+  }
+  for (let j = stepEventIndex + 1; j < events.length; j += 1) {
+    const next = events[j];
+    if (!isObject(next)) continue;
+    if (next.type === 'step') break;
+    if (
+      (next.type === 'pointerdown' || next.type === 'wheel' || next.type === 'gesture') &&
+      isFiniteNumber(next.x) &&
+      isFiniteNumber(next.y)
+    ) {
+      return [next.x, next.y];
+    }
+    if (
+      next.type === 'drag' &&
+      Array.isArray(next.from) &&
+      next.from.length === 2 &&
+      Array.isArray(next.to) &&
+      next.to.length === 2
+    ) {
+      return [(next.from[0] + next.to[0]) / 2, (next.from[1] + next.to[1]) / 2];
+    }
+  }
+  if (isFiniteNumber(stepEvent?.t) && cursor?.samples?.length > 0) {
+    const sampled = sampleCursor(cursor, stepEvent.t);
+    if (sampled) return [sampled.x, sampled.y];
+  }
+  return [viewportWidth / 2, viewportHeight / 2];
+}
+
+/**
+ * Compile smooth, stage- and window-clamped camera keyframes locked to real captured `step`
+ * timestamps when `eventTrack.events` contains per-step `camera` hints.
+ */
+export function compileStepCameraKeyframes({
+  events,
+  viewportWidth,
+  viewportHeight,
+  stage,
+  window: win,
+  outputWidth,
+  outputHeight,
+  cursor,
+} = {}) {
+  if (!Array.isArray(events)) return null;
+  const stepHints = [];
+  events.forEach((event, eventIndex) => {
+    if (isObject(event) && event.type === 'step' && event.camera !== undefined && isFiniteNumber(event.t)) {
+      stepHints.push({ event, eventIndex });
+    }
+  });
+  if (stepHints.length === 0) return null;
+
+  const clampPose = (vx, vy, zoom, clampToWindowFlag) => {
+    let x = win.x + (vx / viewportWidth) * win.width;
+    let y = win.y + (vy / viewportHeight) * win.height;
+    const shouldClampToWindow = clampToWindowFlag ?? (isPositiveNumber(zoom) && zoom > 1);
+    if (
+      isFiniteNumber(x) &&
+      isFiniteNumber(y) &&
+      isPositiveNumber(zoom) &&
+      isPositiveNumber(outputWidth) &&
+      isPositiveNumber(outputHeight) &&
+      isPositiveNumber(stage.width) &&
+      isPositiveNumber(stage.height)
+    ) {
+      const halfW = outputWidth / (2 * zoom);
+      const halfH = outputHeight / (2 * zoom);
+      if (shouldClampToWindow && isPositiveNumber(win.width) && isPositiveNumber(win.height)) {
+        x = clampCameraAxisToBox(x, halfW, win.x, win.x + win.width);
+        y = clampCameraAxisToBox(y, halfH, win.y, win.y + win.height);
+      }
+      x = clampCameraAxisToStage(x, halfW, stage.width);
+      y = clampCameraAxisToStage(y, halfH, stage.height);
+    }
+    return {
+      x: normalizeZero(x),
+      y: normalizeZero(y),
+      zoom,
+    };
+  };
+
+  const resolvedSteps = stepHints.map(({ event, eventIndex }) => {
+    const check = validateStepCameraHint(event.camera, `eventTrack.events[${eventIndex}].camera`);
+    if (!check.ok) {
+      throw Error(`Invalid step camera hint:\n- ${check.errors.join('\n- ')}`);
+    }
+    if (event.camera === 'wide') {
+      const pose = clampPose(viewportWidth / 2, viewportHeight / 2, 1, false);
+      return {
+        t: roundTime(event.t),
+        ...pose,
+        easing: 'ease-in-out',
+        lead: DEFAULT_STEP_CAMERA_LEAD,
+        hold: DEFAULT_STEP_CAMERA_HOLD,
+      };
+    }
+
+    const hint = event.camera;
+    const zoom = hint.zoom ?? 1;
+    const focusSpec =
+      hint.focus ??
+      hint.target ??
+      (zoom <= 1
+        ? 'window'
+        : Array.isArray(event.target)
+          ? 'target'
+          : cursor?.samples?.length > 0
+            ? 'pointer'
+            : 'window');
+
+    let vx;
+    let vy;
+    if (focusSpec === 'window') {
+      [vx, vy] = [viewportWidth / 2, viewportHeight / 2];
+    } else if (focusSpec === 'target') {
+      [vx, vy] = inferStepTargetViewportPoint(events, eventIndex, cursor, viewportWidth, viewportHeight);
+    } else if (focusSpec === 'pointer') {
+      if (cursor?.samples?.length > 0) {
+        const sampled = sampleCursor(cursor, event.t);
+        [vx, vy] = sampled ? [sampled.x, sampled.y] : [viewportWidth / 2, viewportHeight / 2];
+      } else {
+        [vx, vy] = [viewportWidth / 2, viewportHeight / 2];
+      }
+    } else if (Array.isArray(focusSpec)) {
+      [vx, vy] = focusSpec;
+    } else {
+      [vx, vy] = [focusSpec.x, focusSpec.y];
+    }
+
+    const pose = clampPose(vx, vy, zoom, hint.clampToWindow);
+    return {
+      t: roundTime(event.t),
+      ...pose,
+      easing: normalizeEasing(hint.easing, 'ease-in-out'),
+      lead: hint.lead ?? DEFAULT_STEP_CAMERA_LEAD,
+      hold: hint.hold ?? DEFAULT_STEP_CAMERA_HOLD,
+    };
+  });
+
+  const samePose = (a, b) =>
+    Math.abs(a.x - b.x) < EPS && Math.abs(a.y - b.y) < EPS && Math.abs(a.zoom - b.zoom) < EPS;
+
+  const widePose = clampPose(viewportWidth / 2, viewportHeight / 2, 1, false);
+  const keyframes = [];
+  const first = resolvedSteps[0];
+
+  if (first.t <= EPS) {
+    keyframes.push({
+      t: 0,
+      x: first.x,
+      y: first.y,
+      zoom: first.zoom,
+      easing: 'linear',
+    });
+  } else {
+    keyframes.push({
+      t: 0,
+      x: widePose.x,
+      y: widePose.y,
+      zoom: widePose.zoom,
+      easing: 'linear',
+    });
+    if (!samePose(widePose, first)) {
+      const leadStart = roundTime(Math.max(0, first.t - first.lead));
+      if (leadStart > EPS) {
+        keyframes.push({
+          t: leadStart,
+          x: widePose.x,
+          y: widePose.y,
+          zoom: widePose.zoom,
+          easing: 'linear',
+        });
+      }
+      keyframes.push({
+        t: first.t,
+        x: first.x,
+        y: first.y,
+        zoom: first.zoom,
+        easing: first.easing,
+      });
+    }
+  }
+
+  for (let k = 1; k < resolvedSteps.length; k += 1) {
+    const prev = resolvedSteps[k - 1];
+    const curr = resolvedSteps[k];
+    const lastKf = keyframes[keyframes.length - 1];
+    if (samePose(lastKf, curr)) continue;
+
+    const anchorT = Math.max(lastKf.t, prev.t);
+    const currT = Math.max(anchorT, curr.t);
+    const gap = currT - anchorT;
+
+    if (gap <= EPS) {
+      if (curr.lead === 0) {
+        if (lastKf.t < currT) {
+          keyframes.push({
+            t: currT,
+            x: lastKf.x,
+            y: lastKf.y,
+            zoom: lastKf.zoom,
+            easing: 'linear',
+          });
+        }
+        keyframes.push({
+          t: currT,
+          x: curr.x,
+          y: curr.y,
+          zoom: curr.zoom,
+          easing: curr.easing,
+        });
+      } else {
+        keyframes[keyframes.length - 1] = {
+          t: currT,
+          x: curr.x,
+          y: curr.y,
+          zoom: curr.zoom,
+          easing: keyframes.length === 1 ? 'linear' : curr.easing,
+        };
+      }
+      continue;
+    }
+
+    const requestedSpan = prev.hold + curr.lead;
+    let departT;
+    if (requestedSpan <= 0) {
+      departT = currT;
+    } else if (gap >= requestedSpan) {
+      departT = roundTime(currT - curr.lead);
+    } else {
+      departT = roundTime(anchorT + prev.hold * (gap / requestedSpan));
+    }
+    departT = Math.min(currT, Math.max(anchorT, departT));
+
+    if (departT > lastKf.t + EPS) {
+      keyframes.push({
+        t: departT,
+        x: lastKf.x,
+        y: lastKf.y,
+        zoom: lastKf.zoom,
+        easing: 'linear',
+      });
+    } else if (curr.lead === 0 && departT === currT && lastKf.t < currT) {
+      keyframes.push({
+        t: currT,
+        x: lastKf.x,
+        y: lastKf.y,
+        zoom: lastKf.zoom,
+        easing: 'linear',
+      });
+    }
+
+    keyframes.push({
+      t: currT,
+      x: curr.x,
+      y: curr.y,
+      zoom: curr.zoom,
+      easing: curr.easing,
+    });
+  }
+
+  return keyframes;
+}
+
 /**
  * Compile a take reference, Event Track v1 payload, and recipe presentation options into a
  * deterministic, schema-validated `timeline.json` v1 object.
@@ -1439,6 +1793,9 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
   if (!isObject(recipe)) {
     throw Error('recipe must be an object');
   }
+  const effectiveRecipe = isObject(recipe.presentation)
+    ? { ...recipe, ...recipe.presentation }
+    : recipe;
 
   const resolvedTake = {
     video: take?.video ?? eventTrack.video?.file,
@@ -1462,9 +1819,12 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     throw Error('take/eventTrack must specify positive viewport width and height');
   }
 
-  const recipeStage = recipe.stage ?? {};
-  const recipeWindow = recipe.window ?? {};
-  const recipeCamera = recipe.camera ?? {};
+  const recipeStage = effectiveRecipe.stage ?? {};
+  const recipeWindow = effectiveRecipe.window ?? {};
+  const recipeCamera = effectiveRecipe.camera ?? {};
+  if (recipeCamera.fromSteps !== undefined && typeof recipeCamera.fromSteps !== 'boolean') {
+    throw Error('recipe.camera.fromSteps must be a boolean');
+  }
 
   const padding = recipeStage.padding ?? 120;
   const frame = recipeWindow.frame ?? 'none';
@@ -1496,28 +1856,11 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     shadow: recipeWindow.shadow ?? frame !== 'none',
   };
 
-  const { overlays, steps } = compileOverlays(eventTrack.events, recipe.overlays, resolvedTake.duration ?? 0);
+  const { overlays, steps } = compileOverlays(eventTrack.events, effectiveRecipe.overlays, resolvedTake.duration ?? 0);
   const cursorTrackForCamera = {
     enabled: true,
     style: 'macos',
     samples: overlays.cursor.samples,
-  };
-
-  const clampCameraAxisToBox = (center, halfSpan, minBound, maxBound) => {
-    const low = minBound + halfSpan;
-    const high = maxBound - halfSpan;
-    if (low <= high) {
-      return Math.min(high, Math.max(low, center));
-    }
-    const coverLow = maxBound - halfSpan;
-    const coverHigh = minBound + halfSpan;
-    return Math.min(coverHigh, Math.max(coverLow, center));
-  };
-
-  const clampCameraAxisToStage = (center, halfSpan, stageSpan) => {
-    const low = halfSpan;
-    const high = stageSpan - halfSpan;
-    return low <= high ? Math.min(high, Math.max(low, center)) : stageSpan / 2;
   };
 
   const resolveTargetViewportPoint = (target, kfTime, index) => {
@@ -1543,71 +1886,88 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
   };
 
   const rawKeyframes = recipeCamera.keyframes;
-  const keyframes =
-    Array.isArray(rawKeyframes) && rawKeyframes.length > 0
-      ? rawKeyframes.map((kf, index) => {
-          if (!isObject(kf)) return kf;
-          if (kf.clampToWindow !== undefined && typeof kf.clampToWindow !== 'boolean') {
-            throw Error(`timeline.camera.keyframes[${index}].clampToWindow must be a boolean`);
-          }
-          const zoom = kf.zoom ?? 1;
-          const hasDeclarativeTarget = kf.target !== undefined;
-          const usesViewportTarget = kf.viewportX !== undefined || kf.viewportY !== undefined;
+  let keyframes = null;
 
-          let targetX;
-          let targetY;
-          if (hasDeclarativeTarget) {
-            const [vx, vy] = resolveTargetViewportPoint(kf.target, kf.t, index);
-            targetX = win.x + (vx / viewportWidth) * win.width;
-            targetY = win.y + (vy / viewportHeight) * win.height;
-          } else if (usesViewportTarget) {
-            targetX = win.x + ((kf.viewportX ?? viewportWidth / 2) / viewportWidth) * win.width;
-            targetY = win.y + ((kf.viewportY ?? viewportHeight / 2) / viewportHeight) * win.height;
-          } else {
-            targetX = kf.x ?? stage.width / 2;
-            targetY = kf.y ?? stage.height / 2;
-          }
+  if (Array.isArray(rawKeyframes) && rawKeyframes.length > 0) {
+    keyframes = rawKeyframes.map((kf, index) => {
+      if (!isObject(kf)) return kf;
+      if (kf.clampToWindow !== undefined && typeof kf.clampToWindow !== 'boolean') {
+        throw Error(`timeline.camera.keyframes[${index}].clampToWindow must be a boolean`);
+      }
+      const zoom = kf.zoom ?? 1;
+      const rawTarget = kf.target ?? kf.focus;
+      const hasDeclarativeTarget = rawTarget !== undefined;
+      const usesViewportTarget = kf.viewportX !== undefined || kf.viewportY !== undefined;
 
-          const shouldClampToWindow = kf.clampToWindow ?? (hasDeclarativeTarget && isPositiveNumber(zoom) && zoom > 1);
-          const shouldClampToStage = shouldClampToWindow || hasDeclarativeTarget;
+      let targetX;
+      let targetY;
+      if (hasDeclarativeTarget) {
+        const [vx, vy] = resolveTargetViewportPoint(rawTarget, kf.t, index);
+        targetX = win.x + (vx / viewportWidth) * win.width;
+        targetY = win.y + (vy / viewportHeight) * win.height;
+      } else if (usesViewportTarget) {
+        targetX = win.x + ((kf.viewportX ?? viewportWidth / 2) / viewportWidth) * win.width;
+        targetY = win.y + ((kf.viewportY ?? viewportHeight / 2) / viewportHeight) * win.height;
+      } else {
+        targetX = kf.x ?? stage.width / 2;
+        targetY = kf.y ?? stage.height / 2;
+      }
 
-          if (
-            (shouldClampToWindow || shouldClampToStage) &&
-            isFiniteNumber(targetX) &&
-            isFiniteNumber(targetY) &&
-            isPositiveNumber(zoom) &&
-            isPositiveNumber(outputWidth) &&
-            isPositiveNumber(outputHeight) &&
-            isPositiveNumber(stage.width) &&
-            isPositiveNumber(stage.height)
-          ) {
-            const halfW = outputWidth / (2 * zoom);
-            const halfH = outputHeight / (2 * zoom);
-            if (shouldClampToWindow && isPositiveNumber(win.width) && isPositiveNumber(win.height)) {
-              targetX = clampCameraAxisToBox(targetX, halfW, win.x, win.x + win.width);
-              targetY = clampCameraAxisToBox(targetY, halfH, win.y, win.y + win.height);
-            }
-            targetX = clampCameraAxisToStage(targetX, halfW, stage.width);
-            targetY = clampCameraAxisToStage(targetY, halfH, stage.height);
-          }
+      const shouldClampToWindow = kf.clampToWindow ?? (hasDeclarativeTarget && isPositiveNumber(zoom) && zoom > 1);
+      const shouldClampToStage = shouldClampToWindow || hasDeclarativeTarget;
 
-          return {
-            t: isFiniteNumber(kf.t) ? roundTime(kf.t) : kf.t,
-            x: isFiniteNumber(targetX) ? normalizeZero(targetX) : targetX,
-            y: isFiniteNumber(targetY) ? normalizeZero(targetY) : targetY,
-            zoom,
-            easing: normalizeEasing(kf.easing, index === 0 ? 'linear' : 'ease-in-out'),
-          };
-        })
-      : [
-          {
-            t: 0,
-            x: normalizeZero(stage.width / 2),
-            y: normalizeZero(stage.height / 2),
-            zoom: 1,
-            easing: 'linear',
-          },
-        ];
+      if (
+        (shouldClampToWindow || shouldClampToStage) &&
+        isFiniteNumber(targetX) &&
+        isFiniteNumber(targetY) &&
+        isPositiveNumber(zoom) &&
+        isPositiveNumber(outputWidth) &&
+        isPositiveNumber(outputHeight) &&
+        isPositiveNumber(stage.width) &&
+        isPositiveNumber(stage.height)
+      ) {
+        const halfW = outputWidth / (2 * zoom);
+        const halfH = outputHeight / (2 * zoom);
+        if (shouldClampToWindow && isPositiveNumber(win.width) && isPositiveNumber(win.height)) {
+          targetX = clampCameraAxisToBox(targetX, halfW, win.x, win.x + win.width);
+          targetY = clampCameraAxisToBox(targetY, halfH, win.y, win.y + win.height);
+        }
+        targetX = clampCameraAxisToStage(targetX, halfW, stage.width);
+        targetY = clampCameraAxisToStage(targetY, halfH, stage.height);
+      }
+
+      return {
+        t: isFiniteNumber(kf.t) ? roundTime(kf.t) : kf.t,
+        x: isFiniteNumber(targetX) ? normalizeZero(targetX) : targetX,
+        y: isFiniteNumber(targetY) ? normalizeZero(targetY) : targetY,
+        zoom,
+        easing: normalizeEasing(kf.easing, index === 0 ? 'linear' : 'ease-in-out'),
+      };
+    });
+  } else if (recipeCamera.fromSteps !== false) {
+    keyframes = compileStepCameraKeyframes({
+      events: eventTrack.events,
+      viewportWidth,
+      viewportHeight,
+      stage,
+      window: win,
+      outputWidth,
+      outputHeight,
+      cursor: cursorTrackForCamera,
+    });
+  }
+
+  if (!keyframes) {
+    keyframes = [
+      {
+        t: 0,
+        x: normalizeZero(stage.width / 2),
+        y: normalizeZero(stage.height / 2),
+        zoom: 1,
+        easing: 'linear',
+      },
+    ];
+  }
 
   const camera = {
     outputWidth: normalizeZero(outputWidth),
@@ -1616,9 +1976,9 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
   };
 
   const audio = {
-    tracks: Array.isArray(recipe.audio?.tracks) ? structuredClone(recipe.audio.tracks) : [],
+    tracks: Array.isArray(effectiveRecipe.audio?.tracks) ? structuredClone(effectiveRecipe.audio.tracks) : [],
   };
-  const outputs = buildOutputProfiles(recipe.outputs, camera, resolvedTake);
+  const outputs = buildOutputProfiles(effectiveRecipe.outputs, camera, resolvedTake);
 
   const timeline = {
     version: TIMELINE_VERSION,

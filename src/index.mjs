@@ -1,4 +1,4 @@
-export { captureRun, loadConfiguration, selectedRecipes, sourceRevision, statusRun, VERSION } from './run.mjs';
+export { captureRun, loadConfiguration, runPipeline, selectedRecipes, sourceRevision, statusRun, VERSION } from './run.mjs';
 export { reviewRun } from './review.mjs';
 export {
   DEFAULT_CURSOR_THRESHOLD_PX,
@@ -21,7 +21,9 @@ export { renderTerminalTake } from './terminal.mjs';
 export {
   RENDER_PROFILES,
   resolveRenderTargets,
+  resolvePreviewTargets,
   renderTimeline,
+  renderTimelinePreview,
   computeFrameScene,
   screenToRender,
   moveFileAtomic,
@@ -36,13 +38,18 @@ export {
   CURSOR_STYLES,
   GESTURE_KINDS,
   OUTPUT_FORMATS,
+  STEP_CAMERA_FOCUSES,
+  DEFAULT_STEP_CAMERA_LEAD,
+  DEFAULT_STEP_CAMERA_HOLD,
   applyEasing,
   sampleCamera,
   cameraViewportRect,
   sampleCursor,
   compileCursorSamples,
+  compileStepCameraKeyframes,
   projectViewportToStage,
   projectViewportToScreen,
+  validateStepCameraHint,
   validateEventTrack,
   validateTimeline,
   assertValidTimeline,
@@ -55,6 +62,7 @@ export {
   encodeScreencastFrames,
   minimumJerk,
   minimumJerkTrajectory,
+  resolveTargetPoint,
   serializeEventTrack,
   validateCaptureMode,
 } from './take-browser.mjs';

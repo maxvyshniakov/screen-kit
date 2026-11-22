@@ -11,6 +11,7 @@ import { hash } from './run.mjs';
 import {
   GESTURE_KINDS as TIMELINE_GESTURE_KINDS,
   validateEventTrack as checkEventTrackSchema,
+  validateStepCameraHint,
 } from './timeline.mjs';
 import { probeVideo } from './video.mjs';
 
@@ -389,26 +390,224 @@ async function waitForPageReady(page, recipe) {
   }, { sel: selector, limit: timeout, storyChildren: checkStoryChildren });
 }
 
-async function resolveTargetPoint(page, target, fallbackPoint) {
+function describeTarget(target) {
+  if (typeof target === 'string') return target;
+  try {
+    return JSON.stringify(target);
+  } catch {
+    return String(target);
+  }
+}
+
+function parseSemanticLocatorObject(target) {
+  const locatorKeys = ['selector', 'role', 'text', 'label'].filter((key) => target[key] !== undefined);
+  if (locatorKeys.length !== 1) return null;
+  const kind = locatorKeys[0];
+
+  if (kind === 'selector') {
+    if (typeof target.selector !== 'string' || !target.selector.trim()) {
+      throw Error(`Invalid target.selector: expected non-empty CSS selector string`);
+    }
+  } else if (kind === 'role') {
+    if (typeof target.role !== 'string' || !target.role.trim()) {
+      throw Error(`Invalid target.role: expected non-empty ARIA role string`);
+    }
+    if (target.name !== undefined && typeof target.name !== 'string' && !(target.name instanceof RegExp)) {
+      throw Error(`Invalid target.name: expected string or RegExp`);
+    }
+  } else if (kind === 'text') {
+    if ((typeof target.text !== 'string' || !target.text.length) && !(target.text instanceof RegExp)) {
+      throw Error(`Invalid target.text: expected non-empty string or RegExp`);
+    }
+  } else if (kind === 'label') {
+    if ((typeof target.label !== 'string' || !target.label.length) && !(target.label instanceof RegExp)) {
+      throw Error(`Invalid target.label: expected non-empty string or RegExp`);
+    }
+  }
+
+  if (target.exact !== undefined && typeof target.exact !== 'boolean') {
+    throw Error(`Invalid target.exact: expected boolean`);
+  }
+  const nth = target.nth ?? 0;
+  if (!Number.isInteger(nth) || nth < 0) {
+    throw Error(`Invalid target.nth: ${JSON.stringify(target.nth)}; expected non-negative integer`);
+  }
+  const offset = target.offset !== undefined ? toPointTuple(target.offset, 'target.offset') : [0, 0];
+  if (target.timeout !== undefined && (!Number.isFinite(target.timeout) || target.timeout <= 0)) {
+    throw Error(`Invalid target.timeout: ${target.timeout}; expected positive milliseconds`);
+  }
+
+  return { kind, nth, offset, timeout: target.timeout };
+}
+
+/**
+ * Resolve a target specification (`[x, y]`, `{ x, y }`, CSS string, or semantic DOM locator
+ * `{ selector | role | text | label, name?, exact?, offset?, nth?, timeout? }`) to live
+ * viewport CSS pixel coordinates `[vx, vy]`, waiting up to `timeout` and scrolling into view if off-screen.
+ */
+export async function resolveTargetPoint(page, target, fallbackPoint, options = {}) {
   if (target === undefined || target === null) {
-    if (fallbackPoint) return fallbackPoint;
-    throw Error('Step requires a target selector or coordinates');
+    if (fallbackPoint) {
+      const [fx, fy] = toPointTuple(fallbackPoint, 'fallbackPoint');
+      return [roundCoord(fx), roundCoord(fy)];
+    }
+    throw Error('Step requires a target selector, locator, or coordinates');
   }
-  if (Array.isArray(target) || (typeof target === 'object' && Number.isFinite(target.x) && Number.isFinite(target.y))) {
-    return toPointTuple(target, 'target');
+  if (Array.isArray(target)) {
+    const [px, py] = toPointTuple(target, 'target');
+    return [roundCoord(px), roundCoord(py)];
   }
-  if (typeof target === 'string') {
-    const point = await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return null;
-      const rect = el.getBoundingClientRect();
-      if (!rect.width && !rect.height) return null;
-      return [rect.left + rect.width / 2, rect.top + rect.height / 2];
-    }, target);
-    if (!point) throw Error(`Target selector matched no visible element: ${target}`);
-    return [roundCoord(point[0]), roundCoord(point[1])];
+  if (typeof target === 'object') {
+    const hasLocatorKey =
+      target.selector !== undefined ||
+      target.role !== undefined ||
+      target.text !== undefined ||
+      target.label !== undefined;
+    if (!hasLocatorKey && Number.isFinite(target.x) && Number.isFinite(target.y)) {
+      const [ox, oy] = target.offset !== undefined ? toPointTuple(target.offset, 'target.offset') : [0, 0];
+      return [roundCoord(target.x + ox), roundCoord(target.y + oy)];
+    }
   }
-  throw Error(`Unsupported target specification: ${JSON.stringify(target)}`);
+
+  const normalizedSpec = typeof target === 'string' ? { selector: target } : target;
+  if (!normalizedSpec || typeof normalizedSpec !== 'object') {
+    throw Error(`Unsupported target specification: ${describeTarget(target)}`);
+  }
+
+  const parsed = parseSemanticLocatorObject(normalizedSpec);
+  if (!parsed) {
+    throw Error(`Unsupported target specification: ${describeTarget(target)}`);
+  }
+
+  const timeout = parsed.timeout ?? options.timeout ?? 2500;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw Error(`Invalid target timeout: ${timeout}`);
+  }
+  const [dx, dy] = parsed.offset;
+  const pageViewport = options.viewport ?? (typeof page?.viewportSize === 'function' ? page.viewportSize() : null);
+
+  let baseLocator = null;
+  if (parsed.kind === 'selector' && typeof page?.locator === 'function') {
+    baseLocator = page.locator(normalizedSpec.selector);
+  } else if (parsed.kind === 'role') {
+    if (typeof page?.getByRole !== 'function') {
+      throw Error('Page driver does not support getByRole locators');
+    }
+    const roleOpts = {
+      ...(normalizedSpec.name !== undefined ? { name: normalizedSpec.name } : {}),
+      ...(normalizedSpec.exact !== undefined ? { exact: normalizedSpec.exact } : {}),
+    };
+    baseLocator = Object.keys(roleOpts).length > 0
+      ? page.getByRole(normalizedSpec.role, roleOpts)
+      : page.getByRole(normalizedSpec.role);
+  } else if (parsed.kind === 'text') {
+    if (typeof page?.getByText !== 'function') {
+      throw Error('Page driver does not support getByText locators');
+    }
+    baseLocator = normalizedSpec.exact !== undefined
+      ? page.getByText(normalizedSpec.text, { exact: normalizedSpec.exact })
+      : page.getByText(normalizedSpec.text);
+  } else if (parsed.kind === 'label') {
+    if (typeof page?.getByLabel !== 'function') {
+      throw Error('Page driver does not support getByLabel locators');
+    }
+    baseLocator = normalizedSpec.exact !== undefined
+      ? page.getByLabel(normalizedSpec.label, { exact: normalizedSpec.exact })
+      : page.getByLabel(normalizedSpec.label);
+  }
+
+  if (baseLocator) {
+    const locator = parsed.nth === 0
+      ? (typeof baseLocator.first === 'function'
+          ? baseLocator.first()
+          : typeof baseLocator.nth === 'function'
+            ? baseLocator.nth(0)
+            : baseLocator)
+      : (() => {
+          if (typeof baseLocator.nth !== 'function') {
+            throw Error(`Locator does not support nth(${parsed.nth})`);
+          }
+          return baseLocator.nth(parsed.nth);
+        })();
+
+    try {
+      if (typeof locator.waitFor === 'function') {
+        await locator.waitFor({ state: 'visible', timeout });
+      }
+    } catch (error) {
+      throw Error(`Target matched no visible element: ${describeTarget(target)} (${error.message})`);
+    }
+
+    let box = await locator.boundingBox({ timeout });
+    if (!box || (box.width <= 0 && box.height <= 0)) {
+      throw Error(`Target matched no visible element: ${describeTarget(target)}`);
+    }
+
+    const vpW = pageViewport?.width;
+    const vpH = pageViewport?.height;
+    const isOffScreen =
+      box.x < 0 ||
+      box.y < 0 ||
+      (Number.isFinite(vpW) && box.x + box.width > vpW) ||
+      (Number.isFinite(vpH) && box.y + box.height > vpH);
+
+    if (isOffScreen) {
+      if (typeof locator.scrollIntoViewIfNeeded === 'function') {
+        await locator.scrollIntoViewIfNeeded({ timeout });
+      } else if (typeof locator.evaluate === 'function') {
+        await locator.evaluate((el) => {
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        });
+      }
+      box = await locator.boundingBox({ timeout });
+      if (!box || (box.width <= 0 && box.height <= 0)) {
+        throw Error(`Target matched no visible element after scrolling into view: ${describeTarget(target)}`);
+      }
+    }
+
+    return [
+      roundCoord(box.x + box.width / 2 + dx),
+      roundCoord(box.y + box.height / 2 + dy),
+    ];
+  }
+
+  // Fallback for minimal mock pages that only implement page.evaluate(fn, arg)
+  if (parsed.kind === 'selector' && typeof page?.evaluate === 'function') {
+    const deadline = Date.now() + timeout;
+    let point = null;
+    while (Date.now() <= deadline) {
+      point = await page.evaluate(
+        (arg) => {
+          const sel = typeof arg === 'string' ? arg : arg.selector;
+          const nthIndex = typeof arg === 'object' && arg ? (arg.nth ?? 0) : 0;
+          const matches = document.querySelectorAll(sel);
+          const el = matches[nthIndex];
+          if (!el) return null;
+          let rect = el.getBoundingClientRect();
+          if (!rect.width && !rect.height) return null;
+          if (
+            rect.left < 0 ||
+            rect.top < 0 ||
+            rect.right > window.innerWidth ||
+            rect.bottom > window.innerHeight
+          ) {
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            rect = el.getBoundingClientRect();
+          }
+          return [rect.left + rect.width / 2, rect.top + rect.height / 2];
+        },
+        typeof target === 'string' && parsed.nth === 0 ? target : { selector: normalizedSpec.selector, nth: parsed.nth },
+      );
+      if (Array.isArray(point) && point.length === 2 && point.every(Number.isFinite)) break;
+      await sleep(50);
+    }
+    if (!Array.isArray(point) || point.length !== 2 || !point.every(Number.isFinite)) {
+      throw Error(`Target selector matched no visible element: ${describeTarget(target)}`);
+    }
+    return [roundCoord(point[0] + dx), roundCoord(point[1] + dy)];
+  }
+
+  throw Error(`Unsupported target specification: ${describeTarget(target)}`);
 }
 
 async function runPrepAction(page, action) {
@@ -1002,12 +1201,6 @@ export async function createBrowserTakeCapture({
           await sleep(rawStep.at * 1000 - (performance.now() - takeStartMs));
         }
 
-        const stepLabel = rawStep && typeof rawStep === 'object' && !Array.isArray(rawStep) ? rawStep.label : undefined;
-        if (stepLabel !== undefined) {
-          const normalizedLabel = String(stepLabel).trim() || `step-${stepIndex}`;
-          emit({ type: 'step', index: stepIndex, label: normalizedLabel });
-        }
-
         if (typeof rawStep === 'string') {
           await page.evaluate(`(async () => { ${helpers}\n${rawStep}\n })()`);
           continue;
@@ -1015,7 +1208,7 @@ export async function createBrowserTakeCapture({
         if (Array.isArray(rawStep)) {
           const [cmd, arg] = rawStep;
           if (cmd === 'click') {
-            const [tx, ty] = await resolveTargetPoint(page, arg);
+            const [tx, ty] = await resolveTargetPoint(page, arg, undefined, { viewport });
             await glideTo(tx, ty);
             await page.mouse.down({ button: 'left' });
             emit({ type: 'pointerdown', x: pointerX, y: pointerY, button: 'left' });
@@ -1050,10 +1243,17 @@ export async function createBrowserTakeCapture({
           throw Error(`Invalid browser take step at index ${stepIndex}`);
         }
 
+        if (rawStep.camera !== undefined) {
+          const camCheck = validateStepCameraHint(rawStep.camera, `steps[${stepIndex}].camera`);
+          if (!camCheck.ok) {
+            throw Error(`Invalid step camera hint: ${camCheck.errors.join('; ')}`);
+          }
+        }
+
         const kind = rawStep.type
           ?? (rawStep.click !== undefined ? 'click'
-            : rawStep.drag !== undefined ? 'drag'
-            : rawStep.hover !== undefined || rawStep.move !== undefined ? 'move'
+            : rawStep.drag !== undefined || (rawStep.from !== undefined && rawStep.to !== undefined) ? 'drag'
+            : rawStep.hover !== undefined || (rawStep.move !== undefined && typeof rawStep.move !== 'boolean') ? 'move'
             : rawStep.wheel !== undefined ? 'wheel'
             : rawStep.gesture !== undefined ? 'gesture'
             : rawStep.key !== undefined || rawStep.press !== undefined ? 'key'
@@ -1062,20 +1262,50 @@ export async function createBrowserTakeCapture({
             : rawStep.eval !== undefined ? 'eval'
             : null);
 
+        const locatorOpts = {
+          viewport,
+          ...(rawStep.timeout !== undefined
+            ? { timeout: rawStep.timeout }
+            : recipe.stepTimeout !== undefined
+              ? { timeout: recipe.stepTimeout }
+              : {}),
+        };
+
+        const stepLabel = rawStep.label;
+        const stepCamera = rawStep.camera;
+        const shouldEmitStep = stepLabel !== undefined || stepCamera !== undefined || kind === 'step';
+        let stepEmitted = false;
+        const emitStepMarker = (resolvedTarget = null) => {
+          if (stepEmitted || !shouldEmitStep) return;
+          stepEmitted = true;
+          const resolvedIndex = kind === 'step' ? (rawStep.index ?? stepIndex) : stepIndex;
+          const rawLabel = stepLabel !== undefined ? stepLabel : (kind === 'step' ? rawStep.name : undefined);
+          const normalizedLabel = rawLabel !== undefined
+            ? (String(rawLabel).trim() || `step-${resolvedIndex}`)
+            : `step-${resolvedIndex}`;
+          emit({
+            type: 'step',
+            index: resolvedIndex,
+            label: normalizedLabel,
+            ...(resolvedTarget ? { target: [roundCoord(resolvedTarget[0]), roundCoord(resolvedTarget[1])] } : {}),
+            ...(stepCamera !== undefined ? { camera: structuredClone(stepCamera) } : {}),
+          });
+        };
+
         switch (kind) {
           case 'step': {
-            if (stepLabel === undefined) {
-              const resolvedIndex = rawStep.index ?? stepIndex;
-              const normalizedLabel = String(rawStep.name ?? '').trim() || `step-${resolvedIndex}`;
-              emit({ type: 'step', index: resolvedIndex, label: normalizedLabel });
-            }
+            const explicitTarget = rawStep.target !== undefined
+              ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
+              : null;
+            emitStepMarker(explicitTarget);
             break;
           }
           case 'move':
           case 'hover': {
             const targetSpec = rawStep.to ?? rawStep.target ?? rawStep.hover ?? rawStep.move
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
-            const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+            const [tx, ty] = await resolveTargetPoint(page, targetSpec, undefined, locatorOpts);
+            emitStepMarker([tx, ty]);
             await glideTo(tx, ty, rawStep.duration, rawStep.arc ?? 0.08);
             break;
           }
@@ -1083,7 +1313,8 @@ export async function createBrowserTakeCapture({
           case 'dblclick': {
             const targetSpec = rawStep.target ?? rawStep.click
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
-            const [tx, ty] = await resolveTargetPoint(page, targetSpec, [pointerX, pointerY]);
+            const [tx, ty] = await resolveTargetPoint(page, targetSpec, [pointerX, pointerY], locatorOpts);
+            emitStepMarker([tx, ty]);
             const button = rawStep.button ?? 'left';
             if (!BUTTONS.has(button)) throw Error(`Invalid mouse button: ${button}`);
             const clickModifiers = [];
@@ -1128,8 +1359,11 @@ export async function createBrowserTakeCapture({
             const targetSpec = rawStep.target
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
             if (targetSpec) {
-              const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+              const [tx, ty] = await resolveTargetPoint(page, targetSpec, undefined, locatorOpts);
+              emitStepMarker([tx, ty]);
               await glideTo(tx, ty, rawStep.moveDuration);
+            } else {
+              emitStepMarker([pointerX, pointerY]);
             }
             const button = rawStep.button ?? 'left';
             if (!BUTTONS.has(button)) throw Error(`Invalid mouse button: ${button}`);
@@ -1157,8 +1391,12 @@ export async function createBrowserTakeCapture({
           }
           case 'drag': {
             const dragSpec = rawStep.drag && typeof rawStep.drag === 'object' ? rawStep.drag : rawStep;
-            const [fromX, fromY] = await resolveTargetPoint(page, dragSpec.from);
-            const [toX, toY] = await resolveTargetPoint(page, dragSpec.to);
+            const [fromX, fromY] = await resolveTargetPoint(page, dragSpec.from, undefined, locatorOpts);
+            const [toX, toY] = await resolveTargetPoint(page, dragSpec.to, undefined, locatorOpts);
+            const explicitDragTarget = rawStep.target !== undefined
+              ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
+              : [roundCoord((fromX + toX) / 2), roundCoord((fromY + toY) / 2)];
+            emitStepMarker(explicitDragTarget);
             const button = dragSpec.button ?? 'left';
             if (!BUTTONS.has(button)) throw Error(`Invalid drag button: ${button}`);
             const dragDuration = dragSpec.duration ?? 0.6;
@@ -1188,8 +1426,11 @@ export async function createBrowserTakeCapture({
             const targetSpec = rawStep.target
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
             if (targetSpec) {
-              const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+              const [tx, ty] = await resolveTargetPoint(page, targetSpec, undefined, locatorOpts);
+              emitStepMarker([tx, ty]);
               await glideTo(tx, ty, rawStep.moveDuration);
+            } else {
+              emitStepMarker(null);
             }
             const totalDx = rawStep.deltaX ?? 0;
             const totalDy = rawStep.deltaY ?? 0;
@@ -1217,7 +1458,8 @@ export async function createBrowserTakeCapture({
             const targetSpec = rawStep.target
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
             if (targetSpec) {
-              const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+              const [tx, ty] = await resolveTargetPoint(page, targetSpec, undefined, locatorOpts);
+              emitStepMarker([tx, ty]);
               if (rawStep.move === true) await glideTo(tx, ty, rawStep.moveDuration);
               else {
                 pointerX = roundCoord(tx);
@@ -1225,6 +1467,8 @@ export async function createBrowserTakeCapture({
                 await page.mouse.move(pointerX, pointerY);
                 emit({ type: 'pointermove', x: pointerX, y: pointerY });
               }
+            } else {
+              emitStepMarker(null);
             }
             const gestureStartT = nowT();
             const beforeGestureMs = performance.now();
@@ -1308,6 +1552,10 @@ export async function createBrowserTakeCapture({
             break;
           }
           case 'key': {
+            const explicitTarget = rawStep.target !== undefined
+              ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
+              : null;
+            emitStepMarker(explicitTarget);
             const action = rawStep.action ?? 'press';
             if (!KEY_ACTIONS.has(action)) throw Error(`Invalid key action: ${action}`);
             const { key, modifiers } = parseKeySpec(rawStep.key ?? rawStep.press, rawStep.modifiers);
@@ -1340,7 +1588,8 @@ export async function createBrowserTakeCapture({
             const targetSpec = rawStep.target
               ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
             if (targetSpec) {
-              const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+              const [tx, ty] = await resolveTargetPoint(page, targetSpec, undefined, locatorOpts);
+              emitStepMarker([tx, ty]);
               if (rawStep.move !== false) {
                 await glideTo(tx, ty, rawStep.moveDuration, rawStep.arc ?? 0.08);
               } else {
@@ -1354,6 +1603,8 @@ export async function createBrowserTakeCapture({
               await sleep((rawStep.hold ?? 0.05) * 1000);
               await page.mouse.up({ button: 'left' });
               emit({ type: 'pointerup', x: pointerX, y: pointerY, button: 'left' });
+            } else {
+              emitStepMarker(null);
             }
             const emitKeys = rawStep.emitKeys === true || rawStep.includeKeys === true;
             const chars = [...rawStep.text];
@@ -1380,12 +1631,20 @@ export async function createBrowserTakeCapture({
             break;
           }
           case 'pause': {
+            const explicitTarget = rawStep.target !== undefined
+              ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
+              : null;
+            emitStepMarker(explicitTarget);
             const seconds = rawStep.duration ?? rawStep.pause ?? ((rawStep.wait ?? 0) / 1000);
             if (!Number.isFinite(seconds) || seconds < 0) throw Error(`Invalid pause duration: ${seconds}`);
             await sleep(seconds * 1000);
             break;
           }
           case 'eval': {
+            const explicitTarget = rawStep.target !== undefined
+              ? await resolveTargetPoint(page, rawStep.target, undefined, locatorOpts)
+              : null;
+            emitStepMarker(explicitTarget);
             await page.evaluate(`(async () => { ${helpers}\n${rawStep.eval}\n })()`);
             break;
           }

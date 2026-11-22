@@ -13,6 +13,7 @@ import {
   selectComposition,
 } from '@remotion/renderer';
 import { assertValidTimeline } from './timeline.mjs';
+import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
 import { computeFrameScene, screenToRender } from './remotion/layout.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
@@ -649,6 +650,314 @@ export async function renderTimeline({
       mode: plan.mode,
       outDir: plan.outDir,
       outputs: renderedOutputs,
+    };
+  } finally {
+    if (browser) {
+      await browser.close({ silent: true }).catch(() => {});
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function slugifyPreviewLabel(label) {
+  return String(label ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
+/**
+ * Deterministically resolve key step preview timestamps and still filenames (capped at `maxFrames`).
+ */
+export function resolvePreviewTargets({
+  timeline,
+  eventTrack,
+  timestamps,
+  maxFrames = 12,
+} = {}) {
+  if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 120) {
+    throw Error('maxFrames must be an integer between 1 and 120');
+  }
+  const duration = timeline?.take?.duration ?? 0;
+  const fps = timeline?.take?.fps ?? 30;
+  const safeMaxTime = duration > 0 ? Math.max(0, duration - Math.min(0.04, 0.5 / Math.max(1, fps))) : 0;
+
+  let rawTargets = [];
+  if (Array.isArray(timestamps) && timestamps.length > 0) {
+    timestamps.forEach((entry, i) => {
+      if (typeof entry === 'number' && Number.isFinite(entry)) {
+        rawTargets.push({ index: i, t: entry, label: `frame-${i}` });
+      } else if (entry && typeof entry === 'object' && typeof entry.t === 'number' && Number.isFinite(entry.t)) {
+        rawTargets.push({
+          index: Number.isInteger(entry.index) ? entry.index : i,
+          t: entry.t,
+          label: entry.label ?? `step-${i}`,
+        });
+      } else {
+        throw Error(`Invalid preview timestamp at index ${i}`);
+      }
+    });
+  } else if (Array.isArray(timeline?.steps) && timeline.steps.length > 0) {
+    timeline.steps.forEach((step, i) => {
+      rawTargets.push({
+        index: Number.isInteger(step.index) ? step.index : i,
+        t: step.t,
+        label: step.label ?? `step-${i}`,
+      });
+    });
+  } else if (Array.isArray(eventTrack?.events)) {
+    const stepEvents = eventTrack.events.filter(
+      (e) => e && typeof e === 'object' && e.type === 'step' && typeof e.t === 'number' && Number.isFinite(e.t)
+    );
+    stepEvents.forEach((step, i) => {
+      rawTargets.push({
+        index: Number.isInteger(step.index) ? step.index : i,
+        t: step.t,
+        label: step.label ?? `step-${i}`,
+      });
+    });
+  }
+
+  if (rawTargets.length === 0) {
+    const singleFrame = (timeline?.take?.frames ?? 0) === 1 || safeMaxTime <= 0;
+    const count = singleFrame
+      ? 1
+      : Math.max(2, Math.min(maxFrames, Math.min(6, Math.ceil(duration * 3))));
+    for (let i = 0; i < count; i += 1) {
+      const t = count === 1 ? 0 : (safeMaxTime * i) / (count - 1);
+      rawTargets.push({ index: i, t, label: `sample-${i}` });
+    }
+  }
+
+  if (rawTargets.length > maxFrames) {
+    const pickedIndices = [];
+    for (let i = 0; i < maxFrames; i += 1) {
+      const idx = maxFrames === 1 ? 0 : Math.round((i * (rawTargets.length - 1)) / (maxFrames - 1));
+      if (!pickedIndices.includes(idx)) pickedIndices.push(idx);
+    }
+    rawTargets = pickedIndices.map((idx) => rawTargets[idx]);
+  }
+
+  const usedFilenames = new Set();
+  return rawTargets.map((target, i) => {
+    const clampedT = Math.round(Math.max(0, Math.min(target.t, safeMaxTime)) * 1e4) / 1e4;
+    const pad = String(i).padStart(3, '0');
+    const slug = slugifyPreviewLabel(target.label);
+    let filename = slug ? `step-${pad}-${slug}.png` : `step-${pad}.png`;
+    if (usedFilenames.has(filename)) filename = `step-${pad}.png`;
+    usedFilenames.add(filename);
+    return {
+      index: target.index,
+      t: clampedT,
+      requestedT: Math.round(target.t * 1e4) / 1e4,
+      label: String(target.label ?? `step-${i}`),
+      filename,
+    };
+  });
+}
+
+/**
+ * Fast Remotion still-based preview: renders only key step frames in ONE shared bundle/browser
+ * session and stitches them into `<outDir>/contact-sheet.png` + `<outDir>/stills/*.png`.
+ */
+export async function renderTimelinePreview({
+  timeline: timelineInput,
+  outDir,
+  out,
+  timestamps,
+  maxFrames = 12,
+  width,
+  columns = 3,
+  cwd,
+  browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE ?? null,
+  logLevel = 'error',
+  signal,
+  scratchDir,
+} = {}) {
+  const destArg = outDir ?? out;
+  if (!destArg) {
+    throw Error('renderTimelinePreview requires outDir or out');
+  }
+  if (!Number.isInteger(columns) || columns < 1 || columns > 12) {
+    throw Error('columns must be an integer between 1 and 12');
+  }
+  if (width !== undefined && (!(typeof width === 'number' && Number.isFinite(width)) || width < 2 || width > 7680)) {
+    throw Error('width must be a finite number between 2 and 7680');
+  }
+
+  const { timeline, timelineFile, baseDir } = await loadTimelineInput(timelineInput, cwd);
+  assertValidTimeline(timeline);
+
+  let eventTrack = null;
+  if (
+    (!Array.isArray(timeline.steps) || timeline.steps.length === 0) &&
+    !timestamps &&
+    typeof timeline.take?.eventTrack === 'string' &&
+    timeline.take.eventTrack.length > 0 &&
+    !EXTERNAL_URL_RE.test(timeline.take.eventTrack)
+  ) {
+    try {
+      const trackPath = resolveLocalPath(timeline.take.eventTrack, baseDir);
+      eventTrack = JSON.parse(await readFile(trackPath, 'utf8'));
+    } catch {
+      // Optional fallback when timeline.steps is empty.
+    }
+  }
+
+  const targets = resolvePreviewTargets({
+    timeline,
+    eventTrack,
+    timestamps,
+    maxFrames,
+  });
+
+  const aspect = timeline.camera.outputHeight / timeline.camera.outputWidth;
+  const previewWidth = evenDimension(width ?? Math.min(1280, timeline.camera.outputWidth));
+  const previewHeight = evenDimension(previewWidth * aspect);
+  const previewFps = timeline.take.fps;
+  const targetOutDir = resolve(cwd ?? process.cwd(), destArg);
+
+  const scratchBase = scratchDir ? resolve(scratchDir) : tmpdir();
+  await mkdir(scratchBase, { recursive: true });
+  const tempDir = await mkdtemp(join(scratchBase, 'screen-kit-preview-'));
+  const publicDir = join(tempDir, 'public');
+  const bundleOutDir = join(tempDir, 'bundle');
+  const tempOutputsDir = join(tempDir, 'outputs');
+
+  let browser = null;
+  try {
+    await mkdir(publicDir, { recursive: true });
+    await mkdir(tempOutputsDir, { recursive: true });
+
+    const stagedTimeline = await prepareStagedTimeline(timeline, baseDir, publicDir);
+
+    const serveUrl = await bundle({
+      entryPoint: REMOTION_ENTRY,
+      outDir: bundleOutDir,
+      publicDir,
+      symlinkPublicDir: true,
+      enableCaching: false,
+      rspack: true,
+    });
+
+    browser = await openBrowser('chrome', {
+      ...(browserExecutable ? { browserExecutable } : {}),
+      logLevel,
+    });
+
+    if (signal?.aborted) {
+      throw Error('Timeline preview aborted');
+    }
+    const remotionCancel = signal ? makeCancelSignal() : null;
+    if (signal && remotionCancel) {
+      signal.addEventListener('abort', () => remotionCancel.cancel(), { once: true });
+    }
+
+    const inputProps = {
+      timeline: stagedTimeline,
+      output: {
+        id: 'preview',
+        width: previewWidth,
+        height: previewHeight,
+        fps: previewFps,
+      },
+    };
+
+    const composition = await selectComposition({
+      serveUrl,
+      id: COMPOSITION_ID,
+      inputProps,
+      puppeteerInstance: browser,
+      logLevel,
+    });
+
+    const maxFrame = Math.max(0, composition.durationInFrames - 1);
+    const stagedStills = [];
+
+    for (const target of targets) {
+      if (signal?.aborted) {
+        throw Error('Timeline preview aborted');
+      }
+      const frame = Math.min(maxFrame, Math.max(0, Math.round(target.t * composition.fps)));
+      const tempStillFile = join(tempOutputsDir, target.filename);
+      await renderStill({
+        serveUrl,
+        composition,
+        inputProps,
+        frame,
+        imageFormat: 'png',
+        output: tempStillFile,
+        puppeteerInstance: browser,
+        ...(remotionCancel ? { cancelSignal: remotionCancel.cancelSignal } : {}),
+        overwrite: true,
+        logLevel,
+      });
+
+      const meta = await sharp(tempStillFile).metadata();
+      if (!meta.width || !meta.height) {
+        throw Error(`Preview render produced invalid image for ${target.filename}`);
+      }
+      const bytes = await readFile(tempStillFile);
+      const destination = join(targetOutDir, 'stills', target.filename);
+      stagedStills.push({
+        tempFile: tempStillFile,
+        destination,
+        record: {
+          index: target.index,
+          t: target.t,
+          requestedT: target.requestedT,
+          frame,
+          label: target.label,
+          filename: target.filename,
+          file: destination,
+          width: meta.width,
+          height: meta.height,
+          bytes: bytes.length,
+          sha256: sha256(bytes),
+        },
+      });
+    }
+
+    const tempContactSheet = join(tempOutputsDir, 'contact-sheet.png');
+    const rawSheet = await generateContactSheet({
+      stills: stagedStills.map((item) => ({
+        index: item.record.index,
+        t: item.record.t,
+        label: item.record.label,
+        file: item.tempFile,
+      })),
+      outputFile: tempContactSheet,
+      columns,
+    });
+    const sheetBytes = await readFile(tempContactSheet);
+    const finalSheetPath = join(targetOutDir, 'contact-sheet.png');
+
+    if (signal?.aborted) {
+      throw Error('Timeline preview aborted');
+    }
+
+    const stills = [];
+    for (const item of stagedStills) {
+      await moveFileAtomic(item.tempFile, item.destination);
+      stills.push(item.record);
+    }
+    await moveFileAtomic(tempContactSheet, finalSheetPath);
+
+    return {
+      renderer: 'remotion-4',
+      ...(timelineFile ? { timelineFile } : {}),
+      outDir: targetOutDir,
+      width: previewWidth,
+      height: previewHeight,
+      fps: previewFps,
+      contactSheet: {
+        ...rawSheet,
+        file: finalSheetPath,
+        bytes: sheetBytes.length,
+        sha256: sha256(sheetBytes),
+      },
+      stills,
     };
   } finally {
     if (browser) {

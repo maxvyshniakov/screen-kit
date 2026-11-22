@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, relative, dirname, basename, extname } from 'node:path';
-import { captureRun, loadConfiguration, selectedRecipes, statusRun, VERSION } from './run.mjs';
+import { captureRun, loadConfiguration, runPipeline, selectedRecipes, statusRun, VERSION } from './run.mjs';
 import { reviewRun, reviewVideo } from './review.mjs';
 import { compileTimeline } from './timeline.mjs';
 import { renderVideo } from './video.mjs';
@@ -11,6 +11,8 @@ const help = `screen-kit ${VERSION}
 screen-kit capture --config screen-kit.config.mjs [--only name,name] [--out dir]
 screen-kit status --config screen-kit.config.mjs [--manifest out/run.json]
 screen-kit timeline --input event-track.json --out timeline.json [--config screen-kit.config.mjs] [--recipe name] [--video take.mp4]
+screen-kit preview --input timeline.json --out out/preview [--columns 3] [--width 1280]
+screen-kit run --config demo.mjs --out out/demo [--only name] [--preview-only] [--reuse-take] [--profiles web-loop]
 screen-kit review --manifest out/run.json [--out-dir review-out] [--baseline stills-dir] [--out review.json]
 screen-kit review --video demo.mp4 [--timeline timeline.json] [--event-track event-track.json] [--baseline stills-dir] [--out-dir review-out] [--out review.json] [--cursor-threshold 2] [--cursor-detection #ff00ff|json] [--multimodal]
 screen-kit render --input take.cast --out demo.webp [--fps 1] [--at 3]
@@ -19,8 +21,10 @@ screen-kit render --input timeline.json --out out/demo [--profiles web-loop,yout
 
 Recipes live in the consumer repository. Browser and terminal capture use real input.
 Capture writes run.json, original takes and exported files; timeline compiles event-track.json into
-timeline.json; review verifies hashes, dimensions, frame counts, duration, capture checkpoints and
-rendered video quality; render exports silent MP4/WebM or renders timeline.json headlessly via Remotion 4.
+timeline.json; preview renders key step frames into a contact sheet; run executes the unified
+capture -> timeline -> preview/render -> review pipeline; review verifies hashes, dimensions, frame
+counts, duration, capture checkpoints and rendered video quality; render exports silent MP4/WebM or
+renders timeline.json headlessly via Remotion 4.
 `;
 
 function parseCursorDetectionFlag(rawDetection, rawColor) {
@@ -58,11 +62,12 @@ function parseCursorDetectionFlag(rawDetection, rawColor) {
 const [command = 'help', ...args] = process.argv.slice(2);
 const allowed = new Set([
   'config', 'cwd', 'only', 'recipe', 'out', 'manifest', 'input', 'take', 'fps', 'at',
-  'profile', 'profiles', 'poster-format',
+  'profile', 'profiles', 'poster-format', 'columns', 'width', 'preview-only', 'reuse-take',
   'video', 'timeline', 'event-track', 'baseline', 'out-dir',
   'cursor-threshold', 'cursor-detection', 'cursor-color', 'multimodal', 'provider',
 ]);
-const booleanFlags = new Set(['multimodal']);
+const booleanFlags = new Set(['multimodal', 'preview-only', 'reuse-take']);
+const toBoolFlag = (val) => val === true || val === 'true' || val === '1';
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
   else if (['--version', '-V'].includes(command)) console.log(VERSION);
@@ -104,7 +109,11 @@ try {
             throw Error('timeline --config has multiple recipes; pass --recipe <name>');
           }
           const rawRecipe = entries[0][1] ?? {};
-          timelineRecipe = rawRecipe.timeline && typeof rawRecipe.timeline === 'object' ? rawRecipe.timeline : rawRecipe;
+          timelineRecipe = rawRecipe.presentation && typeof rawRecipe.presentation === 'object'
+            ? rawRecipe.presentation
+            : rawRecipe.timeline && typeof rawRecipe.timeline === 'object'
+              ? rawRecipe.timeline
+              : rawRecipe;
         } else {
           timelineRecipe = loaded.config;
         }
@@ -206,6 +215,34 @@ try {
       } else result=await renderVideo({ input: flags.input, output: flags.out,
         ...(flags.fps ? { fps: Number(flags.fps) } : {}) });
       console.log(JSON.stringify(result, null, 2));
+    } else if (command === 'preview') {
+      const timelineArg = flags.input ?? flags.timeline;
+      const outArg = flags.out ?? flags['out-dir'];
+      if (!timelineArg || !outArg) throw Error('preview requires --input (or --timeline) and --out');
+      const { renderTimelinePreview } = await import('./render-timeline.mjs');
+      const columns = flags.columns !== undefined ? Number(flags.columns) : undefined;
+      const width = flags.width !== undefined ? Number(flags.width) : undefined;
+      const result = await renderTimelinePreview({
+        timeline: resolve(timelineArg),
+        outDir: resolve(outArg),
+        ...(columns !== undefined ? { columns } : {}),
+        ...(width !== undefined ? { width } : {}),
+      });
+      console.log(JSON.stringify(result, null, 2));
+    } else if (command === 'run') {
+      const loaded = await loadConfiguration(flags.config ?? 'screen-kit.config.mjs');
+      const profileArg = flags.profiles ?? flags.profile;
+      const result = await runPipeline({
+        config: loaded.config,
+        cwd: flags.cwd ? resolve(flags.cwd) : loaded.cwd,
+        ...(flags.only ? { only: flags.only } : {}),
+        ...(flags.out ? { out: resolve(flags.out) } : {}),
+        previewOnly: toBoolFlag(flags['preview-only']),
+        reuseTake: toBoolFlag(flags['reuse-take']),
+        ...(profileArg ? { profiles: profileArg } : {}),
+      });
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 1;
     } else throw Error(`unknown command: ${command}`);
   }
 } catch (error) {

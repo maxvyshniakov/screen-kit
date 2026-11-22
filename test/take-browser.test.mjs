@@ -18,6 +18,7 @@ import {
   minimumJerk,
   minimumJerkTrajectory,
   resolveChromiumExecutable,
+  resolveTargetPoint,
   serializeEventTrack,
   validateCaptureMode,
   validateEventTrack,
@@ -683,6 +684,282 @@ test('typing step, modified-click pointerdown modifiers, and motion-window-aware
   assert.equal(stalledDuringMotion.activeMotionMaxGapMs, 180);
 });
 
+test('semantic DOM locators ({ selector, role, text, label, offset, nth }) scroll off-screen elements, drive minimum-jerk steps, and record resolved target + camera hints', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-semantic-locators-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const dummyFrame = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#0f172a' } }).png().toBuffer();
+  const base64Frame = dummyFrame.toString('base64');
+
+  let galleryScrolledIntoView = false;
+  const locatorTrace = [];
+  const mouseMoves = [];
+  const typedText = [];
+
+  const makeMockLocator = (id, getBox) => {
+    const createIndexed = (nthIndex) => ({
+      async waitFor({ state, timeout }) {
+        locatorTrace.push({ op: 'waitFor', id, nthIndex, state, timeout });
+      },
+      async scrollIntoViewIfNeeded() {
+        locatorTrace.push({ op: 'scrollIntoViewIfNeeded', id, nthIndex });
+        if (id === 'role:button:Gallery') galleryScrolledIntoView = true;
+      },
+      async boundingBox() {
+        return getBox(nthIndex);
+      },
+    });
+    return {
+      first: () => createIndexed(0),
+      nth: (n) => createIndexed(n),
+    };
+  };
+
+  const mockPage = {
+    viewportSize: () => ({ width: 640, height: 360 }),
+    async goto() {},
+    async evaluate() { return true; },
+    locator(selector) {
+      locatorTrace.push({ op: 'locator', selector });
+      if (selector === '.row-item') {
+        return makeMockLocator('selector:.row-item', (n) => ({
+          x: 200,
+          y: 40 + n * 30,
+          width: 100,
+          height: 24,
+        }));
+      }
+      if (selector === '#drop-slot') {
+        return makeMockLocator('selector:#drop-slot', () => ({ x: 420, y: 180, width: 120, height: 60 }));
+      }
+      return makeMockLocator(`selector:${selector}`, () => null);
+    },
+    getByRole(role, opts) {
+      locatorTrace.push({ op: 'getByRole', role, opts });
+      if (role === 'button' && opts?.name === 'Gallery' && opts?.exact === true) {
+        return makeMockLocator('role:button:Gallery', () =>
+          galleryScrolledIntoView
+            ? { x: 100, y: 140, width: 120, height: 40 } // scrolled into viewport -> center [160, 160]
+            : { x: 100, y: 980, width: 120, height: 40 }, // initially off-screen below 360px fold!
+        );
+      }
+      return makeMockLocator(`role:${role}`, () => null);
+    },
+    getByText(text, opts) {
+      locatorTrace.push({ op: 'getByText', text, opts });
+      if (text === 'Quick search') {
+        return makeMockLocator('text:Quick search', () => ({ x: 300, y: 30, width: 140, height: 32 }));
+      }
+      return makeMockLocator(`text:${text}`, () => null);
+    },
+    getByLabel(label, opts) {
+      locatorTrace.push({ op: 'getByLabel', label, opts });
+      if (label === 'Filter query') {
+        return makeMockLocator('label:Filter query', () => ({ x: 40, y: 36, width: 200, height: 36 }));
+      }
+      return makeMockLocator(`label:${label}`, () => null);
+    },
+    mouse: {
+      async move(x, y) { mouseMoves.push([x, y]); },
+      async down() {},
+      async up() {},
+      async wheel() {},
+    },
+    keyboard: {
+      async press() {},
+      async down() {},
+      async up() {},
+      async type(text) { typedText.push(text); },
+    },
+  };
+
+  // Direct unit checks on resolveTargetPoint error handling
+  await assert.rejects(
+    resolveTargetPoint(mockPage, { role: 'button', name: 'Missing', timeout: 50 }),
+    /matched no visible element/,
+  );
+  await assert.rejects(
+    resolveTargetPoint(mockPage, { selector: '.row-item', nth: -1 }),
+    /Invalid target\.nth/,
+  );
+  await assert.rejects(
+    resolveTargetPoint(mockPage, { selector: '#a', role: 'button' }),
+    /Unsupported target specification/,
+  );
+
+  const mockPw = {
+    chromium: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() { return mockPage; },
+              async newCDPSession() {
+                let listener = null;
+                return {
+                  on(ev, fn) { if (ev === 'Page.screencastFrame') listener = fn; },
+                  async send(method) {
+                    if (method === 'Page.captureScreenshot') return { data: base64Frame };
+                    if (method === 'Page.startScreencast' && listener) {
+                      listener({ data: base64Frame, metadata: { timestamp: 10.0 }, sessionId: 1 });
+                      listener({ data: base64Frame, metadata: { timestamp: 10.016 }, sessionId: 2 });
+                    }
+                    return {};
+                  },
+                  async detach() {},
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+  };
+
+  // Reject invalid per-step camera hint before running broken choreography
+  await assert.rejects(
+    captureBrowserTake({
+      out: join(dir, 'bad-cam'),
+      captureMode: 'headless',
+      playwright: mockPw,
+      encodeFrames: async () => ({ width: 640, height: 360, fps: 30, duration: 0.2, frames: 6, codec: 'h264', audio: false }),
+      recipe: {
+        url: 'https://example.test/app',
+        viewport: [640, 360],
+        steps: [{ type: 'click', target: { text: 'Quick search' }, camera: { zoom: 0, focus: 'invalid' } }],
+      },
+    }),
+    /Invalid step camera hint/,
+  );
+
+  const take = await captureBrowserTake({
+    out: join(dir, 'locator-take'),
+    captureMode: 'headless',
+    playwright: mockPw,
+    encodeFrames: async ({ outputFile, targetDuration, rawFrames }) => {
+      await writeFile(outputFile, Buffer.from('video'));
+      return {
+        width: 640,
+        height: 360,
+        fps: 60,
+        duration: targetDuration,
+        frames: Math.max(1, Math.round(targetDuration * 60)),
+        measuredFps: 60,
+        capturedFrames: rawFrames.length,
+        codec: 'h264',
+        audio: false,
+      };
+    },
+    recipe: {
+      url: 'https://example.test/app',
+      viewport: [640, 360],
+      fps: 60,
+      tail: 0.02,
+      steps: [
+        // 0: off-screen ARIA role locator -> scrolls into view -> [160, 160]
+        {
+          type: 'click',
+          target: { role: 'button', name: 'Gallery', exact: true },
+          moveDuration: 0.05,
+          hold: 0.01,
+          label: 'Open Gallery',
+          camera: { zoom: 1.75, focus: 'target', lead: 0.1, hold: 0.2 },
+        },
+        // 1: move to text locator with offset [10, -6] -> [370 + 10, 46 - 6] = [380, 40]
+        {
+          type: 'move',
+          target: { text: 'Quick search', exact: true, offset: [10, -6] },
+          duration: 0.04,
+          label: 'Hover Search',
+        },
+        // 2: dblclick CSS selector with nth: 2 -> y = 40 + 60 + 12 = 112, x = 250
+        {
+          type: 'dblclick',
+          target: { selector: '.row-item', nth: 2 },
+          moveDuration: 0.04,
+          hold: 0.01,
+          label: 'Inspect Row 2',
+        },
+        // 3: drag from nth: 1 ([250, 82]) to #drop-slot ([480, 210]) -> midpoint [365, 146]
+        {
+          type: 'drag',
+          from: { selector: '.row-item', nth: 1 },
+          to: { selector: '#drop-slot' },
+          moveDuration: 0.03,
+          duration: 0.05,
+          releaseHold: 0.01,
+          label: 'Drag Row',
+          camera: { zoom: 1.5, focus: 'target' },
+        },
+        // 4: wheel on #drop-slot
+        {
+          type: 'wheel',
+          target: { selector: '#drop-slot' },
+          moveDuration: 0.03,
+          deltaX: 0,
+          deltaY: 80,
+          label: 'Wheel Slot',
+        },
+        // 5: gesture on #drop-slot
+        {
+          type: 'gesture',
+          kind: 'pinch',
+          target: { selector: '#drop-slot' },
+          scaleFactor: 1.2,
+          steps: 2,
+          duration: 0.03,
+          label: 'Pinch Slot',
+        },
+        // 6: type into label locator -> [140, 54], reset camera wide
+        {
+          type: 'type',
+          target: { label: 'Filter query' },
+          moveDuration: 0.03,
+          hold: 0.01,
+          delayMs: 2,
+          text: 'hi',
+          label: 'Type Filter',
+          camera: 'wide',
+        },
+      ],
+    },
+  });
+
+  // Off-screen Gallery button triggered scrollIntoViewIfNeeded before pointer glide
+  assert.equal(galleryScrolledIntoView, true);
+  assert.ok(locatorTrace.some((t) => t.op === 'scrollIntoViewIfNeeded' && t.id === 'role:button:Gallery'));
+  assert.deepEqual(typedText, ['hi']);
+
+  // Verify step events preserved exact resolved target coordinates and camera hints
+  const stepEvents = take.eventTrackData.events.filter((e) => e.type === 'step');
+  assert.equal(stepEvents.length, 7);
+  assert.deepEqual(stepEvents[0].target, [160, 160]);
+  assert.deepEqual(stepEvents[0].camera, { zoom: 1.75, focus: 'target', lead: 0.1, hold: 0.2 });
+  assert.deepEqual(stepEvents[1].target, [380, 40]);
+  assert.deepEqual(stepEvents[2].target, [250, 112]);
+  assert.deepEqual(stepEvents[3].target, [365, 146]);
+  assert.deepEqual(stepEvents[3].camera, { zoom: 1.5, focus: 'target' });
+  assert.deepEqual(stepEvents[4].target, [480, 210]);
+  assert.deepEqual(stepEvents[5].target, [480, 210]);
+  assert.deepEqual(stepEvents[6].target, [140, 54]);
+  assert.equal(stepEvents[6].camera, 'wide');
+
+  // Verify real pointerdowns landed at exact resolved semantic locator coordinates
+  const pointerdowns = take.eventTrackData.events.filter((e) => e.type === 'pointerdown');
+  assert.deepEqual([pointerdowns[0].x, pointerdowns[0].y], [160, 160]); // Gallery click
+  assert.deepEqual([pointerdowns[1].x, pointerdowns[1].y], [250, 112]); // Row 2 dblclick #1
+  assert.deepEqual([pointerdowns[2].x, pointerdowns[2].y], [250, 112]); // Row 2 dblclick #2
+  assert.deepEqual([pointerdowns[3].x, pointerdowns[3].y], [250, 82]); // Drag start from Row 1
+  assert.deepEqual([pointerdowns[4].x, pointerdowns[4].y], [140, 54]); // Type input focus click
+
+  // Compiles cleanly into a validated timeline with automatic step camera keyframes
+  const compiled = compileTimeline({ eventTrack: take.eventTrackData });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+  assert.ok(compiled.camera.keyframes.length >= 4);
+});
+
 test('real headless browser captures clean video take, rich event-track.json, and verifiable run.json', {
   skip: !process.env.SCREEN_KIT_BROWSER_TESTS,
 }, async (t) => {
@@ -795,9 +1072,9 @@ test('real headless browser captures clean video take, rich event-track.json, an
         viewport: [640, 360],
         fps: 30,
         steps: [
-          { type: 'hover', target: '#action-btn', duration: 0.2, label: 'hover button' },
-          { type: 'click', target: '#action-btn', hold: 0.06, label: 'click button' },
-          { type: 'drag', from: '#card', to: [340, 155], duration: 0.25, label: 'drag card' },
+          { type: 'hover', target: { role: 'button', name: 'Activate', exact: true }, duration: 0.2, label: 'hover button' },
+          { type: 'click', target: { role: 'button', name: 'Activate', exact: true }, hold: 0.06, label: 'click button', camera: { zoom: 1.5, focus: 'target' } },
+          { type: 'drag', from: { text: 'Drag', exact: true }, to: [340, 155], duration: 0.25, label: 'drag card', camera: 'wide' },
           { type: 'wheel', target: '#scroller', deltaX: 160, deltaY: 0, phase: 'changed', label: 'wheel scroll' },
           { type: 'gesture', kind: 'scroll', target: '#scroller', deltaX: -240, deltaY: 0, duration: 0.25, settle: 0.15, label: 'trackpad scroll' },
           { type: 'key', key: 'k', modifiers: ['Meta'], action: 'press', label: 'command palette' },

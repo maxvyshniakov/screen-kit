@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, relative, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -24,7 +24,9 @@ export function selectedRecipes(config, only) {
     if (!Object.hasOwn(config.recipes, name)) throw Error(`unknown recipe: ${name}`);
     const recipe = { ...config.defaults, ...config.recipes[name] };
     if (!recipe.format && recipe.output?.format) recipe.format = recipe.output.format;
-    if (recipe.source === 'browser' && recipe.captureMode !== undefined && !recipe.format) recipe.format = 'mp4';
+    if (recipe.source === 'browser' && (recipe.captureMode !== undefined || recipe.presentation !== undefined) && !recipe.format) {
+      recipe.format = 'mp4';
+    }
     if (!['terminal', 'browser'].includes(recipe.source)) throw Error(`${name}: unsupported source ${recipe.source}`);
     return [name, recipe];
   });
@@ -139,4 +141,224 @@ export async function statusRun({ config, cwd = process.cwd(), manifest, only } 
       sourceDirty: source.dirty };
   }
   return { source, recipes };
+}
+
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Unified single-config pipeline: capture browser takes (or reuse existing valid takes when
+ * `reuseTake` is true) -> compile `timeline.json` (with `recipe.presentation` and per-step camera
+ * hints) -> run fast `renderTimelinePreview` (`previewOnly`) OR full `renderTimeline` + `reviewVideo`.
+ */
+export async function runPipeline({
+  config: configInput,
+  cwd: cwdInput = process.cwd(),
+  only,
+  out: outInput,
+  previewOnly = false,
+  reuseTake = false,
+  profiles,
+  captureOptions = {},
+  renderOptions = {},
+  reviewOptions = {},
+} = {}) {
+  let config = configInput;
+  let cwd = resolve(cwdInput);
+  if (typeof configInput === 'string') {
+    const loaded = await loadConfiguration(configInput, cwd);
+    config = loaded.config;
+    cwd = loaded.cwd;
+  }
+
+  const recipes = selectedRecipes(config, only);
+  for (const [name, recipe] of recipes) {
+    if (recipe.source !== 'browser') {
+      throw Error(`${name}: runPipeline requires source "browser" (received "${recipe.source}")`);
+    }
+  }
+
+  const out = resolve(cwd, outInput ?? join(cwd, 'out', 'screen-kit'));
+  await mkdir(out, { recursive: true });
+
+  const [{ captureBrowserTake, validateEventTrack }, { compileTimeline }, { renderTimeline, renderTimelinePreview }, { probeVideo }, { reviewVideo }] =
+    await Promise.all([
+      import('./take-browser.mjs'),
+      import('./timeline.mjs'),
+      import('./render-timeline.mjs'),
+      import('./video.mjs'),
+      import('./review-video.mjs'),
+    ]);
+
+  const recipeResults = {};
+  let allOk = true;
+
+  for (const [name, recipe] of recipes) {
+    const takeDir = join(out, 'takes', name);
+    const recipeDir = recipes.length === 1 ? out : join(out, name);
+    await mkdir(recipeDir, { recursive: true });
+
+    let eventTrack = null;
+    let eventTrackPath = join(takeDir, 'event-track.json');
+    let videoPath = null;
+    let reused = false;
+
+    if (reuseTake && (await fileExists(eventTrackPath))) {
+      const rawTrack = JSON.parse(await readFile(eventTrackPath, 'utf8'));
+      eventTrack = validateEventTrack(rawTrack);
+      videoPath = resolve(takeDir, eventTrack.video.file);
+      if (!(await fileExists(videoPath))) {
+        throw Error(`${name}: reusable take video missing at ${videoPath}`);
+      }
+      const probed = await probeVideo(videoPath);
+      if (!probed.frames || !(probed.duration > 0)) {
+        throw Error(`${name}: reusable take video is empty or invalid at ${videoPath}`);
+      }
+      reused = true;
+    } else {
+      const format = ['mp4', 'webm'].includes(recipe.format) ? recipe.format : 'mp4';
+      const artifact = await captureBrowserTake({
+        name,
+        recipe: { ...recipe, format },
+        cwd,
+        out: takeDir,
+        base: recipe.base,
+        ...(recipe.scale ? { scale: recipe.scale } : {}),
+        ...(recipe.captureMode !== undefined ? { captureMode: recipe.captureMode } : {}),
+        ...captureOptions,
+      });
+      eventTrack = artifact.eventTrackData;
+      eventTrackPath = artifact.eventTrack;
+      videoPath = artifact.file;
+    }
+
+    const presentation =
+      recipe.presentation && typeof recipe.presentation === 'object'
+        ? recipe.presentation
+        : recipe.timeline && typeof recipe.timeline === 'object'
+          ? recipe.timeline
+          : recipe;
+
+    const timelinePath = join(recipeDir, 'timeline.json');
+    const relVideo = relative(recipeDir, videoPath);
+    const relEventTrack = relative(recipeDir, eventTrackPath);
+
+    const compiledTimeline = compileTimeline({
+      take: {
+        video: relVideo,
+        eventTrack: relEventTrack,
+      },
+      eventTrack,
+      recipe: presentation,
+    });
+    await writeFile(timelinePath, JSON.stringify(compiledTimeline, null, 2) + '\n');
+
+    const takeSummary = {
+      reused,
+      video: videoPath,
+      eventTrack: eventTrackPath,
+      captureMode: eventTrack.captureMode,
+      width: eventTrack.video.width,
+      height: eventTrack.video.height,
+      fps: eventTrack.video.fps,
+      duration: eventTrack.video.duration,
+      frames: eventTrack.video.frames,
+    };
+
+    const timelineSummary = {
+      file: timelinePath,
+      steps: compiledTimeline.steps,
+      cameraKeyframes: compiledTimeline.camera.keyframes.length,
+      outputs: compiledTimeline.outputs,
+    };
+
+    if (previewOnly) {
+      const previewDir = join(recipeDir, 'preview');
+      const preview = await renderTimelinePreview({
+        timeline: timelinePath,
+        outDir: previewDir,
+        ...renderOptions,
+      });
+      recipeResults[name] = {
+        ok: true,
+        take: takeSummary,
+        timeline: timelineSummary,
+        preview,
+      };
+    } else {
+      const renderResult = await renderTimeline({
+        timeline: timelinePath,
+        outDir: recipeDir,
+        ...(profiles ? { profiles } : {}),
+        ...renderOptions,
+      });
+
+      const videoOutputs = renderResult.outputs.filter(
+        (item) => item.format === 'mp4' || item.format === 'webm'
+      );
+      const primaryVideo =
+        videoOutputs.find((item) => item.role === 'video' && item.format === 'mp4') ??
+        videoOutputs.find((item) => item.format === 'mp4') ??
+        videoOutputs[0] ??
+        null;
+
+      let reviewSummary = null;
+      let recipeOk = true;
+      if (primaryVideo) {
+        const reviewDir = join(recipeDir, 'review');
+        const fullReview = await reviewVideo({
+          video: primaryVideo.file,
+          timeline: timelinePath,
+          eventTrack: eventTrackPath,
+          outDir: reviewDir,
+          ...reviewOptions,
+        });
+        recipeOk = Boolean(fullReview.ok);
+        reviewSummary = {
+          ok: fullReview.ok,
+          video: fullReview.video,
+          report: fullReview.artifacts?.report ?? null,
+          contactSheet: fullReview.artifacts?.contactSheet?.file ?? null,
+          stills: (fullReview.artifacts?.stills ?? []).map((s) => s.file),
+          checks: fullReview.checks,
+          findings: fullReview.findings,
+        };
+      }
+
+      if (!recipeOk) allOk = false;
+      recipeResults[name] = {
+        ok: recipeOk,
+        take: takeSummary,
+        timeline: timelineSummary,
+        render: renderResult,
+        review: reviewSummary,
+      };
+    }
+  }
+
+  const singleName = recipes.length === 1 ? recipes[0][0] : null;
+  const singleResult = singleName ? recipeResults[singleName] : null;
+
+  return {
+    ok: allOk,
+    mode: previewOnly ? 'preview' : 'full',
+    outDir: out,
+    ...(singleResult
+      ? {
+          recipe: singleName,
+          take: singleResult.take,
+          timeline: singleResult.timeline,
+          ...(previewOnly
+            ? { preview: singleResult.preview }
+            : { render: singleResult.render, review: singleResult.review }),
+        }
+      : {}),
+    recipes: recipeResults,
+  };
 }
