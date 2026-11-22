@@ -49,10 +49,10 @@ test('checks screen assertions at their timestamp even when settle times reorder
  const app=application.replace("if key=='j':", "if key in ('j','k'):").replace("sys.stdout.write('\\x1b[Hselected: beta ')", "sys.stdout.write('\\x1b[Hselected: '+('beta ' if key=='j' else 'alpha'))");
  try {
   await assert.rejects(captureTerminalRecipe({name:'timeline',cwd,out:join(cwd,'out'),recipe:{
-   command:['python3','-c',app],columns:30,rows:6,duration:.9,format:'cast',steps:[
-    {at:.1,input:'j',expect:'selected: beta',settle:.5},
-    {at:.2,input:'k',expect:'selected: beta',settle:.1},
-    {at:.4,input:'j'},
+   command:['python3','-c',app],columns:30,rows:6,duration:1.3,format:'cast',steps:[
+    {at:.2,input:'j',expect:'selected: beta',settle:.95},
+    {at:.35,input:'k',expect:'selected: beta',settle:.4},
+    {at:.95,input:'j'},
    ],
   }}),/expectation.*selected: beta/i);
  } finally {await rm(cwd,{recursive:true,force:true})}

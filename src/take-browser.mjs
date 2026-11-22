@@ -468,6 +468,104 @@ function orderRawScreencastFrames(rawFrames = []) {
     .map((f) => ({ ...f, t: Math.max(0, f.elapsed) }));
 }
 
+function deriveActiveMotionWindows({ events, motionWindows, maxTime = Infinity } = {}) {
+  const raw = [];
+  const limit = Number.isFinite(maxTime) && maxTime > 0 ? maxTime : Infinity;
+  const addWindow = (start, end) => {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const s = Math.max(0, Math.min(start, limit));
+    const e = Math.max(s, Math.min(end, limit));
+    if (e - s > 1e-6) raw.push([s, e]);
+  };
+
+  if (Array.isArray(motionWindows)) {
+    for (const win of motionWindows) {
+      if (Array.isArray(win) && win.length >= 2) {
+        addWindow(win[0], win[1]);
+      } else if (win && typeof win === 'object') {
+        addWindow(win.start, win.end);
+      }
+    }
+  } else if (Array.isArray(events)) {
+    const hasExplicitInteractions = events.some(
+      (e) => e && typeof e === 'object' && (
+        e.type === 'pointerdown' || e.type === 'drag' || e.type === 'gesture' || e.type === 'wheel'
+      ),
+    );
+    let pointerDown = false;
+    let prevMove = null;
+    let prevWheel = null;
+
+    for (const event of events) {
+      if (!event || typeof event !== 'object' || !Number.isFinite(event.t)) continue;
+      if (event.type === 'step') continue;
+
+      if (event.type === 'pointerdown') {
+        pointerDown = true;
+        prevMove = Number.isFinite(event.x) && Number.isFinite(event.y) ? event : null;
+        prevWheel = null;
+        continue;
+      }
+
+      if (event.type === 'pointerup') {
+        pointerDown = false;
+        prevMove = null;
+        prevWheel = null;
+        continue;
+      }
+
+      if (event.type === 'pointermove') {
+        const trackMoveBurst = pointerDown || event.pressed === true || !hasExplicitInteractions;
+        if (
+          trackMoveBurst &&
+          prevMove &&
+          event.t >= prevMove.t &&
+          event.t - prevMove.t <= 0.12 &&
+          Number.isFinite(event.x) &&
+          Number.isFinite(event.y) &&
+          Math.hypot(event.x - prevMove.x, event.y - prevMove.y) > 0
+        ) {
+          addWindow(prevMove.t, event.t);
+        }
+        prevMove = trackMoveBurst && Number.isFinite(event.x) && Number.isFinite(event.y) ? event : null;
+        prevWheel = null;
+        continue;
+      }
+
+      prevMove = null;
+
+      if (event.type === 'gesture' || event.type === 'drag') {
+        const dur = Number.isFinite(event.duration) ? event.duration : 0.25;
+        if (dur > 0) addWindow(event.t, event.t + dur);
+        prevWheel = null;
+      } else if (event.type === 'wheel') {
+        if (Number.isFinite(event.duration) && event.duration > 0) {
+          addWindow(event.t, event.t + event.duration);
+        } else if (prevWheel && event.t >= prevWheel.t && event.t - prevWheel.t <= 0.15) {
+          addWindow(prevWheel.t, event.t);
+        }
+        prevWheel = event;
+      } else {
+        prevWheel = null;
+      }
+    }
+  }
+
+  if (raw.length === 0) return [];
+  raw.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [raw[0]];
+  for (let i = 1; i < raw.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = raw[i];
+    if (curr[0] <= prev[1] + 1e-6) {
+      prev[1] = Math.max(prev[1], curr[1]);
+    } else {
+      merged.push(curr);
+    }
+  }
+  return merged.map(([start, end]) => ({ start: roundTime(start), end: roundTime(end) }));
+}
+
 /**
  * Compute honest raw screencast frame timing and inter-frame gap statistics
  * before temporary frame files are deleted or resampled to CFR.
@@ -478,6 +576,8 @@ export function computeRawCaptureStats({
   requestedFps = 60,
   truncated = false,
   durationExceeded = false,
+  events,
+  motionWindows,
 } = {}) {
   const ordered = orderRawScreencastFrames(rawFrames);
   const safeElapsed = Math.max(0, Number.isFinite(elapsedDuration) ? elapsedDuration : 0);
@@ -498,6 +598,49 @@ export function computeRawCaptureStats({
     }
   }
 
+  const hasMotionSchedule = Array.isArray(events) || Array.isArray(motionWindows);
+  let activeMotionFields = {};
+  if (hasMotionSchedule) {
+    const activeMotionWindows = deriveActiveMotionWindows({
+      events,
+      motionWindows,
+      maxTime: safeElapsed > 0 ? safeElapsed : Infinity,
+    });
+    let activeMotionMaxGapSec = 0;
+    let activeMotionGapsOver2Frames = 0;
+
+    if (activeMotionWindows.length > 0) {
+      if (count === 0) {
+        for (const win of activeMotionWindows) {
+          const span = Math.max(0, win.end - win.start);
+          if (span > activeMotionMaxGapSec) activeMotionMaxGapSec = span;
+          if (span > twoFrameThresholdSec + 1e-6) activeMotionGapsOver2Frames += 1;
+        }
+      } else {
+        for (let i = 1; i < count; i++) {
+          const segStart = ordered[i - 1].t;
+          const segEnd = ordered[i].t;
+          if (segEnd <= segStart) continue;
+          for (const win of activeMotionWindows) {
+            if (win.end <= segStart) continue;
+            if (win.start >= segEnd) break;
+            const overlap = Math.min(segEnd, win.end) - Math.max(segStart, win.start);
+            if (overlap > activeMotionMaxGapSec) activeMotionMaxGapSec = overlap;
+            if (overlap > twoFrameThresholdSec + 1e-6) {
+              activeMotionGapsOver2Frames += 1;
+            }
+          }
+        }
+      }
+    }
+
+    activeMotionFields = {
+      activeMotionWindows,
+      activeMotionMaxGapMs: Number((activeMotionMaxGapSec * 1000).toFixed(3)),
+      activeMotionGapsOver2Frames,
+    };
+  }
+
   return {
     rawFrames: count,
     firstFrameAt,
@@ -506,6 +649,7 @@ export function computeRawCaptureStats({
     rawFps,
     maxGapMs: Number((maxGapSec * 1000).toFixed(3)),
     gapsOver2Frames,
+    ...activeMotionFields,
     truncated: Boolean(truncated),
     ...(durationExceeded ? { durationExceeded: true } : {}),
   };
@@ -886,6 +1030,20 @@ export async function createBrowserTakeCapture({
             emit({ type: 'key', key, modifiers, action: 'press' });
             continue;
           }
+          if (cmd === 'type') {
+            if (typeof arg !== 'string') throw Error('Type command requires a text string');
+            if (typeof page.keyboard.type === 'function') {
+              await page.keyboard.type(arg, { delay: 65 });
+            } else {
+              const chars = [...arg];
+              for (let c = 0; c < chars.length; c++) {
+                await page.keyboard.press(chars[c]);
+                if (c + 1 < chars.length) await sleep(65);
+              }
+            }
+            nowT();
+            continue;
+          }
           throw Error(`Unsupported browser take command array: ${JSON.stringify(rawStep)}`);
         }
         if (!rawStep || typeof rawStep !== 'object') {
@@ -899,6 +1057,7 @@ export async function createBrowserTakeCapture({
             : rawStep.wheel !== undefined ? 'wheel'
             : rawStep.gesture !== undefined ? 'gesture'
             : rawStep.key !== undefined || rawStep.press !== undefined ? 'key'
+            : rawStep.text !== undefined ? 'type'
             : rawStep.pause !== undefined || rawStep.wait !== undefined ? 'pause'
             : rawStep.eval !== undefined ? 'eval'
             : null);
@@ -946,7 +1105,13 @@ export async function createBrowserTakeCapture({
             try {
               for (let c = 1; c <= clickCount; c++) {
                 await page.mouse.down({ button, clickCount: c });
-                emit({ type: 'pointerdown', x: pointerX, y: pointerY, button });
+                emit({
+                  type: 'pointerdown',
+                  x: pointerX,
+                  y: pointerY,
+                  button,
+                  ...(clickModifiers.length > 0 ? { modifiers: [...clickModifiers] } : {}),
+                });
                 await sleep((rawStep.hold ?? 0.07) * 1000);
                 await page.mouse.up({ button, clickCount: c });
                 emit({ type: 'pointerup', x: pointerX, y: pointerY, button });
@@ -955,6 +1120,7 @@ export async function createBrowserTakeCapture({
             } finally {
               for (const mod of [...clickModifiers].reverse()) await page.keyboard.up(mod);
             }
+            if (rawStep.settle) await sleep(rawStep.settle * 1000);
             break;
           }
           case 'pointerdown':
@@ -967,9 +1133,26 @@ export async function createBrowserTakeCapture({
             }
             const button = rawStep.button ?? 'left';
             if (!BUTTONS.has(button)) throw Error(`Invalid mouse button: ${button}`);
-            if (kind === 'pointerdown') await page.mouse.down({ button });
-            else await page.mouse.up({ button });
-            emit({ type: kind, x: pointerX, y: pointerY, button });
+            const pointerModifiers = [];
+            for (const mod of rawStep.modifiers ?? []) {
+              const canonical = MODIFIER_MAP.get(String(mod).toLowerCase());
+              if (!canonical) throw Error(`Unsupported pointer modifier: ${mod}`);
+              if (!pointerModifiers.includes(canonical)) pointerModifiers.push(canonical);
+            }
+            if (kind === 'pointerdown') {
+              for (const mod of pointerModifiers) await page.keyboard.down(mod);
+              await page.mouse.down({ button });
+            } else {
+              await page.mouse.up({ button });
+              for (const mod of [...pointerModifiers].reverse()) await page.keyboard.up(mod);
+            }
+            emit({
+              type: kind,
+              x: pointerX,
+              y: pointerY,
+              button,
+              ...(pointerModifiers.length > 0 ? { modifiers: pointerModifiers } : {}),
+            });
             break;
           }
           case 'drag': {
@@ -1139,6 +1322,61 @@ export async function createBrowserTakeCapture({
               for (const mod of [...modifiers].reverse()) await page.keyboard.up(mod);
             }
             emit({ type: 'key', key, modifiers, action });
+            if (rawStep.settle) await sleep(rawStep.settle * 1000);
+            break;
+          }
+          case 'type': {
+            if (typeof rawStep.text !== 'string') {
+              throw Error('Type step requires a text string');
+            }
+            const delayMs = rawStep.delayMs ?? 65;
+            if (!Number.isFinite(delayMs) || delayMs < 0) {
+              throw Error(`Invalid type delayMs: ${delayMs}`);
+            }
+            const settle = rawStep.settle ?? 0;
+            if (!Number.isFinite(settle) || settle < 0) {
+              throw Error(`Invalid type settle: ${settle}`);
+            }
+            const targetSpec = rawStep.target
+              ?? (Number.isFinite(rawStep.x) && Number.isFinite(rawStep.y) ? [rawStep.x, rawStep.y] : null);
+            if (targetSpec) {
+              const [tx, ty] = await resolveTargetPoint(page, targetSpec);
+              if (rawStep.move !== false) {
+                await glideTo(tx, ty, rawStep.moveDuration, rawStep.arc ?? 0.08);
+              } else {
+                pointerX = roundCoord(tx);
+                pointerY = roundCoord(ty);
+                await page.mouse.move(pointerX, pointerY);
+                emit({ type: 'pointermove', x: pointerX, y: pointerY });
+              }
+              await page.mouse.down({ button: 'left' });
+              emit({ type: 'pointerdown', x: pointerX, y: pointerY, button: 'left' });
+              await sleep((rawStep.hold ?? 0.05) * 1000);
+              await page.mouse.up({ button: 'left' });
+              emit({ type: 'pointerup', x: pointerX, y: pointerY, button: 'left' });
+            }
+            const emitKeys = rawStep.emitKeys === true || rawStep.includeKeys === true;
+            const chars = [...rawStep.text];
+            if (!emitKeys && typeof page.keyboard.type === 'function') {
+              if (chars.length > 0) {
+                await page.keyboard.type(rawStep.text, { delay: delayMs });
+              }
+            } else {
+              for (let c = 0; c < chars.length; c++) {
+                const ch = chars[c];
+                if (typeof page.keyboard.type === 'function') {
+                  await page.keyboard.type(ch);
+                } else {
+                  await page.keyboard.press(ch);
+                }
+                if (emitKeys) {
+                  emit({ type: 'key', key: ch, modifiers: [], action: 'press', typing: true });
+                }
+                if (delayMs > 0 && c + 1 < chars.length) await sleep(delayMs);
+              }
+            }
+            nowT();
+            if (settle > 0) await sleep(settle * 1000);
             break;
           }
           case 'pause': {
@@ -1183,6 +1421,7 @@ export async function createBrowserTakeCapture({
         requestedFps,
         truncated: recipe.truncate === true && durationExceeded,
         durationExceeded,
+        events,
       });
 
       const videoFileName = `take.${format}`;

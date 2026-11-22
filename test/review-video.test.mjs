@@ -1032,6 +1032,53 @@ test('reviewVideo catches CFR-resampled raw capture gaps, excuses intentional qu
     assert.ok(manifestReview.videos?.rawTake);
     assert.equal(manifestReview.checks.find((c) => c.name === 'rawTake:video:ffprobe')?.ok, true);
     assert.equal(manifestReview.checks.find((c) => c.name === 'rawTake:video:capture-gaps')?.ok, false);
+
+    // 5. Motion-window-aware rawCapture: static pause gaps pass when activeMotionGapsOver2Frames === 0, while active-motion stalls fail
+    const staticPauseTrack = {
+      ...stalledEventTrack,
+      video: {
+        ...stalledEventTrack.video,
+        capture: {
+          rawFrames: 28,
+          firstFrameAt: 0,
+          lastFrameAt: 1.48,
+          elapsedDuration: 1.5,
+          rawFps: 18.67,
+          maxGapMs: 620,
+          gapsOver2Frames: 2,
+          activeMotionWindows: [{ start: 0.1, end: 0.45 }, { start: 1.1, end: 1.45 }],
+          activeMotionMaxGapMs: 18.4,
+          activeMotionGapsOver2Frames: 0,
+          truncated: false,
+        },
+      },
+    };
+    const pauseGapPass = await reviewVideo({ video: cfrVideo, eventTrack: staticPauseTrack });
+    assert.equal(pauseGapPass.ok, true, JSON.stringify(pauseGapPass.checks, null, 2));
+    assert.equal(pauseGapPass.checks.find((c) => c.name === 'capture-gaps')?.ok, true);
+    assert.equal(pauseGapPass.metrics.rawCapture.rawFps, 18.67);
+    assert.equal(pauseGapPass.metrics.rawCapture.maxGapMs, 620);
+    assert.equal(pauseGapPass.metrics.rawCapture.activeMotionGapsOver2Frames, 0);
+
+    const activeStallTrack = {
+      ...staticPauseTrack,
+      video: {
+        ...staticPauseTrack.video,
+        capture: {
+          ...staticPauseTrack.video.capture,
+          activeMotionMaxGapMs: 240,
+          activeMotionGapsOver2Frames: 1,
+        },
+      },
+    };
+    const activeStallFail = await reviewVideo({ video: cfrVideo, eventTrack: activeStallTrack });
+    assert.equal(activeStallFail.ok, false);
+    assert.equal(activeStallFail.checks.find((c) => c.name === 'capture-gaps')?.ok, false);
+    assert.ok(
+      activeStallFail.findings.some(
+        (f) => f.category === 'capture-gap' && /active-motion gap/i.test(f.message)
+      )
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

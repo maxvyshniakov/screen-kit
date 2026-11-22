@@ -1595,9 +1595,17 @@ export async function reviewVideo({
   if (gapsEnabled && rawCapture) {
     const rawZeroFrames = isFiniteNumber(rawCapture.rawFrames) && rawCapture.rawFrames <= 0;
     const rawTruncated = rawCapture.truncated === true;
+    const hasActiveMotionStats = isFiniteNumber(rawCapture.activeMotionGapsOver2Frames);
+    const effectiveGapCount = hasActiveMotionStats
+      ? rawCapture.activeMotionGapsOver2Frames
+      : rawCapture.gapsOver2Frames;
+    const effectiveMaxGapMs =
+      hasActiveMotionStats && isFiniteNumber(rawCapture.activeMotionMaxGapMs)
+        ? rawCapture.activeMotionMaxGapMs
+        : rawCapture.maxGapMs;
     const rawExceedsGapThreshold = isFiniteNumber(gapOptions.maxGapMs)
-      ? isFiniteNumber(rawCapture.maxGapMs) && rawCapture.maxGapMs > gapOptions.maxGapMs + EPS
-      : isFiniteNumber(rawCapture.gapsOver2Frames) && rawCapture.gapsOver2Frames > maxRawGaps;
+      ? isFiniteNumber(effectiveMaxGapMs) && effectiveMaxGapMs > gapOptions.maxGapMs + EPS
+      : isFiniteNumber(effectiveGapCount) && effectiveGapCount > maxRawGaps;
     rawGapsOk = !rawZeroFrames && !rawTruncated && !rawExceedsGapThreshold;
     if (!rawGapsOk) {
       const reasons = [];
@@ -1605,7 +1613,9 @@ export async function reviewVideo({
       if (rawTruncated) reasons.push('raw capture was truncated at requested duration');
       if (rawExceedsGapThreshold) {
         reasons.push(
-          `raw capture reported ${rawCapture.gapsOver2Frames ?? 1} gap(s) > 2 frames (max gap ${rawCapture.maxGapMs} ms, rawFps ${rawCapture.rawFps})`
+          hasActiveMotionStats
+            ? `raw capture reported ${effectiveGapCount} active-motion gap(s) > 2 frames (activeMaxGap ${effectiveMaxGapMs} ms, overall maxGap ${rawCapture.maxGapMs} ms, rawFps ${rawCapture.rawFps})`
+            : `raw capture reported ${rawCapture.gapsOver2Frames ?? 1} gap(s) > 2 frames (max gap ${rawCapture.maxGapMs} ms, rawFps ${rawCapture.rawFps})`
         );
       }
       rawGapReason = reasons.join('; ');

@@ -605,3 +605,120 @@ test('unified Event Track v1 schema supports stationary/mayBegin wheel phases, 0
     { t: 2.8, index: 1, label: 'step-1' },
   ]);
 });
+
+test('compileTimeline suppresses unmodified typing keys unless includeTyping is true, keeps shortcuts/special keys, and emits modified-click HUD pills', () => {
+  const track = makeFixtureEventTrack({
+    events: [
+      { t: 0.1, type: 'pointerdown', x: 300, y: 200, button: 'left' }, // plain click -> no pill
+      { t: 0.2, type: 'pointerup', x: 300, y: 200, button: 'left' },
+      { t: 0.4, type: 'pointerdown', x: 320, y: 240, button: 'left', modifiers: ['Shift'] },
+      { t: 0.5, type: 'pointerup', x: 320, y: 240, button: 'left' },
+      { t: 0.7, type: 'pointerdown', x: 320, y: 280, button: 'left', modifiers: ['Meta'] },
+      { t: 0.8, type: 'pointerup', x: 320, y: 280, button: 'left' },
+      { t: 1.0, type: 'key', key: 'f', modifiers: ['Meta'], action: 'press' },
+      { t: 1.2, type: 'key', key: 'o', modifiers: [], action: 'press' },
+      { t: 1.3, type: 'key', key: 'a', modifiers: [], action: 'press' },
+      { t: 1.4, type: 'key', key: 'k', modifiers: [], action: 'press' },
+      { t: 1.6, type: 'key', key: ' ', modifiers: [], action: 'press' },
+      { t: 1.8, type: 'key', key: 'ArrowDown', modifiers: [], action: 'press' },
+      { t: 2.0, type: 'key', key: 'Tab', modifiers: [], action: 'press' },
+      { t: 2.2, type: 'key', key: 'Backspace', modifiers: [], action: 'press' },
+      { t: 2.4, type: 'key', key: 'Enter', modifiers: [], action: 'press' },
+      { t: 2.6, type: 'key', key: 'Escape', modifiers: [], action: 'press' },
+      { t: 2.8, type: 'key', key: 'l', modifiers: ['Shift', 'Meta'], action: 'press' },
+    ],
+  });
+
+  const defaultTimeline = compileTimeline({ eventTrack: track });
+  assert.deepEqual(validateTimeline(defaultTimeline), { ok: true, errors: [] });
+  assert.deepEqual(
+    defaultTimeline.overlays.keystrokes.map((k) => k.label),
+    ['⇧ Click', '⌘ Click', '⌘F', 'Space', '↓', '⇥', '⌫', '↩', 'Esc', '⇧⌘L'],
+  );
+
+  const withTyping = compileTimeline({
+    eventTrack: track,
+    recipe: { overlays: { keystrokes: { enabled: true, includeTyping: true } } },
+  });
+  assert.deepEqual(validateTimeline(withTyping), { ok: true, errors: [] });
+  assert.deepEqual(
+    withTyping.overlays.keystrokes.map((k) => k.label),
+    ['⇧ Click', '⌘ Click', '⌘F', 'O', 'A', 'K', 'Space', '↓', '⇥', '⌫', '↩', 'Esc', '⇧⌘L'],
+  );
+});
+
+test('compileTimeline supports declarative camera target (pointer, window, [vx, vy]) and clampToWindow to prevent dark stage margins', () => {
+  const track = makeFixtureEventTrack({
+    viewport: { width: 1440, height: 810, deviceScaleFactor: 2 },
+    events: [
+      { t: 0.0, type: 'pointermove', x: 720, y: 405 },
+      { t: 1.0, type: 'pointermove', x: 40, y: 30 }, // near top-left corner of viewport!
+      { t: 2.0, type: 'pointermove', x: 1410, y: 790 }, // near bottom-right corner of viewport!
+    ],
+  });
+
+  // Stage 1920x1080, window 1440x810 at [240..1680, 135..945], camera output 1680x945
+  const timeline = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      stage: { width: 1920, height: 1080, padding: 135 },
+      window: { frame: 'browser', width: 1440, height: 810 },
+      camera: {
+        outputWidth: 1680,
+        outputHeight: 945,
+        keyframes: [
+          { t: 0, target: 'window', zoom: 1.0, easing: 'linear' },
+          // At zoom=2.0, visible rect is 840x472.5 (smaller than 1440x810 window); pointer at [40, 30] clamps flush to window top-left [240, 135]
+          { t: 1.0, target: 'pointer', zoom: 2.0, easing: 'ease-in-out' },
+          // Explicit viewport tuple near bottom-right corner clamps flush to window bottom-right [1680, 945]
+          { t: 2.0, target: [1420, 800], zoom: 2.0, easing: 'ease-in-out' },
+          // Opting out with clampToWindow: false allows revealing stage margin while still staying inside stage [0..1920, 0..1080]
+          { t: 3.0, target: [40, 30], zoom: 2.0, clampToWindow: false, easing: 'ease-out' },
+          { t: 4.0, target: 'window', zoom: 1.0, easing: 'ease-in-out' },
+        ],
+      },
+    },
+  });
+
+  assert.deepEqual(validateTimeline(timeline), { ok: true, errors: [] });
+
+  // t=0: centered on window (960, 540)
+  assert.deepEqual(sampleCamera(timeline.camera, 0), { x: 960, y: 540, zoom: 1 });
+
+  // t=1.0: clamped to window top-left [240..1080, 135..607.5] -> zero dark stage margin!
+  const rectAt1 = cameraViewportRect(timeline.camera, 1.0);
+  assert.equal(rectAt1.left, timeline.window.x);
+  assert.equal(rectAt1.top, timeline.window.y);
+  assert.ok(rectAt1.right <= timeline.window.x + timeline.window.width);
+  assert.ok(rectAt1.bottom <= timeline.window.y + timeline.window.height);
+
+  // t=2.0: clamped to window bottom-right [840..1680, 472.5..945] -> zero dark stage margin!
+  const rectAt2 = cameraViewportRect(timeline.camera, 2.0);
+  assert.equal(rectAt2.right, timeline.window.x + timeline.window.width);
+  assert.equal(rectAt2.bottom, timeline.window.y + timeline.window.height);
+  assert.ok(rectAt2.left >= timeline.window.x);
+  assert.ok(rectAt2.top >= timeline.window.y);
+
+  // Interpolated midpoint t=1.5 ALSO stays strictly inside window bounds!
+  const rectAt15 = cameraViewportRect(timeline.camera, 1.5);
+  assert.ok(rectAt15.left >= timeline.window.x - 1e-6);
+  assert.ok(rectAt15.top >= timeline.window.y - 1e-6);
+  assert.ok(rectAt15.right <= timeline.window.x + timeline.window.width + 1e-6);
+  assert.ok(rectAt15.bottom <= timeline.window.y + timeline.window.height + 1e-6);
+
+  // t=3.0 (clampToWindow: false): reveals left/top stage margin (< window.x/y) while staying >= 0 inside stage
+  const rectAt3 = cameraViewportRect(timeline.camera, 3.0);
+  assert.equal(rectAt3.left, 0);
+  assert.equal(rectAt3.top, 0);
+  assert.ok(rectAt3.left < timeline.window.x);
+
+  // Invalid target fails cleanly
+  assert.throws(
+    () =>
+      compileTimeline({
+        eventTrack: track,
+        recipe: { camera: { keyframes: [{ t: 0, target: 'mars', zoom: 1.5 }] } },
+      }),
+    /Invalid camera keyframe target/,
+  );
+});

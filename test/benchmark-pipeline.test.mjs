@@ -447,7 +447,7 @@ test('Benchmark 2 (Acceptance): Straylight scenario editor full flow on wallpape
   assert.ok(timeline.overlays.ripples.length >= 3, 'expected click & drag ripples');
   assert.deepEqual(
     timeline.overlays.keystrokes.map((k) => k.label),
-    ['⌘A', '⇧⌘L'],
+    ['⇧ Click', '⌘ Click', '⌘A', '⇧⌘L'],
   );
 
   const timelinePath = join(workDir, 'timeline.json');
@@ -502,7 +502,7 @@ test('Benchmark 2 (Acceptance): Straylight scenario editor full flow on wallpape
           assert.ok(payload.contactSheet?.endsWith('contact-sheet.png'));
           assert.ok(payload.stills.length >= 8);
           assert.equal(payload.timelineSummary.window.frame, 'macos');
-          assert.equal(payload.timelineSummary.overlays.keystrokes, 2);
+          assert.equal(payload.timelineSummary.overlays.keystrokes, 4);
           return {
             ok: true,
             summary: 'macOS traffic-light frame, wallpaper stage, cursor, ripples, gestures, and keystroke pills verified',

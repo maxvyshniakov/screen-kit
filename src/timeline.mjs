@@ -359,6 +359,41 @@ export function validateEventTrack(eventTrack) {
           if (cap.gapsOver2Frames !== undefined && !isNonNegativeInteger(cap.gapsOver2Frames)) {
             errors.push('eventTrack.video.capture.gapsOver2Frames must be a non-negative integer');
           }
+          if (
+            cap.activeMotionGapsOver2Frames !== undefined &&
+            !isNonNegativeInteger(cap.activeMotionGapsOver2Frames)
+          ) {
+            errors.push(
+              'eventTrack.video.capture.activeMotionGapsOver2Frames must be a non-negative integer'
+            );
+          }
+          if (cap.activeMotionMaxGapMs !== undefined && !isNonNegativeNumber(cap.activeMotionMaxGapMs)) {
+            errors.push('eventTrack.video.capture.activeMotionMaxGapMs must be a non-negative number');
+          }
+          if (cap.activeMotionWindows !== undefined) {
+            if (!Array.isArray(cap.activeMotionWindows)) {
+              errors.push('eventTrack.video.capture.activeMotionWindows must be an array');
+            } else {
+              cap.activeMotionWindows.forEach((win, wi) => {
+                const validTuple =
+                  Array.isArray(win) &&
+                  win.length === 2 &&
+                  isNonNegativeNumber(win[0]) &&
+                  isNonNegativeNumber(win[1]) &&
+                  win[1] >= win[0];
+                const validObj =
+                  isObject(win) &&
+                  isNonNegativeNumber(win.start) &&
+                  isNonNegativeNumber(win.end) &&
+                  win.end >= win.start;
+                if (!validTuple && !validObj) {
+                  errors.push(
+                    `eventTrack.video.capture.activeMotionWindows[${wi}] must be { start, end } with 0 <= start <= end`
+                  );
+                }
+              });
+            }
+          }
           if (cap.truncated !== undefined && typeof cap.truncated !== 'boolean') {
             errors.push('eventTrack.video.capture.truncated must be a boolean');
           }
@@ -404,6 +439,19 @@ export function validateEventTrack(eventTrack) {
         }
         if (event.button !== undefined && !MOUSE_BUTTONS.includes(event.button)) {
           errors.push(`${prefix}.button must be a valid button (${MOUSE_BUTTONS.join(', ')})`);
+        }
+        if (
+          (event.type === 'pointerdown' || event.type === 'pointerup') &&
+          event.modifiers !== undefined
+        ) {
+          if (
+            !Array.isArray(event.modifiers) ||
+            event.modifiers.some((mod) => !VALID_MODIFIERS.has(mod))
+          ) {
+            errors.push(
+              `${prefix}.modifiers must be an array of canonical modifiers (${[...VALID_MODIFIERS].join(', ')})`
+            );
+          }
         }
         break;
       case 'wheel':
@@ -452,7 +500,11 @@ export function validateEventTrack(eventTrack) {
         }
         break;
       case 'key':
-        if (!isNonEmptyString(event.key)) {
+        if (
+          typeof event.key !== 'string' ||
+          event.key.length === 0 ||
+          (event.key !== ' ' && event.key.trim().length === 0)
+        ) {
           errors.push(`${prefix}.key must be a non-empty string`);
         }
         if (event.modifiers !== undefined) {
@@ -470,6 +522,9 @@ export function validateEventTrack(eventTrack) {
         }
         if (event.duration !== undefined && !isNonNegativeNumber(event.duration)) {
           errors.push(`${prefix}.duration must be a non-negative number`);
+        }
+        if (event.typing !== undefined && typeof event.typing !== 'boolean') {
+          errors.push(`${prefix}.typing must be a boolean`);
         }
         break;
       case 'step':
@@ -974,6 +1029,22 @@ function formatKeystrokeLabel(modifiers, key) {
   return allSymbols ? `${parts.join('')}${formattedKey}` : `${parts.join('+')}+${formattedKey}`;
 }
 
+function formatModifiedClickLabel(modifiers) {
+  const parts = modifiers.map((mod) => MODIFIER_SYMBOLS[mod] ?? mod);
+  const allSymbols = parts.every((part) => Object.values(MODIFIER_SYMBOLS).includes(part));
+  return allSymbols ? `${parts.join('')} Click` : `${parts.join('+')}+Click`;
+}
+
+function isSuppressedTypingKey(event) {
+  if (event.typing === true) return true;
+  const modifiers = event.modifiers ?? [];
+  if (modifiers.length > 0) return false;
+  const key = event.key;
+  if (typeof key !== 'string' || Object.hasOwn(KEY_LABELS, key)) return false;
+  const codePoints = [...key];
+  return codePoints.length === 1 && !/^\p{Cc}$/u.test(key);
+}
+
 function normalizeBackground(background) {
   if (!background) {
     return { type: 'solid', color: '#0f172a' };
@@ -1223,6 +1294,7 @@ function compileOverlays(events, recipeOverlays, duration) {
   const gestureDefaultDuration = gestureCfg.duration ?? 0.35;
   const keystrokeEnabled = keystrokeCfg.enabled !== false;
   const keystrokeDuration = keystrokeCfg.duration ?? 1.2;
+  const includeTyping = keystrokeCfg.includeTyping === true;
 
   const cursorSamples = compileCursorSamples(events, duration);
   const ripples = [];
@@ -1241,6 +1313,15 @@ function compileOverlays(events, recipeOverlays, duration) {
             y: normalizeZero(event.y),
             button: event.button ?? 'left',
             duration: rippleDuration,
+          });
+        }
+        const clickModifiers = Array.isArray(event.modifiers) ? event.modifiers : [];
+        if (keystrokeEnabled && clickModifiers.length > 0) {
+          keystrokes.push({
+            t: roundTime(event.t),
+            label: formatModifiedClickLabel(clickModifiers),
+            keys: [...clickModifiers, 'Click'],
+            duration: keystrokeDuration,
           });
         }
         break;
@@ -1303,12 +1384,13 @@ function compileOverlays(events, recipeOverlays, duration) {
       }
       case 'key': {
         const action = event.action ?? 'press';
-        if (keystrokeEnabled && action !== 'up') {
+        if (keystrokeEnabled && action !== 'up' && (includeTyping || !isSuppressedTypingKey(event))) {
           const modifiers = event.modifiers ?? [];
+          const normalizedKeyToken = event.key === ' ' ? 'Space' : event.key;
           keystrokes.push({
             t: roundTime(event.t),
             label: formatKeystrokeLabel(modifiers, event.key),
-            keys: [...modifiers, event.key],
+            keys: [...modifiers, normalizedKeyToken],
             duration: isPositiveNumber(event.duration) ? event.duration : keystrokeDuration,
           });
         }
@@ -1414,23 +1496,106 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     shadow: recipeWindow.shadow ?? frame !== 'none',
   };
 
+  const { overlays, steps } = compileOverlays(eventTrack.events, recipe.overlays, resolvedTake.duration ?? 0);
+  const cursorTrackForCamera = {
+    enabled: true,
+    style: 'macos',
+    samples: overlays.cursor.samples,
+  };
+
+  const clampCameraAxisToBox = (center, halfSpan, minBound, maxBound) => {
+    const low = minBound + halfSpan;
+    const high = maxBound - halfSpan;
+    if (low <= high) {
+      return Math.min(high, Math.max(low, center));
+    }
+    const coverLow = maxBound - halfSpan;
+    const coverHigh = minBound + halfSpan;
+    return Math.min(coverHigh, Math.max(coverLow, center));
+  };
+
+  const clampCameraAxisToStage = (center, halfSpan, stageSpan) => {
+    const low = halfSpan;
+    const high = stageSpan - halfSpan;
+    return low <= high ? Math.min(high, Math.max(low, center)) : stageSpan / 2;
+  };
+
+  const resolveTargetViewportPoint = (target, kfTime, index) => {
+    if (target === 'window') {
+      return [viewportWidth / 2, viewportHeight / 2];
+    }
+    if (target === 'pointer') {
+      if (isFiniteNumber(kfTime) && cursorTrackForCamera.samples.length > 0) {
+        const sampled = sampleCursor(cursorTrackForCamera, kfTime);
+        if (sampled) return [sampled.x, sampled.y];
+      }
+      return [viewportWidth / 2, viewportHeight / 2];
+    }
+    if (Array.isArray(target) && target.length === 2 && target.every(isFiniteNumber)) {
+      return [target[0], target[1]];
+    }
+    if (isObject(target) && isFiniteNumber(target.x) && isFiniteNumber(target.y)) {
+      return [target.x, target.y];
+    }
+    throw Error(
+      `Invalid camera keyframe target at timeline.camera.keyframes[${index}]: expected "pointer", "window", or [vx, vy]`
+    );
+  };
+
   const rawKeyframes = recipeCamera.keyframes;
   const keyframes =
     Array.isArray(rawKeyframes) && rawKeyframes.length > 0
       ? rawKeyframes.map((kf, index) => {
           if (!isObject(kf)) return kf;
+          if (kf.clampToWindow !== undefined && typeof kf.clampToWindow !== 'boolean') {
+            throw Error(`timeline.camera.keyframes[${index}].clampToWindow must be a boolean`);
+          }
+          const zoom = kf.zoom ?? 1;
+          const hasDeclarativeTarget = kf.target !== undefined;
           const usesViewportTarget = kf.viewportX !== undefined || kf.viewportY !== undefined;
-          const targetX = usesViewportTarget
-            ? win.x + ((kf.viewportX ?? viewportWidth / 2) / viewportWidth) * win.width
-            : (kf.x ?? stage.width / 2);
-          const targetY = usesViewportTarget
-            ? win.y + ((kf.viewportY ?? viewportHeight / 2) / viewportHeight) * win.height
-            : (kf.y ?? stage.height / 2);
+
+          let targetX;
+          let targetY;
+          if (hasDeclarativeTarget) {
+            const [vx, vy] = resolveTargetViewportPoint(kf.target, kf.t, index);
+            targetX = win.x + (vx / viewportWidth) * win.width;
+            targetY = win.y + (vy / viewportHeight) * win.height;
+          } else if (usesViewportTarget) {
+            targetX = win.x + ((kf.viewportX ?? viewportWidth / 2) / viewportWidth) * win.width;
+            targetY = win.y + ((kf.viewportY ?? viewportHeight / 2) / viewportHeight) * win.height;
+          } else {
+            targetX = kf.x ?? stage.width / 2;
+            targetY = kf.y ?? stage.height / 2;
+          }
+
+          const shouldClampToWindow = kf.clampToWindow ?? (hasDeclarativeTarget && isPositiveNumber(zoom) && zoom > 1);
+          const shouldClampToStage = shouldClampToWindow || hasDeclarativeTarget;
+
+          if (
+            (shouldClampToWindow || shouldClampToStage) &&
+            isFiniteNumber(targetX) &&
+            isFiniteNumber(targetY) &&
+            isPositiveNumber(zoom) &&
+            isPositiveNumber(outputWidth) &&
+            isPositiveNumber(outputHeight) &&
+            isPositiveNumber(stage.width) &&
+            isPositiveNumber(stage.height)
+          ) {
+            const halfW = outputWidth / (2 * zoom);
+            const halfH = outputHeight / (2 * zoom);
+            if (shouldClampToWindow && isPositiveNumber(win.width) && isPositiveNumber(win.height)) {
+              targetX = clampCameraAxisToBox(targetX, halfW, win.x, win.x + win.width);
+              targetY = clampCameraAxisToBox(targetY, halfH, win.y, win.y + win.height);
+            }
+            targetX = clampCameraAxisToStage(targetX, halfW, stage.width);
+            targetY = clampCameraAxisToStage(targetY, halfH, stage.height);
+          }
+
           return {
             t: isFiniteNumber(kf.t) ? roundTime(kf.t) : kf.t,
             x: isFiniteNumber(targetX) ? normalizeZero(targetX) : targetX,
             y: isFiniteNumber(targetY) ? normalizeZero(targetY) : targetY,
-            zoom: kf.zoom ?? 1,
+            zoom,
             easing: normalizeEasing(kf.easing, index === 0 ? 'linear' : 'ease-in-out'),
           };
         })
@@ -1450,7 +1615,6 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     keyframes,
   };
 
-  const { overlays, steps } = compileOverlays(eventTrack.events, recipe.overlays, resolvedTake.duration ?? 0);
   const audio = {
     tracks: Array.isArray(recipe.audio?.tracks) ? structuredClone(recipe.audio.tracks) : [],
   };

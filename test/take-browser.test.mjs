@@ -498,6 +498,191 @@ test('computeRawCaptureStats reports honest rawFps (including >250ms gaps), capt
   }
 });
 
+test('typing step, modified-click pointerdown modifiers, and motion-window-aware computeRawCaptureStats work end-to-end', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'screen-kit-type-modclick-motion-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const dummyFrame = await sharp({ create: { width: 32, height: 24, channels: 3, background: '#0f172a' } }).png().toBuffer();
+  const base64Frame = dummyFrame.toString('base64');
+  const typedCalls = [];
+
+  const mockPw = {
+    chromium: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                return {
+                  async goto() {},
+                  async evaluate() { return [240, 120]; },
+                  mouse: { async move() {}, async down() {}, async up() {}, async wheel() {} },
+                  keyboard: {
+                    async press(chord) { typedCalls.push({ op: 'press', chord }); },
+                    async down(mod) { typedCalls.push({ op: 'down', mod }); },
+                    async up(mod) { typedCalls.push({ op: 'up', mod }); },
+                    async type(text, opts) { typedCalls.push({ op: 'type', text, opts }); },
+                  },
+                };
+              },
+              async newCDPSession() {
+                let listener = null;
+                return {
+                  on(ev, fn) { if (ev === 'Page.screencastFrame') listener = fn; },
+                  async send(method) {
+                    if (method === 'Page.captureScreenshot') return { data: base64Frame };
+                    if (method === 'Page.startScreencast' && listener) {
+                      listener({ data: base64Frame, metadata: { timestamp: 20.0 }, sessionId: 1 });
+                      listener({ data: base64Frame, metadata: { timestamp: 20.016 }, sessionId: 2 });
+                    }
+                    return {};
+                  },
+                  async detach() {},
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+  };
+
+  const result = await captureBrowserTake({
+    out: join(dir, 'take'),
+    captureMode: 'headless',
+    playwright: mockPw,
+    encodeFrames: async ({ outputFile, targetDuration, rawFrames }) => {
+      await writeFile(outputFile, Buffer.from('video'));
+      return {
+        width: 640,
+        height: 360,
+        fps: 60,
+        duration: targetDuration,
+        frames: Math.max(1, Math.round(targetDuration * 60)),
+        measuredFps: 60,
+        capturedFrames: rawFrames.length,
+        codec: 'h264',
+        audio: false,
+      };
+    },
+    recipe: {
+      url: 'https://example.test/data-grid',
+      viewport: [640, 360],
+      fps: 60,
+      tail: 0.02,
+      steps: [
+        { type: 'click', x: 200, y: 100, move: false, modifiers: ['Shift'], hold: 0.01, label: 'Shift select row' },
+        { type: 'dblclick', x: 200, y: 140, move: false, modifiers: ['cmd'], hold: 0.01, label: 'Command double click' },
+        { type: 'type', text: 'oak', delayMs: 5, settle: 0.02, label: 'Filter oak' },
+        { type: 'key', key: 'Escape', label: 'Clear filter' },
+      ],
+    },
+  });
+
+  // 1. Typing step invokes keyboard.type('oak', { delay: 5 }), emits step event, and emits NO key toast spam
+  assert.deepEqual(
+    typedCalls.filter((c) => c.op === 'type'),
+    [{ op: 'type', text: 'oak', opts: { delay: 5 } }],
+  );
+  const events = result.eventTrackData.events;
+  assert.ok(events.some((e) => e.type === 'step' && e.label === 'Filter oak'));
+  const keyEvents = events.filter((e) => e.type === 'key');
+  assert.equal(keyEvents.length, 1);
+  assert.equal(keyEvents[0].key, 'Escape');
+
+  // 2. Modified clicks record canonical modifiers on pointerdown and compile into HUD keystroke pills
+  const pointerdowns = events.filter((e) => e.type === 'pointerdown');
+  assert.deepEqual(pointerdowns[0].modifiers, ['Shift']);
+  assert.deepEqual(pointerdowns[1].modifiers, ['Meta']);
+  assert.deepEqual(pointerdowns[2].modifiers, ['Meta']);
+
+  // Invalid modifiers on pointerdown/pointerup are rejected by validateEventTrack
+  assert.throws(
+    () => validateEventTrack({
+      ...result.eventTrackData,
+      events: [{ t: 0, type: 'pointerdown', x: 10, y: 10, button: 'left', modifiers: ['SuperKey'] }],
+    }),
+    /modifiers/,
+  );
+
+  const compiled = compileTimeline({ eventTrack: result.eventTrackData });
+  assert.deepEqual(
+    compiled.overlays.keystrokes.map((k) => k.label),
+    ['⇧ Click', '⌘ Click', '⌘ Click', 'Esc'],
+  );
+
+  // 3. computeRawCaptureStats separates static pause/settle gaps from active-motion-window stalls
+  const pauseOnlyEvents = [
+    { t: 0.0, type: 'pointermove', x: 100, y: 100 },
+    // Active scroll gesture 0.10..0.30 (frames arrive every 16ms)
+    { t: 0.10, type: 'gesture', kind: 'scroll', x: 100, y: 100, deltaX: -200, deltaY: 0, duration: 0.2 },
+    // Static pause / settle 0.30..0.85 (no screencast frames needed while static!)
+    // Active drag + pointermove burst 0.85..1.05 (frames arrive every 16ms)
+    { t: 0.85, type: 'drag', from: [100, 100], to: [220, 100], duration: 0.2 },
+    { t: 0.88, type: 'pointermove', x: 140, y: 100 },
+    { t: 0.94, type: 'pointermove', x: 180, y: 100 },
+    { t: 1.00, type: 'pointermove', x: 220, y: 100 },
+  ];
+  const healthyWithStaticPause = computeRawCaptureStats({
+    rawFrames: [
+      { index: 1, cdpTimestamp: 1.00, elapsed: 0.00 },
+      { index: 2, cdpTimestamp: 1.10, elapsed: 0.10 },
+      { index: 3, cdpTimestamp: 1.12, elapsed: 0.12 },
+      { index: 4, cdpTimestamp: 1.15, elapsed: 0.15 },
+      { index: 5, cdpTimestamp: 1.18, elapsed: 0.18 },
+      { index: 6, cdpTimestamp: 1.21, elapsed: 0.21 },
+      { index: 7, cdpTimestamp: 1.24, elapsed: 0.24 },
+      { index: 8, cdpTimestamp: 1.27, elapsed: 0.27 },
+      { index: 9, cdpTimestamp: 1.30, elapsed: 0.30 },
+      // 550ms static pause here (1.30 -> 1.85)!
+      { index: 10, cdpTimestamp: 1.85, elapsed: 0.85 },
+      { index: 11, cdpTimestamp: 1.88, elapsed: 0.88 },
+      { index: 12, cdpTimestamp: 1.91, elapsed: 0.91 },
+      { index: 13, cdpTimestamp: 1.94, elapsed: 0.94 },
+      { index: 14, cdpTimestamp: 1.97, elapsed: 0.97 },
+      { index: 15, cdpTimestamp: 2.00, elapsed: 1.00 },
+      { index: 16, cdpTimestamp: 2.03, elapsed: 1.03 },
+      { index: 17, cdpTimestamp: 2.05, elapsed: 1.05 },
+    ],
+    elapsedDuration: 1.1,
+    requestedFps: 60,
+    events: pauseOnlyEvents,
+  });
+  assert.equal(healthyWithStaticPause.maxGapMs, 550);
+  assert.ok(healthyWithStaticPause.gapsOver2Frames >= 1);
+  assert.equal(healthyWithStaticPause.activeMotionGapsOver2Frames, 0);
+  assert.ok(healthyWithStaticPause.activeMotionMaxGapMs <= 30);
+  assert.deepEqual(healthyWithStaticPause.activeMotionWindows, [
+    { start: 0.1, end: 0.3 },
+    { start: 0.85, end: 1.05 },
+  ]);
+
+  // Real stall DURING active wheel / pressed pointermove burst IS flagged in activeMotionGapsOver2Frames
+  const stalledDuringMotion = computeRawCaptureStats({
+    rawFrames: [
+      { index: 1, cdpTimestamp: 5.00, elapsed: 0.00 },
+      { index: 2, cdpTimestamp: 5.10, elapsed: 0.10 },
+      // 180ms stall right in the middle of wheel + pressed pointermove bursts!
+      { index: 3, cdpTimestamp: 5.28, elapsed: 0.28 },
+      { index: 4, cdpTimestamp: 5.30, elapsed: 0.30 },
+    ],
+    elapsedDuration: 0.4,
+    requestedFps: 60,
+    events: [
+      { t: 0.10, type: 'wheel', x: 50, y: 50, deltaX: 0, deltaY: 120, duration: 0.05 },
+      { t: 0.10, type: 'pointerdown', x: 50, y: 50, button: 'left' },
+      { t: 0.15, type: 'pointermove', x: 90, y: 50 },
+      { t: 0.22, type: 'pointermove', x: 130, y: 50 },
+      { t: 0.28, type: 'pointermove', x: 170, y: 50 },
+      { t: 0.30, type: 'pointerup', x: 170, y: 50, button: 'left' },
+    ],
+  });
+  assert.equal(stalledDuringMotion.activeMotionGapsOver2Frames, 1);
+  assert.equal(stalledDuringMotion.activeMotionMaxGapMs, 180);
+});
+
 test('real headless browser captures clean video take, rich event-track.json, and verifiable run.json', {
   skip: !process.env.SCREEN_KIT_BROWSER_TESTS,
 }, async (t) => {
