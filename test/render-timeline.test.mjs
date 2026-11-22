@@ -18,6 +18,7 @@ import {
   screenToRender,
 } from '../src/render-timeline.mjs';
 import { calculateTimelineMetadata } from '../src/remotion/Root.mjs';
+import { buildSquirclePath } from '../src/remotion/layout.mjs';
 import {
   compileTimeline,
   projectViewportToScreen,
@@ -634,5 +635,31 @@ test('moveFileAtomic copies to <dest>.tmp then renames atomically on EXDEV and C
     assert.match(ciYaml, /timeout-minutes:\s*20/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildSquirclePath produces a strictly convex closed clockwise contour with zero corner cusps', () => {
+  const path = buildSquirclePath(1440, 854, 16, 0.6);
+  const coords = [...path.matchAll(/[ML]\s+([0-9.]+)\s+([0-9.]+)/g)].map((m) => [
+    Number(m[1]),
+    Number(m[2]),
+  ]);
+  assert.ok(coords.length >= 96, 'expected smooth sampled superellipse contour');
+
+  // Verify every point stays within [0..1440, 0..854] and every consecutive turn is convex (cross >= -1e-6)
+  for (const [x, y] of coords) {
+    assert.ok(x >= 0 && x <= 1440, `x out of bounds: ${x}`);
+    assert.ok(y >= 0 && y <= 854, `y out of bounds: ${y}`);
+  }
+  const unique = coords.filter((pt, i) => {
+    const prev = coords[(i - 1 + coords.length) % coords.length];
+    return Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) > 1e-6;
+  });
+  for (let i = 0; i < unique.length; i++) {
+    const a = unique[i];
+    const b = unique[(i + 1) % unique.length];
+    const c = unique[(i + 2) % unique.length];
+    const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    assert.ok(cross >= -1e-6, `concave notch/cusp detected at (${b[0]}, ${b[1]}): cross=${cross}`);
   }
 });

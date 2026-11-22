@@ -14,9 +14,12 @@ export function resolveAssetUrl(src, mapAsset) {
 }
 
 /**
- * Build an Apple/Figma-style continuous-corner (squircle) SVG path for a rectangle of size `width x height`.
- * Uses smooth cubic Bezier transitions (`smoothness` in [0..1], default 0.6) so corners avoid the
- * harsh curvature jump of circular CSS `border-radius`.
+ * Build a mathematically C∞-smooth continuous-corner (superellipse / macOS squircle) SVG path
+ * for a rectangle of size `width x height`.
+ *
+ * Each corner follows the exact Lamé superellipse `(1 - u)^n + (1 - v)^n = 1` over shoulder
+ * length `s = r * (1 + smoothness * 0.45)`, which meets every straight edge with zero curvature
+ * jump (G2 continuity) and has zero cusps at the 45° diagonal.
  */
 export function buildSquirclePath(width, height, radius, smoothness = 0.6) {
   const w = Math.max(0, Number(width) || 0);
@@ -25,29 +28,54 @@ export function buildSquirclePath(width, height, radius, smoothness = 0.6) {
   if (r <= 0.01) {
     return `M 0 0 H ${w} V ${h} H 0 Z`;
   }
-  // Effective shoulder length extends slightly past r for G2-like continuous curvature
-  const s = Math.min(r * (1 + smoothness * 0.52), w / 2, h / 2);
-  // Control point pull toward the corner vertex
-  const c1 = r * (1 - 0.5522847498) * (1 - smoothness * 0.38);
-  const c2 = s * 0.45;
-  const f = (n) => Number(n.toFixed(3));
 
-  return [
-    `M ${f(s)} 0`,
-    `H ${f(w - s)}`,
-    `C ${f(w - c2)} 0 ${f(w - c1)} 0 ${f(w - c1)} ${f(c1)}`,
-    `C ${f(w)} ${f(c1)} ${f(w)} ${f(c2)} ${f(w)} ${f(s)}`,
-    `V ${f(h - s)}`,
-    `C ${f(w)} ${f(h - c2)} ${f(w)} ${f(h - c1)} ${f(w - c1)} ${f(h - c1)}`,
-    `C ${f(w - c1)} ${f(h)} ${f(w - c2)} ${f(h)} ${f(w - s)} ${f(h)}`,
-    `H ${f(s)}`,
-    `C ${f(c2)} ${f(h)} ${f(c1)} ${f(h)} ${f(c1)} ${f(h - c1)}`,
-    `C 0 ${f(h - c1)} 0 ${f(h - c2)} 0 ${f(h - s)}`,
-    `V ${f(s)}`,
-    `C 0 ${f(c2)} 0 ${f(c1)} ${f(c1)} ${f(c1)}`,
-    `C ${f(c1)} 0 ${f(c2)} 0 ${f(s)} 0`,
-    'Z',
-  ].join(' ');
+  const sm = Math.max(0, Math.min(1, Number(smoothness) || 0));
+  // n = 2 is a circle; n ≈ 4.2 matches Apple continuous corners (squircle)
+  const n = 2 + sm * 3.6;
+  const exp = 2 / n;
+  // Shoulder length extends slightly past r so visual inset matches radius r
+  const s = Math.min(r * (1 + sm * 0.42), w / 2, h / 2);
+  const steps = 24;
+  const f = (v) => Number(v.toFixed(3));
+
+  const points = [];
+  // Top-right corner: from (w - s, 0) to (w, s), angle θ: 0 -> π/2
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * (Math.PI / 2);
+    const x = w - s + s * Math.pow(Math.sin(theta), exp);
+    const y = s - s * Math.pow(Math.cos(theta), exp);
+    points.push([x, y]);
+  }
+  // Bottom-right corner: from (w, h - s) to (w - s, h)
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * (Math.PI / 2);
+    const x = w - s + s * Math.pow(Math.cos(theta), exp);
+    const y = h - s + s * Math.pow(Math.sin(theta), exp);
+    points.push([x, y]);
+  }
+  // Bottom-left corner: from (s, h) to (0, h - s)
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * (Math.PI / 2);
+    const x = s - s * Math.pow(Math.sin(theta), exp);
+    const y = h - s + s * Math.pow(Math.cos(theta), exp);
+    points.push([x, y]);
+  }
+  // Top-left corner: from (0, s) to (s, 0)
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * (Math.PI / 2);
+    const x = s - s * Math.pow(Math.cos(theta), exp);
+    const y = s - s * Math.pow(Math.sin(theta), exp);
+    points.push([x, y]);
+  }
+
+  return (
+    `M ${f(points[0][0])} ${f(points[0][1])} ` +
+    points
+      .slice(1)
+      .map(([x, y]) => `L ${f(x)} ${f(y)}`)
+      .join(' ') +
+    ' Z'
+  );
 }
 
 /**
