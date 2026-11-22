@@ -566,7 +566,8 @@ export async function encodeScreencastFrames({
   for (let i = 0; i < timeline.length; i++) {
     const current = timeline[i];
     const nextT = i + 1 < timeline.length ? timeline[i + 1].t : targetDuration;
-    const dur = Math.max(1 / fps, nextT - current.t);
+    // Preserve sub-frame 120Hz ProMotion intervals rather than clamping up to 1/fps (which stretches time into slow-motion).
+    const dur = Math.max(0.0005, nextT - current.t);
     lines.push(`file '${escapeConcatPath(current.file)}'`);
     lines.push(`duration ${dur.toFixed(6)}`);
   }
@@ -582,7 +583,7 @@ export async function encodeScreencastFrames({
     : ['-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'];
   const codec = format === 'mp4'
     ? [
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-profile:v', 'high',
+        '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-profile:v', 'high',
         '-movflags', '+faststart',
       ]
     : [

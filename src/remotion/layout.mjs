@@ -85,7 +85,7 @@ export function buildSquirclePath(width, height, radius, smoothness = 0.6) {
  * `projectViewportToStage` and `projectViewportToScreen` remain exact for every frame style.
  */
 export function computeWindowChrome(win) {
-  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 16);
+  const borderRadius = win.borderRadius ?? (win.frame === 'none' ? 0 : 24);
   const shadow = win.shadow ?? win.frame !== 'none';
 
   switch (win.frame) {

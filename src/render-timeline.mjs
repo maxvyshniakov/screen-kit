@@ -582,12 +582,13 @@ export async function renderTimeline({
           },
         });
       } else {
-        const crf = target.codec === 'vp9' ? 24 : 18;
+        const crf = target.codec === 'vp9' ? 20 : 15;
         await renderMedia({
           serveUrl,
           composition,
           inputProps,
           codec: target.codec,
+          imageFormat: 'png',
           crf,
           pixelFormat: 'yuv420p',
           colorSpace: 'bt709',
