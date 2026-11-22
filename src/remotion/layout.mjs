@@ -91,6 +91,44 @@ export function computeWindowChrome(win) {
   const shadow = win.shadow ?? win.frame !== 'none';
 
   switch (win.frame) {
+    case 'macos-inset': {
+      const tl =
+        win.trafficLights === false
+          ? null
+          : {
+              x:
+                win.trafficLights && typeof win.trafficLights === 'object' && Number.isFinite(win.trafficLights.x)
+                  ? win.trafficLights.x
+                  : 14,
+              y:
+                win.trafficLights && typeof win.trafficLights === 'object' && Number.isFinite(win.trafficLights.y)
+                  ? win.trafficLights.y
+                  : 15,
+            };
+      return {
+        frame: 'macos-inset',
+        title: win.title ?? '',
+        borderRadius: win.borderRadius ?? 20,
+        shadow,
+        topBarHeight: 0,
+        bottomBarHeight: 0,
+        sideBorder: 0,
+        trafficLights: tl,
+        outerRect: {
+          x: win.x,
+          y: win.y,
+          width: win.width,
+          height: win.height,
+        },
+        contentOffset: { left: 0, top: 0 },
+        contentRect: {
+          x: win.x,
+          y: win.y,
+          width: win.width,
+          height: win.height,
+        },
+      };
+    }
     case 'macos': {
       const topBarHeight = 38;
       return {

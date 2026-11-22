@@ -18,7 +18,7 @@ export const EVENT_TRACK_VERSION = 1;
 
 export const CAPTURE_MODES = ['quality', 'headless'];
 export const COLOR_SPACES = ['srgb', 'p3'];
-export const WINDOW_FRAMES = ['none', 'macos', 'browser', 'device'];
+export const WINDOW_FRAMES = ['none', 'macos', 'macos-inset', 'browser', 'device'];
 export const BACKGROUND_TYPES = ['solid', 'gradient', 'image'];
 export const IMAGE_FITS = ['cover', 'contain', 'fill'];
 export const CAMERA_EASINGS = [
@@ -809,6 +809,18 @@ export function validateTimeline(timeline) {
     }
     if (win.shadow !== undefined && typeof win.shadow !== 'boolean') {
       errors.push('timeline.window.shadow must be a boolean');
+    }
+    if (win.trafficLights !== undefined && typeof win.trafficLights !== 'boolean') {
+      if (!isObject(win.trafficLights)) {
+        errors.push('timeline.window.trafficLights must be a boolean or { x, y } object');
+      } else {
+        if (win.trafficLights.x !== undefined && !isNonNegativeNumber(win.trafficLights.x)) {
+          errors.push('timeline.window.trafficLights.x must be a non-negative number');
+        }
+        if (win.trafficLights.y !== undefined && !isNonNegativeNumber(win.trafficLights.y)) {
+          errors.push('timeline.window.trafficLights.y must be a non-negative number');
+        }
+      }
     }
   }
 
@@ -2061,8 +2073,9 @@ export function compileTimeline({ take, eventTrack, recipe = {} } = {}) {
     y: normalizeZero(windowY),
     width: normalizeZero(windowWidth),
     height: normalizeZero(windowHeight),
-    borderRadius: normalizeZero(recipeWindow.borderRadius ?? (frame === 'none' ? 0 : 12)),
+    borderRadius: normalizeZero(recipeWindow.borderRadius ?? (frame === 'none' ? 0 : frame === 'macos-inset' ? 20 : 12)),
     shadow: recipeWindow.shadow ?? frame !== 'none',
+    ...(recipeWindow.trafficLights !== undefined ? { trafficLights: recipeWindow.trafficLights } : {}),
   };
 
   const { overlays, steps } = compileOverlays(eventTrack.events, effectiveRecipe.overlays, resolvedTake.duration ?? 0);

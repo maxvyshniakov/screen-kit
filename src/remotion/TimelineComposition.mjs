@@ -776,7 +776,41 @@ export function TimelineComposition({ timeline, output, renderVideoElement = tru
                   },
                 })
               : null
-          )
+          ),
+          windowChrome.frame === 'macos-inset' && windowChrome.trafficLights
+            ? h(
+                'div',
+                {
+                  'data-layer': 'inset-traffic-lights',
+                  style: {
+                    position: 'absolute',
+                    left: windowChrome.trafficLights.x,
+                    top: windowChrome.trafficLights.y,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 9,
+                    pointerEvents: 'none',
+                    zIndex: 5,
+                  },
+                },
+                [
+                  { bg: 'radial-gradient(circle at 35% 30%, #ff7b72 0%, #ff5f57 55%, #d9413a 100%)' },
+                  { bg: 'radial-gradient(circle at 35% 30%, #ffd454 0%, #febc2e 55%, #d89614 100%)' },
+                  { bg: 'radial-gradient(circle at 35% 30%, #4de065 0%, #28c840 55%, #1aa02e 100%)' },
+                ].map((dot, idx) =>
+                  h('span', {
+                    key: idx,
+                    style: {
+                      width: 14,
+                      height: 14,
+                      borderRadius: 999,
+                      background: dot.bg,
+                      boxShadow: 'inset 0 0.5px 0.5px rgba(255, 255, 255, 0.35), inset 0 0 0 0.5px rgba(0, 0, 0, 0.28), 0 1px 2px rgba(0, 0, 0, 0.26)',
+                    },
+                  })
+                )
+              )
+            : null
         ),
         // Precision vector double-hairline rim (dark outer edge + vertical specular inner edge)
         hasRoundedCorners

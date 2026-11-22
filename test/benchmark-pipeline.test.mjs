@@ -116,7 +116,7 @@ test('consumer benchmark example configs load standalone and satisfy stage/windo
     eventTrack: syntheticTrack,
     recipe: slMod.timelinePresentation,
   });
-  assert.equal(slTimeline.window.frame, 'macos');
+  assert.equal(slTimeline.window.frame, 'macos-inset');
   assert.equal(slTimeline.stage.background.type, 'image');
   assert.deepEqual(
     slTimeline.overlays.keystrokes.map((k) => k.label),

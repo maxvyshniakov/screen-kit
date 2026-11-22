@@ -18,7 +18,7 @@ export const timelinePresentation = {
     },
   },
   window: {
-    frame: 'macos',
+    frame: 'macos-inset',
     title: 'Straylight — Scenario Editor',
     width: 1440,
     height: 810,
@@ -57,6 +57,7 @@ export default {
     'scenario-editor-acceptance': {
       story: 'straylight-scenarios--linear',
       ready: '[data-testid="canvas"]',
+      setup: ["document.querySelector('.app-shell')?.setAttribute('data-native-titlebar', 'true')"],
       initialPointer: [720, 380],
       tail: 0.35,
       steps: [

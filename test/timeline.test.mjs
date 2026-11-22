@@ -920,3 +920,30 @@ test('sine-in-out easing, smooth 1.3s / sine-in-out default step camera glides (
   badOutCs.outputs[0].colorSpace = 'bt601';
   assert.equal(validateTimeline(badOutCs).ok, false);
 });
+
+test('macos-inset window frame compiles with overlay trafficLights and zero extra top bar', () => {
+  const track = makeFixtureEventTrack();
+  const compiled = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      window: { frame: 'macos-inset', trafficLights: { x: 14, y: 15 } },
+    },
+  });
+  assert.deepEqual(validateTimeline(compiled), { ok: true, errors: [] });
+  assert.equal(compiled.window.frame, 'macos-inset');
+  assert.equal(compiled.window.borderRadius, 20);
+  assert.deepEqual(compiled.window.trafficLights, { x: 14, y: 15 });
+
+  const noLights = compileTimeline({
+    eventTrack: track,
+    recipe: {
+      window: { frame: 'macos-inset', trafficLights: false },
+    },
+  });
+  assert.deepEqual(validateTimeline(noLights), { ok: true, errors: [] });
+  assert.equal(noLights.window.trafficLights, false);
+
+  const badLights = structuredClone(compiled);
+  badLights.window.trafficLights = { x: -4, y: 14 };
+  assert.equal(validateTimeline(badLights).ok, false);
+});
