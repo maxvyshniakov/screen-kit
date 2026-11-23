@@ -16,7 +16,7 @@
         "sharp": "0.35.5",
       },
       "devDependencies": {
-        "@maxvyshniakov/repo-kit": "0.6.0",
+        "@maxvyshniakov/repo-kit": "0.10.0",
       },
     },
   },
@@ -177,7 +177,7 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@maxvyshniakov/repo-kit": ["@maxvyshniakov/repo-kit@0.6.0", "https://npm.pkg.github.com/download/@maxvyshniakov/repo-kit/0.6.0/18243bbb8ee3f151426177440ff6d6ea09a77666", { "peerDependencies": { "playwright": ">=1.50.0" }, "bin": { "repo-kit": "src/cli.mjs", "repo-kit-lane": "src/lanefather.mjs" } }, "sha512-hOTo1f1bUBPJ8oKzeqrl3NxiFlIIPi48FkiMRojaFVCsjVAA5A65dFIgpTaUJ5JUfAMRYL5wccALcM5lArHrYA=="],
+    "@maxvyshniakov/repo-kit": ["@maxvyshniakov/repo-kit@0.10.0", "https://npm.pkg.github.com/download/@maxvyshniakov/repo-kit/0.10.0/8b2131c0d8bab232898131bdaccbad50e865c6c5", { "peerDependencies": { "playwright": ">=1.50.0" }, "bin": { "repo-kit": "src/cli.mjs", "repo-kit-lane": "src/lanefather.mjs" } }, "sha512-BtRAGfiyWpacRctbSjLe/igHiuMwhVg3UiB3ceVO8aBJxM10gzXHpemotZn262At5/FkAfPzc5ir+i8naTXNpw=="],
 
     "@mediabunny/aac-encoder": ["@mediabunny/aac-encoder@1.66.0", "", { "peerDependencies": { "mediabunny": "^1.0.0" } }, "sha512-46RM06RQGIqC+HQI30e2HR2JTgk6dzyD/ybD23E6zuc7R22/x1XIQHghJDkfKnHF72ztJBZxNbt/NncH7SrvYQ=="],
 

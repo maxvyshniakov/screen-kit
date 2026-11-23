@@ -76,7 +76,7 @@
     "sharp": "0.35.5"
   },
   "devDependencies": {
-    "@maxvyshniakov/repo-kit": "0.6.0"
+    "@maxvyshniakov/repo-kit": "0.10.0"
   },
   "license": "MIT"
 }
