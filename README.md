@@ -1,6 +1,7 @@
 # screen-kit
 
 [![CI](https://github.com/maxvyshniakov/screen-kit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/maxvyshniakov/screen-kit/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/screen-kit)](https://www.npmjs.com/package/screen-kit)
 [![Release](https://img.shields.io/github/v/release/maxvyshniakov/screen-kit)](https://github.com/maxvyshniakov/screen-kit/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#setup)
@@ -71,24 +72,28 @@ web bundle (VP9/AV1 + H.264 + WebP poster + embed.html) · YouTube upload (--dry
 
 ## Setup
 
-### macOS
+Install `screen-kit` from npm:
 
 ```sh
-bun install
-bun link
-brew install agg webp ffmpeg   # Python 3 is also required for PTY terminal capture
-screen-kit --help
+bun add -D screen-kit
+# or
+npm install -D screen-kit
 ```
 
-### Linux (Debian / Ubuntu)
+### System tools (macOS)
+
+```sh
+brew install agg webp ffmpeg   # Python 3 is also required for PTY terminal capture
+bunx screen-kit --help
+```
+
+### System tools (Linux — Debian / Ubuntu)
 
 ```sh
 sudo apt-get update
 sudo apt-get install -y ffmpeg webp python3
 # Install agg >= 1.9 from https://github.com/asciinema/agg/releases into /usr/local/bin/agg
-bun install
-bun link
-screen-kit --help
+bunx screen-kit --help
 ```
 
 ### Optional Capabilities

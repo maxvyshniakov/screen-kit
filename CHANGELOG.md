@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.2 - 2026-11-23
+
+- Add npm badge and `bun add -D screen-kit` / `npm install -D screen-kit` install instructions to `README.md`, and validate npmjs.org OIDC trusted publishing with provenance.
+
 ## 0.2.1 - 2026-11-23
 
 - Rename package from `@maxvyshniakov/screen-kit` to unscoped `screen-kit` for npmjs.org publication.
