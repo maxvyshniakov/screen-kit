@@ -1,6 +1,6 @@
 # Checks
 
-`slotfather run -n 1 -- bun run verify` runs repo-kit configuration, syntax and tests.
+`slotfather run -n 1 -- bun run verify` runs package-kit configuration, syntax and tests.
 Focused tests: `slotfather run -n 1 -- node --test test/<name>.test.mjs`.
 Terminal tests execute real PTY applications and verify screen expectations and cleanup.
 Video tests encode and decode real files. Encoders and captures require one machine slot;

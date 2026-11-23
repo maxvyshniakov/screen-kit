@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Upgrade `@maxvyshniakov/repo-kit` from vendored `0.2.2` to `0.6.0` (GitHub Packages) with synced git hooks, `bunfig.toml`, and changelog checks.
+- Migrate from vendored `@maxvyshniakov/repo-kit` `0.2.2` to `@maxvyshniakov/package-kit` `1.0.1` on npmjs.org (removing `bunfig.toml` / `GITHUB_TOKEN` install requirement), rename `repo-kit.config.mjs` to `package-kit.config.mjs`, sync git hooks, and add changelog checks.
 
 ## 0.2.0 - 2026-11-23
 
