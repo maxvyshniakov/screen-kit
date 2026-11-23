@@ -388,7 +388,7 @@ export async function publishWebBundle({
     name: bundleName,
     createdAt: new Date().toISOString(),
     tool: {
-      name: '@maxvyshniakov/screen-kit',
+      name: 'screen-kit',
       version: VERSION,
     },
     source: {

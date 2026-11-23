@@ -1,9 +1,10 @@
-# @maxvyshniakov/screen-kit Changelog
+# screen-kit Changelog
 
 ## Unreleased
 
 ## 0.2.1 - 2026-11-23
 
+- Rename package from `@maxvyshniakov/screen-kit` to unscoped `screen-kit` for npmjs.org publication.
 - Migrate from vendored `@maxvyshniakov/repo-kit` `0.2.2` to `@maxvyshniakov/package-kit` `1.0.1` on npmjs.org (removing `bunfig.toml` / `GITHUB_TOKEN` install requirement), rename `repo-kit.config.mjs` to `package-kit.config.mjs`, sync git hooks, and add changelog checks.
 - Configure npmjs.org OIDC trusted publishing with provenance (`publish: { registry: "npm", access: "public" }`, `packedConsumer` probes, and `.github/workflows/release-npm.yml`), replacing the GitHub Packages publish workflow.
 

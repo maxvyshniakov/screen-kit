@@ -1,8 +1,8 @@
-# Publishes @maxvyshniakov/screen-kit to npmjs.org with npm trusted publishing
+# Publishes screen-kit to npmjs.org with npm trusted publishing
 # (OIDC) and provenance.
 #
 # - Register this file once on npmjs.org as the package's trusted publisher:
-#   npm trust github @maxvyshniakov/screen-kit --file release-npm.yml --repo maxvyshniakov/screen-kit
+#   npm trust github screen-kit --file release-npm.yml --repo maxvyshniakov/screen-kit
 #   (In the web UI, enable "Allow npm publish" under Allowed actions and run
 #   this workflow once to validate the connection.)
 # - Release: cut the version (`bun run release <patch|minor|major>`), push main,

@@ -85,7 +85,7 @@ test('package exports and strict renderer module boundary stay decoupled from ca
   assert.equal(rootApi.projectViewportToRender, projectViewportToRender);
   assert.deepEqual(rootApi.RENDER_PROFILES, ['web-loop', 'youtube-master', 'shorts']);
 
-  const subpathMod = await import('@maxvyshniakov/screen-kit/render-timeline');
+  const subpathMod = await import('screen-kit/render-timeline');
   assert.equal(subpathMod.renderTimeline, renderTimeline);
 
   const rendererFiles = [

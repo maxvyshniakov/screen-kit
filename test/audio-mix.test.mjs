@@ -87,7 +87,7 @@ function makeInteractiveTimeline({ video = 'demo.mp4', duration = 5.0, fps = 30 
 }
 
 test('audio-mix exports cleanly from subpath ./audio-mix and root src/index.mjs', async () => {
-  const subpath = await import('@maxvyshniakov/screen-kit/audio-mix');
+  const subpath = await import('screen-kit/audio-mix');
   assert.equal(subpath.generateUiSfx, generateUiSfx);
   assert.equal(subpath.generateMusicBed, generateMusicBed);
   assert.equal(subpath.mixTimelineAudio, mixTimelineAudio);
