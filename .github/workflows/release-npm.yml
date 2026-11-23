@@ -1,0 +1,90 @@
+# Publishes @maxvyshniakov/screen-kit to npmjs.org with npm trusted publishing
+# (OIDC) and provenance.
+#
+# - Register this file once on npmjs.org as the package's trusted publisher:
+#   npm trust github @maxvyshniakov/screen-kit --file release-npm.yml --repo maxvyshniakov/screen-kit
+#   (In the web UI, enable "Allow npm publish" under Allowed actions and run
+#   this workflow once to validate the connection.)
+# - Release: cut the version (`bun run release <patch|minor|major>`), push main,
+#   then `gh workflow run release-npm.yml --repo maxvyshniakov/screen-kit --ref main`.
+name: Release to npm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: maxvyshniakov/package-kit/actions/setup-bun@v1.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install system tools (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg webp python3
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2t64 || \
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2
+          AGG_VERSION="v1.9.0"
+          case "$(uname -m)" in
+            x86_64)
+              AGG_ASSET="agg-x86_64-unknown-linux-gnu"
+              AGG_SHA256="f111e315cd71056b116302342553dd765b7297579ed511f111d0cedb442aeda6"
+              ;;
+            aarch64|arm64)
+              AGG_ASSET="agg-aarch64-unknown-linux-gnu"
+              AGG_SHA256="2b4be407b97e00e1c313a41d154ced8fa3d02c560c8f47a0db4950a2576444c9"
+              ;;
+            *)
+              echo "Unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          curl -fsSL "https://github.com/asciinema/agg/releases/download/${AGG_VERSION}/${AGG_ASSET}" -o /tmp/agg
+          echo "${AGG_SHA256}  /tmp/agg" | sha256sum -c -
+          chmod +x /tmp/agg
+          sudo mv /tmp/agg /usr/local/bin/agg
+
+      - name: Verify
+        run: bun run verify -- --release
+
+  publish:
+    needs: check
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: maxvyshniakov/package-kit/actions/setup-bun@v1.0.1
+      - uses: maxvyshniakov/package-kit/actions/npm-publish@v1.0.1

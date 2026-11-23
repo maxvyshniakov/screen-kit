@@ -1,9 +1,6 @@
 {
   "name": "@maxvyshniakov/screen-kit",
-  "version": "0.2.0",
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
-  },
+  "version": "0.2.1",
   "type": "module",
   "packageManager": "bun@1.4.4",
   "description": "Agent-operated product demo video, screenshot, and terminal recording pipeline with Remotion 4, Display P3, Gemini TTS, Shorts 9:16, and automated QA.",
