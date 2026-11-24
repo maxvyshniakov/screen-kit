@@ -97,7 +97,7 @@ export const STYLE = { bold: 1, underline: 2, strike: 4, invisible: 8, overline:
 export function snapshotScreen(terminal, theme, { cursor = false } = {}) {
   const { columns, rows } = { columns: terminal.cols, rows: terminal.rows };
   const buffer = terminal.buffer.active;
-  const text = new Array(columns * rows).fill('');
+  const text = Array.from({ length: columns * rows }, () => '');
   const widths = new Uint8Array(columns * rows), fg = new Uint32Array(columns * rows), bg = new Uint32Array(columns * rows);
   const styles = new Uint8Array(columns * rows);
   const cell = buffer.getNullCell();

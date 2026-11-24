@@ -240,7 +240,7 @@ screen-kit render --input out/screens/takes/navigation.cast --out demo.mp4 --fps
 - **Architecture & Contracts:** [`docs/SPEC.md`](docs/SPEC.md)
 - **End-to-End Benchmarks:** [`docs/benchmarks.md`](docs/benchmarks.md)
 - **Example Recipes:** [`examples/straylight.screen-kit.mjs`](examples/straylight.screen-kit.mjs), [`examples/data-grid.screen-kit.mjs`](examples/data-grid.screen-kit.mjs)
-- **Verification Gate:** `bun run verify` runs `package-kit check`, syntax checks, and the full test suite (`127` tests) on both macOS and Linux CI. Real browser tests are opt-in (`SCREEN_KIT_BROWSER_TESTS=1`).
+- **Verification Gate:** `bun run verify` runs the changelog and package-kit checks, `oxlint`, and the test suite in seven steps, on macOS and Linux CI; a lane check runs only the steps a change touches ([docs/agents/checks.md](docs/agents/checks.md)). Real browser tests are opt-in (`SCREEN_KIT_BROWSER_TESTS=1`).
 
 ## License
 

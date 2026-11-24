@@ -47,7 +47,7 @@ export function keyInput(key, applicationCursor=false) {
  if([...key].length===1)return key;
  if(Object.hasOwn(CURSOR,key))return (applicationCursor?'\x1bO':'\x1b[')+CURSOR[key];
  if(Object.hasOwn(KEYS,key))return KEYS[key];
- const control=/^Ctrl\+([a-zA-Z@\[\\\]^_])$/.exec(key);
+ const control=/^Ctrl\+([a-zA-Z@[\\\]^_])$/.exec(key);
  if(control)return String.fromCharCode(control[1].toUpperCase().charCodeAt(0)&0x1f);
  const alt=/^Alt\+(.+)$/.exec(key);
  if(alt)return '\x1b'+keyInput(alt[1],applicationCursor);
@@ -159,7 +159,7 @@ async function record(config, steps, signal) {
  const failed=exited.then(()=>{throw Error('Terminal capture ended before its steps finished')});
  failed.catch(()=>{});
  const waitFor=(texts,timeout)=>new Promise((success,failure)=>{
-  const finish=(result,error)=>{clearTimeout(timer);watchers.delete(watch);error?failure(error):success(result)};
+  const finish=(result,error)=>{clearTimeout(timer);watchers.delete(watch);if(error)failure(error);else success(result)};
   const watch=()=>{if(texts.every(text=>screen().includes(text)))finish(latest)};
   const timer=setTimeout(()=>finish(null,Error(`Terminal waitFor timed out after ${timeout}s: ${texts.join(', ')}\n--- screen ---\n${screen()}`)),timeout*1000);
   watchers.add(watch);

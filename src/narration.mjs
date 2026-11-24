@@ -6,7 +6,6 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promise
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, dirname, extname, join, relative, resolve } from 'node:path';
 import {
-  EXTERNAL_MEDIA_RE,
   fileExists,
   moveFileAtomic,
   rebaseMediaRef,
@@ -721,7 +720,7 @@ function mapExternalTimingsToScript(tokens, normalizedExternal, startOffset, max
   }
   anchors.reverse();
 
-  const rawMapped = new Array(n).fill(null);
+  const rawMapped = Array.from({ length: n }, () => null);
 
   const assignProportionalSpan = (sStart, sEnd, winStart, winEnd) => {
     const count = sEnd - sStart + 1;

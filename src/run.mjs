@@ -168,7 +168,7 @@ export async function withManagedServer(server, defaultCwd, fn) {
   }
 
   const serverCwd = resolve(defaultCwd, server.cwd ?? '.');
-  const mergedEnv = { ...process.env, ...(server.env ?? {}) };
+  const mergedEnv = { ...process.env, ...server.env };
 
   const child = Array.isArray(server.command)
     ? spawn(server.command[0], server.command.slice(1), {

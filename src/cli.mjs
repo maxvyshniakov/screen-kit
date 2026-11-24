@@ -99,7 +99,7 @@ function parseCursorDetectionFlag(rawDetection, rawColor) {
     }
   }
   if (rawColor !== undefined) {
-    options = { ...(options ?? {}), color: String(rawColor).trim() };
+    options = { ...options, color: String(rawColor).trim() };
   }
   return options;
 }

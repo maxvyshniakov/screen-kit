@@ -1,0 +1,2 @@
+# Two lanes that each add an entry under `## Unreleased` merge without a conflict (docs/agents/orchestration.md).
+CHANGELOG.md merge=union

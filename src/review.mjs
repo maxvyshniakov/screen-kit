@@ -241,7 +241,7 @@ export async function reviewRun({
         file,
         width: actual.width,
         height: actual.height,
-        ...(baselineInfo ?? {}),
+        ...baselineInfo,
       };
     } catch (error) {
       check(`${name}:file`, false, error.message);
@@ -249,7 +249,7 @@ export async function reviewRun({
         ok: false,
         status: artifact.status,
         error: error.message,
-        ...(baselineInfo ?? {}),
+        ...baselineInfo,
       };
     }
   }
