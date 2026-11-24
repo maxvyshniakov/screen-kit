@@ -12,15 +12,21 @@ import { bundle } from '@remotion/bundler';
 import {
   makeCancelSignal,
   openBrowser,
-  renderMedia,
-  renderStill,
-  selectComposition,
+  renderMedia as remotionRenderMedia,
+  renderStill as remotionRenderStill,
+  selectComposition as remotionSelectComposition,
 } from '@remotion/renderer';
 import { COLOR_SPACES, SAFE_OUTPUT_ID_RE, assertValidTimeline } from './timeline.mjs';
 import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
 import { computeFrameScene, projectViewportToRender, screenToRender } from './timeline-scene.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
+import { retryMissingNavigationResponse } from './internal/remotion-retry.mjs';
+
+// Each opens a page of its own: a navigation Remotion saw no response to is run again (internal/remotion-retry.mjs)
+const renderMedia = retryMissingNavigationResponse(remotionRenderMedia);
+const renderStill = retryMissingNavigationResponse(remotionRenderStill);
+const selectComposition = retryMissingNavigationResponse(remotionSelectComposition);
 
 const exec = promisify(execFile);
 

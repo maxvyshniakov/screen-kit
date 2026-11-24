@@ -16,7 +16,7 @@ export const TEST_GROUPS = {
   },
   'narration tests': { files: ['narration'], seconds: 40, heavy: true, memory: 2.4 },
   'review tests': { files: ['review-video', 'audio-mix'], seconds: 60, heavy: true, memory: 1.6 },
-  'render tests': { files: ['render-timeline'], seconds: 69, heavy: true, memory: 3.5 },
+  'render tests': { files: ['render-timeline', 'remotion-retry'], seconds: 69, heavy: true, memory: 3.5 },
 };
 
 export const testFile = name => `test/${name}.test.mjs`;
