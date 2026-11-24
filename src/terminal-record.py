@@ -3,8 +3,10 @@
 
 The caller runs the recipe's steps: every recorded output event is also written to stdout as a JSON line {"t", "o"},
 and stdin carries JSON-line commands: {"input", "label", "narration", "kind"} types now; {"check"} and {"start"} are
-noted in the actions file; {"end": true, "at": seconds | null} stops the capture then (or at once). `duration` is the
-most a capture may last.
+noted in the actions file ({"start": null} at the moment it arrives); {"end": true, "at": seconds | null} stops the
+capture then (or at once). `duration` is the most a capture may last. A command may exit before the steps end: its
+output is drained and the steps go on against its last screen, but an input step after the exit, or an exit with a
+nonzero status, fails the capture.
 """
 import codecs
 import errno
@@ -64,6 +66,8 @@ def record(config, leftover=b''):
         sys.stdout.flush()
 
     def act(step, elapsed):
+        if process.poll() is not None and step.get('input'):
+            raise RuntimeError(f'terminal command exited (exit {process.returncode}) before an input step')
         if step.get('input'):
             os.write(master, step['input'].encode())
         action_entry = dict(at=round(elapsed, 3), input=step.get('input', ''))
@@ -80,7 +84,7 @@ def record(config, leftover=b''):
         if 'check' in order:
             checks.append(order['check'])
         if 'start' in order:
-            capture_start = order['start']
+            capture_start = round(elapsed, 3) if order['start'] is None else order['start']
         if order.get('end'):
             at = order.get('at')
             if at is not None and at < elapsed - .05:
@@ -92,6 +96,8 @@ def record(config, leftover=b''):
                                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         slave = None
+        # Open until the command and every process that inherited the terminal have gone and their output is read
+        terminal_open = True
         while True:
             elapsed = time.monotonic() - started
             if end_at is not None and elapsed >= end_at:
@@ -104,7 +110,7 @@ def record(config, leftover=b''):
                     command(line, elapsed)
             if end_at is not None and elapsed >= end_at:
                 break
-            readable, _, _ = select.select([master, 0], [], [], .02)
+            readable, _, _ = select.select([master, 0] if terminal_open else [0], [], [], .02)
             if 0 in readable:
                 data = os.read(0, 65536)
                 if not data:
@@ -124,16 +130,14 @@ def record(config, leftover=b''):
                     byte_count += len(chunk)
                     if byte_count > config.get('maxBytes', 32 * 1024 * 1024):
                         raise RuntimeError('terminal output exceeded maxBytes')
-                elif process.poll() is not None:
-                    break
+                else:
+                    terminal_open = False
             if pending and (master not in readable or time.monotonic() - pending_since > .1):
                 flush()
-            if process.poll() is not None:
-                break
         if pending:
             flush()
-        if end_at is None:
-            raise RuntimeError(f'terminal command exited before its steps finished (exit {process.returncode})')
+        if process.poll() is not None and process.returncode != 0:
+            raise RuntimeError(f'terminal command failed (exit {process.returncode})')
         duration = round(max(end_at, events[-1][0] if events else 0), 3)
         if not events:
             raise RuntimeError('terminal command produced no output')

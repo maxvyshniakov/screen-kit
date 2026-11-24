@@ -33,6 +33,20 @@ function inspectCast(bytes) {
   return { width: header.width, height: header.height, frames: 0, duration: previous };
 }
 
+/** What a captured file actually holds: a take's terminal size and length, a video's probe, an image's pages. */
+async function inspectArtifact(file, bytes) {
+  const ext = extname(file).toLowerCase();
+  if (ext === '.cast') return inspectCast(bytes);
+  if (['.mp4', '.webm', '.mov'].includes(ext)) return probeVideo(file);
+  const metadata = await sharp(bytes, { animated: true }).metadata();
+  return {
+    width: metadata.width,
+    height: metadata.pageHeight ?? metadata.height,
+    frames: metadata.pages ?? 1,
+    duration: metadata.delay?.reduce((sum, delay) => sum + delay, 0) / 1000,
+  };
+}
+
 /** Verify exported bytes against the capture manifest; no application is launched. */
 export async function reviewRun({
   manifest,
@@ -72,13 +86,19 @@ export async function reviewRun({
         const data = await readFile(resolve(dirname(manifest), input.file));
         check(`${name}:take`, hash(data) === input.sha256, 'source take hash matches the capture manifest');
       }
+      // A multi-output take lists every render, the primary one first: each gets the primary's checks
       for (const output of artifact.outputs ?? []) {
-        const data = await readFile(resolve(dirname(manifest), output.file));
+        const path = resolve(dirname(manifest), output.file);
+        const data = await readFile(path);
         check(`${name}:output`, hash(data) === output.sha256, `${output.file} hash matches the capture manifest`);
-        if (!['.png', '.webp'].includes(extname(output.file).toLowerCase())) continue;
-        const metadata = await sharp(data, { animated: true }).metadata();
-        check(`${name}:output`, metadata.width === output.width && (metadata.pageHeight ?? metadata.height) === output.height
-          && (metadata.pages ?? 1) === output.frames, `${output.file} dimensions and frames match the capture manifest`);
+        const found = await inspectArtifact(path, data);
+        check(`${name}:output`, found.width === output.width && found.height === output.height,
+          `${output.file} dimensions ${found.width}×${found.height}; expected ${output.width}×${output.height}`);
+        if (output.frames !== undefined)
+          check(`${name}:output`, found.frames === output.frames, `${output.file} frames ${found.frames}; expected ${output.frames}`);
+        if (output.duration > 0 && found.frames > 1)
+          check(`${name}:output`, Math.abs(found.duration - output.duration) <= 0.1,
+            `${output.file} duration ${found.duration}s; expected ${output.duration}s`);
       }
       if (artifact.eventTrack) {
         const trackBytes = await readFile(resolve(dirname(manifest), artifact.eventTrack));
@@ -91,21 +111,10 @@ export async function reviewRun({
         }
       }
 
-      let actual;
       const ext = extname(file).toLowerCase();
       const cast = ext === '.cast';
       const isVideo = ['.mp4', '.webm', '.mov'].includes(ext);
-      if (cast) actual = inspectCast(bytes);
-      else if (isVideo) actual = await probeVideo(file);
-      else {
-        const metadata = await sharp(bytes, { animated: true }).metadata();
-        actual = {
-          width: metadata.width,
-          height: metadata.pageHeight ?? metadata.height,
-          frames: metadata.pages ?? 1,
-          duration: metadata.delay?.reduce((sum, delay) => sum + delay, 0) / 1000,
-        };
-      }
+      const actual = await inspectArtifact(file, bytes);
 
       check(`${name}:dimensions`, actual.width === artifact.width && actual.height === artifact.height,
         `dimensions ${actual.width}×${actual.height}; expected ${artifact.width}×${artifact.height}`);

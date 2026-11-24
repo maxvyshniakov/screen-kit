@@ -81,6 +81,11 @@ export function stepInput(step, {columns=1000, rows=1000, applicationCursor=fals
 
 // --- recipes -------------------------------------------------------------------------------------
 
+/** The names a terminal recipe's renders take in the output directory (before their extension). */
+export function terminalOutputNames(recipe, name) {
+ return recipeOutputs(recipe,name).map(output=>output.name);
+}
+
 /** A recipe's renders: `outputs`, or the single one `format`, `at`, `start` and `fps` describe. */
 function recipeOutputs(recipe, name) {
  const single=['format','at','start'].filter(key=>recipe[key]!==undefined);
@@ -315,16 +320,23 @@ export async function renderTerminalTake({cast,name,recipe={},cwd=process.cwd(),
   let start=recipe.start;
   if(start===undefined)start=await replay.firstDrawn(raster.theme)??0;
   else if(!(start>=0&&start<duration))throw Error('Terminal animation start must be within the take');
-  // Frame k shows every event before its end, start + (k + 1) / fps
+  // Frame k shows the screen at its presentation time, start + k / fps, every event up to then included, so
+  // the first frame is the screen at `start` itself; the last one also takes the events after its time, so the
+  // animation ends on the take's last screen. A frame is new only when its pixels differ (a changed attribute
+  // on a blank cell draws nothing), which also keeps the WebP encoder from merging frames behind our back.
   const count=Math.max(1,Math.round((duration-start)*fps));
   async function* frames() {
    let previous,pixels;
    for(let k=0;k<count;k++) {
     signal?.throwIfAborted();
-    await replay.advance(Math.min(duration,start+(k+1)/fps),k===count-1);
+    await replay.advance(k>0&&k===count-1?duration:start+k/fps+1e-6,true);
     const screen=replay.screen(raster.theme);
-    const changed=!sameScreen(screen,previous);
-    if(changed)pixels=await raster.render(screen);
+    let changed=!sameScreen(screen,previous);
+    if(changed) {
+     const drawn=await raster.render(screen);
+     changed=!pixels||!drawn.equals(pixels); // render returns a Buffer
+     pixels=drawn;
+    }
     previous=screen;
     yield {pixels,changed,k};
    }
@@ -344,6 +356,9 @@ export async function renderTerminalTake({cast,name,recipe={},cwd=process.cwd(),
   }
   const animation=stills.length>1?sharp(stills,{join:{animated:true}}):sharp(stills[0]);
   await animation.webp({lossless:true,effort:4,loop:0,...(stills.length>1?{delay:delays}:{})}).toFile(file);
-  return {file,take:cast,width,height,frames:stills.length,duration:delays.reduce((a,b)=>a+b,0)/1000,fps,renderer:RENDERER,font};
+  // What the encoder wrote, not what it was given: the manifest records the file review will read
+  const written=await sharp(file,{animated:true}).metadata();
+  const writtenDelays=written.delay??delays;
+  return {file,take:cast,width,height,frames:written.pages??1,duration:writtenDelays.reduce((a,b)=>a+b,0)/1000,fps,renderer:RENDERER,font};
  } finally {replay.dispose()}
 }

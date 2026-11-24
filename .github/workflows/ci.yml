@@ -23,6 +23,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The changelog-entry guard reads every commit of the pushed or proposed range
+          fetch-depth: 0
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -62,3 +65,17 @@ jobs:
 
       - name: Verify
         run: bun run verify
+
+      # The commit-msg hook asks each commit for a changelog entry or a "Changelog: none" trailer; a commit made with
+      # --no-verify skips it, so CI checks the range again (docs/agents/checks.md)
+      - name: Changelog entries
+        if: runner.os == 'Linux'
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base commit (a new branch): nothing to compare."
+          else
+            bunx package-kit check-changelog-entries "$BASE..$HEAD_SHA"
+          fi

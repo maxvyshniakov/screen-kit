@@ -312,6 +312,25 @@ async function isRecipeUnchanged({
   return true;
 }
 
+/**
+ * Every name a configuration's recipes write in the output directory, checked before anything is captured: a
+ * recipe writes its own name (its take, its export), and a terminal recipe each of its outputs' names too. Two
+ * recipes claiming one name would overwrite each other's files, whichever of them this run captures or reuses.
+ */
+async function claimOutputNames(config) {
+  const all = selectedRecipes(config);
+  const { terminalOutputNames } = all.some(([, recipe]) => recipe.source === 'terminal') ? await import('./terminal.mjs') : {};
+  const owners = new Map();
+  for (const [name, recipe] of all) {
+    const names = new Set([name, ...(recipe.source === 'terminal' ? terminalOutputNames(recipe, name) : [])]);
+    for (const claimed of names) {
+      const owner = owners.get(claimed);
+      if (owner !== undefined && owner !== name) throw Error(`recipes ${owner} and ${name} both write ${claimed}.*: rename one output`);
+      owners.set(claimed, name);
+    }
+  }
+}
+
 /** Capture through real source adapters; partial results and failures remain inspectable. */
 export async function captureRun({
   config,
@@ -323,6 +342,7 @@ export async function captureRun({
 } = {}) {
   const recipes = selectedRecipes(config, only);
   if (config?.server) validateServerConfig(config.server);
+  await claimOutputNames(config);
   cwd = resolve(cwd);
   out = resolve(cwd, out);
   const manifestPath = resolve(cwd, manifest ?? join(out, 'run.json'));

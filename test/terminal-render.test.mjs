@@ -211,3 +211,35 @@ test('an animation begins when the application first draws, not on the blank scr
     await assert.rejects(renderTerminalTake({ cast, out, name: 'late', recipe: { format: 'webp', start: 5, theme: THEME } }), /start must be within/);
   });
 });
+
+test('a changed attribute that draws nothing adds no frame, and the manifest counts the frames the WebP holds', async () => {
+  // A bold blank cell is a new screen with the very same pixels; the WebP encoder would merge such frames
+  const events = [[0, 'o', HIDE_CURSOR + '\x1b[2J\x1b[Halpha'], [1, 'o', '\x1b[1;8H\x1b[1m \x1b[0m'], [2, 'o', '\x1b[Hbeta '], [3, 'm', 'end']];
+  await withTake(12, 2, events, async ({ out, cast }) => {
+    const animation = await renderTerminalTake({ cast, out, name: 'same', recipe: { format: 'webp', fps: 2, theme: THEME } });
+    const metadata = await sharp(animation.file, { animated: true }).metadata();
+    assert.equal(animation.frames, metadata.pages);
+    assert.equal(animation.frames, 2);
+    assert.deepEqual(metadata.delay, [2000, 1000]);
+    assert.equal(animation.duration, 3);
+  });
+});
+
+test('the first frame is the screen at the start, and the last one ends on the take\'s last screen', async () => {
+  // Both changes fall inside a frame's interval at 4 fps: one just after the start, one just before the end
+  const events = [[0, 'o', HIDE_CURSOR + '\x1b[2J\x1b[H\x1b[38;2;250;10;10mfirst'], [0.1, 'o', '\x1b[H\x1b[38;2;10;250;10mnext '],
+    [0.9, 'o', '\x1b[H\x1b[38;2;10;10;250mlast '], [1, 'm', 'end']];
+  await withTake(12, 2, events, async ({ out, cast }) => {
+    const animation = await renderTerminalTake({ cast, out, name: 'edges', recipe: { format: 'webp', fps: 4, start: 0, theme: THEME } });
+    const frames = await pixels(animation.file, { animated: true });
+    const dominant = page => {
+      const totals = [0, 0, 0];
+      for (let y = page * animation.height; y < (page + 1) * animation.height; y++)
+        for (let x = 0; x < animation.width; x++) { const [r, g, b] = frames.at(x, y); if (r > 200 || g > 200 || b > 200) { totals[0] += r; totals[1] += g; totals[2] += b; } }
+      return totals.indexOf(Math.max(...totals));
+    };
+    assert.equal(animation.frames, 3);
+    assert.deepEqual([0, 1, 2].map(dominant), [0, 1, 2], 'the start screen, the next one, then the last');
+    assert.deepEqual((await sharp(animation.file, { animated: true }).metadata()).delay, [250, 500, 250]);
+  });
+});

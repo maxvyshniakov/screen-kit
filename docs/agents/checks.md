@@ -5,7 +5,8 @@
 - One gate step: `node scripts/run-tests.mjs "<step>"` (steps in [scripts/test-groups.mjs](../../scripts/test-groups.mjs)).
 - Lint: `bun run lint` (oxlint, [.oxlintrc.json](../../.oxlintrc.json): the correctness rules of the eslint, unicorn,
   oxc, node, promise and import plugins; test files may reach a module namespace by a computed name).
-- Changelog: `bun run check:changelogs`. Kit drift (managed hooks, workflow pins): `bun run check:kit`.
+- Changelog: `bun run check:changelogs` (format and versions); each commit's entry or `Changelog: none` trailer:
+  `bunx package-kit check-changelog-entries origin/dev..HEAD` (the commit-msg hook, and CI on Linux for the pushed range). Kit drift (managed hooks, workflow pins): `bun run check:kit`.
 - Terminal tests run real PTY applications and verify screen expectations and cleanup. Video tests encode and decode
   real files.
 

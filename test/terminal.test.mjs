@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -138,6 +138,41 @@ test('one PTY take renders several outputs, recorded and reviewed in the manifes
   assert.ok(entry.outputs[1].frames >= 2, 'the WebP shows the screen before and after the key');
   assert.equal(entry.outputs[2].frames, Math.round(entry.outputs[2].duration * 4));
   assert.equal((await reviewRun({ manifest: join(out, 'run.json') })).ok, true);
+  // A secondary video gets the same checks as a primary one: a wrong frame count fails review
+  const manifest = JSON.parse(await readFile(join(out, 'run.json'), 'utf8'));
+  manifest.recipes.overview.outputs[2].frames += 1;
+  await writeFile(join(out, 'run.json'), JSON.stringify(manifest));
+  const review = await reviewRun({ manifest: join(out, 'run.json') });
+  assert.equal(review.ok, false);
+  assert.ok(review.checks.some(check => !check.ok && /overview-clip\.mp4 frames/.test(check.message)), JSON.stringify(review.checks.filter(check => !check.ok)));
+}));
+
+test('an output named like another recipe is refused before anything is captured', () => inTemporary(async cwd => {
+  const terminal = { source: 'terminal', command: ['python3', '-c', echo], columns: 20, rows: 3, steps: [{ waitFor: 'ready' }] };
+  const config = { recipes: { dashboard: terminal, overview: { ...terminal, outputs: [{ name: 'dashboard', format: 'png' }] } } };
+  await assert.rejects(captureRun({ config, cwd, out: join(cwd, 'out'), only: 'overview' }), /recipes dashboard and overview both write dashboard\.\*/);
+  await assert.rejects(readFile(join(cwd, 'launches')), { code: 'ENOENT' }, 'nothing was launched');
+}));
+
+test('a command that prints and exits is captured; an input after its exit, or a failing exit, is refused', () => inTemporary(async cwd => {
+  const recipe = { command: ['python3', '-c', 'print("ready")'], columns: 20, rows: 3, steps: [{ waitFor: 'ready' }] };
+  const still = await captureTerminalRecipe({ name: 'short', cwd, out: join(cwd, 'out'), recipe });
+  assert.deepEqual(still.checkpoints.map(check => check.passed), [true]);
+  assert.equal(still.frames, 1);
+  await assert.rejects(captureTerminalRecipe({ name: 'late-key', cwd, out: join(cwd, 'out'), recipe: { ...recipe, steps: [{ waitFor: 'ready' }, { hold: 0.3 }, { key: 'x' }] } }),
+    /exited \(exit 0\) before an input step/);
+  await assert.rejects(captureTerminalRecipe({ name: 'failing', cwd, out: join(cwd, 'out'), recipe: { ...recipe, command: ['python3', '-c', 'import sys; print("ready"); sys.exit(3)'] } }),
+    /failed \(exit 3\)/);
+}));
+
+test('a startCapture of its own marks the moment it is reached', () => inTemporary(async cwd => {
+  const result = await captureTerminalRecipe({ name: 'later', cwd, out: join(cwd, 'out'), recipe: {
+    command: ['python3', '-c', echo], columns: 20, rows: 3, format: 'webp', fps: 4,
+    steps: [{ waitFor: 'ready' }, { hold: 0.8 }, { startCapture: true }, { hold: 0.5 }],
+  } });
+  const ready = result.checkpoints[0].at;
+  assert.ok(result.captureStart >= ready + 0.75, `capture starts after the hold: ${result.captureStart} vs ${ready}`);
+  assert.ok(Math.abs(result.duration - (result.takeDuration - result.captureStart)) <= 0.25);
 }));
 
 test('theme presets resolve by name; unknown names and leftover timed steps are refused', async () => {
