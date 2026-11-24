@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Record a trusted command in an isolated PTY; JSON config arrives on stdin."""
+"""Record a trusted command in an isolated PTY; JSON config arrives on stdin's first line.
+
+The caller runs the recipe's steps: every recorded output event is also written to stdout as a JSON line {"t", "o"},
+and stdin carries JSON-line commands: {"input", "label", "narration", "kind"} types now; {"check"} and {"start"} are
+noted in the actions file; {"end": true, "at": seconds | null} stops the capture then (or at once). `duration` is the
+most a capture may last.
+"""
+import codecs
 import errno
 import fcntl
 import json
@@ -15,7 +22,19 @@ import termios
 import time
 
 
-def record(config):
+def read_config():
+    """The first stdin line as JSON, and whatever arrived after it (live commands)."""
+    data = b''
+    while b'\n' not in data:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            break
+        data += chunk
+    line, _, rest = data.partition(b'\n')
+    return json.loads(line), rest
+
+
+def record(config, leftover=b''):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', config['rows'], config['columns'], 0, 0))
     environment = dict(os.environ, TERM='xterm-256color', COLORTERM='truecolor')
@@ -25,32 +44,73 @@ def record(config):
     events, actions, checks = [], [], []
     pending = b''
     pending_since = started
-    steps = list(config.get('steps', []))
-    index = 0
-    duration = config['duration']
+    # Decoded across reads, so a character split between two reads is never replaced
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    limit = config['duration']
+    end_at = None
+    commands = leftover
+    capture_start = None
     byte_count = 0
+
+    def flush():
+        nonlocal pending
+        text = decoder.decode(pending)
+        pending = b''
+        if not text:
+            return
+        event = [round(time.monotonic() - started, 3), 'o', text]
+        events.append(event)
+        sys.stdout.write(json.dumps(dict(t=event[0], o=text), ensure_ascii=False) + '\n')
+        sys.stdout.flush()
+
+    def act(step, elapsed):
+        if step.get('input'):
+            os.write(master, step['input'].encode())
+        action_entry = dict(at=round(elapsed, 3), input=step.get('input', ''))
+        for key in ('label', 'narration', 'kind'):
+            if key in step:
+                action_entry[key] = step[key]
+        actions.append(action_entry)
+
+    def command(line, elapsed):
+        nonlocal end_at, capture_start
+        order = json.loads(line)
+        if 'input' in order:
+            act(order, elapsed)
+        if 'check' in order:
+            checks.append(order['check'])
+        if 'start' in order:
+            capture_start = order['start']
+        if order.get('end'):
+            at = order.get('at')
+            if at is not None and at < elapsed - .05:
+                raise RuntimeError(f'terminal steps outlasted the duration ({elapsed:.2f}s > {at}s)')
+            end_at = elapsed if at is None else at
+
     try:
         process = subprocess.Popen(config['command'], cwd=config['cwd'], env=environment,
                                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         slave = None
-        while time.monotonic() - started < duration:
+        while True:
             elapsed = time.monotonic() - started
-            while index < len(steps) and steps[index]['at'] <= elapsed:
-                step = steps[index]
-                if step.get('input'):
-                    os.write(master, step['input'].encode())
-                action_entry = dict(at=round(elapsed, 3), input=step.get('input', ''))
-                if 'label' in step:
-                    action_entry['label'] = step['label']
-                if 'narration' in step:
-                    action_entry['narration'] = step['narration']
-                actions.append(action_entry)
-                if step.get('expect'):
-                    checks.append(dict(at=step['at'] + step.get('settle', .3), expect=step['expect']))
-                index += 1
-            readable, _, _ = select.select([master], [], [], .02)
-            if readable:
+            if end_at is not None and elapsed >= end_at:
+                break
+            if elapsed >= limit:
+                raise RuntimeError(f'terminal capture reached its {limit}s limit before its steps ended')
+            while b'\n' in commands:
+                line, _, commands = commands.partition(b'\n')
+                if line.strip():
+                    command(line, elapsed)
+            if end_at is not None and elapsed >= end_at:
+                break
+            readable, _, _ = select.select([master, 0], [], [], .02)
+            if 0 in readable:
+                data = os.read(0, 65536)
+                if not data:
+                    raise RuntimeError('terminal capture controller went away')
+                commands += data
+            if master in readable:
                 try:
                     chunk = os.read(master, 65536)
                 except OSError as error:
@@ -66,15 +126,15 @@ def record(config):
                         raise RuntimeError('terminal output exceeded maxBytes')
                 elif process.poll() is not None:
                     break
-            if pending and (not readable or time.monotonic() - pending_since > .1):
-                events.append([round(time.monotonic() - started, 3), 'o', pending.decode('utf-8', errors='replace')])
-                pending = b''
+            if pending and (master not in readable or time.monotonic() - pending_since > .1):
+                flush()
             if process.poll() is not None:
                 break
         if pending:
-            events.append([round(time.monotonic() - started, 3), 'o', pending.decode('utf-8', errors='replace')])
-        if process.poll() is not None and time.monotonic() - started < duration - .2:
-            raise RuntimeError(f'terminal command exited before capture finished (exit {process.returncode})')
+            flush()
+        if end_at is None:
+            raise RuntimeError(f'terminal command exited before its steps finished (exit {process.returncode})')
+        duration = round(max(end_at, events[-1][0] if events else 0), 3)
         if not events:
             raise RuntimeError('terminal command produced no output')
         header = dict(version=2, width=config['columns'], height=config['rows'], timestamp=0)
@@ -83,7 +143,10 @@ def record(config):
         # An end marker preserves intentional reading pauses after the last output.
         events.append([duration, 'm', 'end'])
         Path(config['cast']).write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in [header] + events) + '\n')
-        Path(config['actions']).write_text(json.dumps(dict(actions=actions, checks=checks), indent=2) + '\n')
+        summary = dict(actions=actions, checks=checks, duration=duration)
+        if capture_start is not None:
+            summary['start'] = capture_start
+        Path(config['actions']).write_text(json.dumps(summary, indent=2) + '\n')
     finally:
         if process is not None:
             try:
@@ -118,4 +181,4 @@ def record(config):
 
 if __name__ == '__main__':
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    record(json.load(sys.stdin))
+    record(*read_config())

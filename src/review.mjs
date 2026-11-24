@@ -72,6 +72,14 @@ export async function reviewRun({
         const data = await readFile(resolve(dirname(manifest), input.file));
         check(`${name}:take`, hash(data) === input.sha256, 'source take hash matches the capture manifest');
       }
+      for (const output of artifact.outputs ?? []) {
+        const data = await readFile(resolve(dirname(manifest), output.file));
+        check(`${name}:output`, hash(data) === output.sha256, `${output.file} hash matches the capture manifest`);
+        if (!['.png', '.webp'].includes(extname(output.file).toLowerCase())) continue;
+        const metadata = await sharp(data, { animated: true }).metadata();
+        check(`${name}:output`, metadata.width === output.width && (metadata.pageHeight ?? metadata.height) === output.height
+          && (metadata.pages ?? 1) === output.frames, `${output.file} dimensions and frames match the capture manifest`);
+      }
       if (artifact.eventTrack) {
         const trackBytes = await readFile(resolve(dirname(manifest), artifact.eventTrack));
         if (artifact.eventTrackSha256) {

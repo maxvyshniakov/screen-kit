@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """uv run --with fonttools python tools/build-symbol-font.py
 
-JetBrains Mono derivatives: compact square side bearings and a font-rendered alias for agg.
+JetBrains Mono derivatives: compact square side bearings (and a U+E000 alias, unused since agg was dropped).
 """
 from pathlib import Path
 from fontTools.ttLib import TTFont
@@ -16,8 +16,7 @@ for style in ('Regular','Bold'):
     font.getGlyphSet()[glyph].draw(TransformPen(pen,(.9,0,0,1,30,0)))
     font['glyf'][glyph]=pen.glyph()
     font['hmtx'][glyph]=(600,30)
-    # agg's swash renderer synthesizes U+25A0 as a solid cell. The private-use
-    # alias preserves the actual compact-square outline while blocks remain synthetic.
+    # The private-use alias once routed U+25A0 past agg's synthesized blocks; kept so rebuilds stay identical.
     for table in font['cmap'].tables:
         if table.isUnicode():
             table.cmap[0xE000]=glyph

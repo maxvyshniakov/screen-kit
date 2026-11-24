@@ -663,13 +663,12 @@ test('Finding #6 & #16: offline Kokoro guardrail never calls Gemini in auto alig
   }
 });
 
-test('Finding #7 & #8: CI pins agg release + sha256sum; publishYouTube preserves videoId and URL on partial caption/thumbnail failure', async () => {
-  const ciYaml = await readFile(resolve(REPO_ROOT, '.github/workflows/ci.yml'), 'utf8');
-  assert.doesNotMatch(ciYaml, /releases\/latest\/download\/agg/);
-  assert.match(ciYaml, /AGG_VERSION="v1\.\d+\.\d+"/);
-  assert.match(ciYaml, /x86_64\)/);
-  assert.match(ciYaml, /aarch64\|arm64\)/);
-  assert.match(ciYaml, /sha256sum -c/);
+test('Finding #7 & #8: CI downloads no unpinned terminal renderer; publishYouTube preserves videoId and URL on partial caption/thumbnail failure', async () => {
+  // Terminal takes render in-process (src/internal/terminal-raster.mjs): CI fetches no agg or gif2webp binary at all
+  for (const workflow of ['ci.yml', 'release-npm.yml']) {
+    const yaml = await readFile(resolve(REPO_ROOT, '.github/workflows', workflow), 'utf8');
+    assert.doesNotMatch(yaml, /\bagg\b|gif2webp|releases\/latest\/download/);
+  }
 
   const dir = await mkdtemp(join(tmpdir(), 'screen-kit-w7-yt-partial-'));
   try {
