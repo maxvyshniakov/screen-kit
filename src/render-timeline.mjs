@@ -21,6 +21,7 @@ import { generateContactSheet } from './images.mjs';
 import { probeVideo } from './video.mjs';
 import { computeFrameScene, projectViewportToRender, screenToRender } from './timeline-scene.mjs';
 import { COMPOSITION_ID } from './remotion/Root.mjs';
+import { runRemotion } from './internal/remotion-retry.mjs';
 
 const exec = promisify(execFile);
 
@@ -859,6 +860,9 @@ async function withRemotionSession(
       getChromiumOptionsForColorSpace,
       cancelSignal: remotionCancel?.cancelSignal,
       throwIfAborted,
+      // Every Remotion call goes through this: a page that got no navigation response is opened again, never
+      // after the session's signal aborts (internal/remotion-retry.mjs)
+      remotion: (call, options) => runRemotion(call, options, { signal, throwIfAborted, freshPort: allocateFreePort }),
     });
   } finally {
     if (signal && onAbort) {
@@ -924,6 +928,7 @@ export async function renderTimeline({
       getChromiumOptionsForColorSpace,
       cancelSignal,
       throwIfAborted,
+      remotion,
     }) => {
       const hasAudio = stagedTimeline.audio.tracks.length > 0;
       const stagedOutputs = [];
@@ -946,7 +951,7 @@ export async function renderTimeline({
           },
         };
 
-        const composition = await selectComposition({
+        const composition = await remotion(selectComposition, {
           serveUrl,
           port,
           id: COMPOSITION_ID,
@@ -966,7 +971,7 @@ export async function renderTimeline({
         if (target.kind === 'still') {
           const maxFrame = Math.max(0, composition.durationInFrames - 1);
           const frame = Math.min(maxFrame, Math.max(0, Math.round((target.posterTime ?? 0) * composition.fps)));
-          await renderStill({
+          await remotion(renderStill, {
             serveUrl,
             port,
             composition,
@@ -1003,7 +1008,7 @@ export async function renderTimeline({
           });
         } else {
           const crf = target.codec === 'vp9' ? 20 : 15;
-          await renderMedia({
+          await remotion(renderMedia, {
             serveUrl,
             port,
             composition,
@@ -1162,6 +1167,7 @@ export async function renderTimelineStills({
       getChromiumOptionsForColorSpace,
       cancelSignal,
       throwIfAborted,
+      remotion,
     }) => {
       const compositionCache = new Map();
       const getVariantContext = async (variantId) => {
@@ -1184,7 +1190,7 @@ export async function renderTimelineStills({
             colorSpace: resolvedColorSpace,
           },
         };
-        const composition = await selectComposition({
+        const composition = await remotion(selectComposition, {
           serveUrl,
           port,
           id: COMPOSITION_ID,
@@ -1219,7 +1225,7 @@ export async function renderTimelineStills({
           `requests[${i}] temp still file`
         );
 
-        await renderStill({
+        await remotion(renderStill, {
           serveUrl,
           port,
           composition,
@@ -1465,6 +1471,7 @@ export async function renderTimelinePreview({
       getChromiumOptionsForColorSpace,
       cancelSignal,
       throwIfAborted,
+      remotion,
     }) => {
       const browser = await getBrowserForColorSpace(previewColorSpace);
       const chromiumOptions = getChromiumOptionsForColorSpace(previewColorSpace);
@@ -1480,7 +1487,7 @@ export async function renderTimelinePreview({
         },
       };
 
-      const composition = await selectComposition({
+      const composition = await remotion(selectComposition, {
         serveUrl,
         port,
         id: COMPOSITION_ID,
@@ -1497,7 +1504,7 @@ export async function renderTimelinePreview({
         throwIfAborted();
         const frame = Math.min(maxFrame, Math.max(0, Math.round(target.t * composition.fps)));
         const tempStillFile = join(tempOutputsDir, target.filename);
-        await renderStill({
+        await remotion(renderStill, {
           serveUrl,
           port,
           composition,
