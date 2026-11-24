@@ -155,13 +155,19 @@ async function record(config, steps, signal) {
  const terminal=createTerminal(config.columns,config.rows);
  const watchers=new Set();
  let latest=0,writing=Promise.resolve();
+ let commandFailed;
+ const commandFailure=new Promise((_,failure)=>{commandFailed=failure});
+ commandFailure.catch(()=>{});
  createInterface({input:child.stdout}).on('line',line=>{
-  const {t,o}=JSON.parse(line);
+  const message=JSON.parse(line);
+  // The command exited on its own: a failure fails the steps now, not at a waitFor's timeout
+  if(message.exit!==undefined){if(message.exit!==0)commandFailed(Error(`Terminal command failed (exit ${message.exit})`));return}
+  const {t,o}=message;
   writing=writing.then(()=>new Promise(done=>terminal.write(o,done))).then(()=>{latest=t;for(const watch of watchers)watch()});
  });
  const screen=()=>Array.from({length:config.rows},(_,i)=>terminal.buffer.active.getLine(i)?.translateToString(true)??'').join('\n');
  const send=order=>child.stdin.write(JSON.stringify(order)+'\n');
- const failed=exited.then(()=>{throw Error('Terminal capture ended before its steps finished')});
+ const failed=Promise.race([exited.then(()=>{throw Error('Terminal capture ended before its steps finished')}),commandFailure]);
  failed.catch(()=>{});
  const waitFor=(texts,timeout)=>new Promise((success,failure)=>{
   const finish=(result,error)=>{clearTimeout(timer);watchers.delete(watch);if(error)failure(error);else success(result)};
@@ -321,15 +327,15 @@ export async function renderTerminalTake({cast,name,recipe={},cwd=process.cwd(),
   if(start===undefined)start=await replay.firstDrawn(raster.theme)??0;
   else if(!(start>=0&&start<duration))throw Error('Terminal animation start must be within the take');
   // Frame k shows the screen at its presentation time, start + k / fps, every event up to then included, so
-  // the first frame is the screen at `start` itself; the last one also takes the events after its time, so the
-  // animation ends on the take's last screen. A frame is new only when its pixels differ (a changed attribute
+  // the first frame is the screen at `start` itself; the last one (the only one, in a take shorter than a frame)
+  // takes every event to the end, so the animation ends on the take's last screen. A frame is new only when its pixels differ (a changed attribute
   // on a blank cell draws nothing), which also keeps the WebP encoder from merging frames behind our back.
   const count=Math.max(1,Math.round((duration-start)*fps));
   async function* frames() {
    let previous,pixels;
    for(let k=0;k<count;k++) {
     signal?.throwIfAborted();
-    await replay.advance(k>0&&k===count-1?duration:start+k/fps+1e-6,true);
+    await replay.advance(k===count-1?duration:start+k/fps+1e-6,true);
     const screen=replay.screen(raster.theme);
     let changed=!sameScreen(screen,previous);
     if(changed) {

@@ -318,11 +318,13 @@ async function isRecipeUnchanged({
  * recipes claiming one name would overwrite each other's files, whichever of them this run captures or reuses.
  */
 async function claimOutputNames(config) {
-  const all = selectedRecipes(config);
+  const all = Object.keys(config.recipes).map(name => [name, { ...config.defaults, ...config.recipes[name] }]);
   const { terminalOutputNames } = all.some(([, recipe]) => recipe.source === 'terminal') ? await import('./terminal.mjs') : {};
+  // A recipe this run does not select may be unfinished: its own name still counts, its outputs when they parse
+  const outputsOf = (recipe, name) => { try { return terminalOutputNames(recipe, name); } catch { return []; } };
   const owners = new Map();
   for (const [name, recipe] of all) {
-    const names = new Set([name, ...(recipe.source === 'terminal' ? terminalOutputNames(recipe, name) : [])]);
+    const names = new Set([name, ...(recipe.source === 'terminal' ? outputsOf(recipe, name) : [])]);
     for (const claimed of names) {
       const owner = owners.get(claimed);
       if (owner !== undefined && owner !== name) throw Error(`recipes ${owner} and ${name} both write ${claimed}.*: rename one output`);

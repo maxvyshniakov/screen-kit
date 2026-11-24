@@ -76,6 +76,9 @@ jobs:
         run: |
           if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             echo "No base commit (a new branch): nothing to compare."
+          elif ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            # A force push replaced the base: check from where the new history meets main
+            bunx package-kit check-changelog-entries "$(git merge-base origin/main "$HEAD_SHA")..$HEAD_SHA"
           else
             bunx package-kit check-changelog-entries "$BASE..$HEAD_SHA"
           fi

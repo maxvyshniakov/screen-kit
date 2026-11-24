@@ -152,6 +152,10 @@ test('an output named like another recipe is refused before anything is captured
   const config = { recipes: { dashboard: terminal, overview: { ...terminal, outputs: [{ name: 'dashboard', format: 'png' }] } } };
   await assert.rejects(captureRun({ config, cwd, out: join(cwd, 'out'), only: 'overview' }), /recipes dashboard and overview both write dashboard\.\*/);
   await assert.rejects(readFile(join(cwd, 'launches')), { code: 'ENOENT' }, 'nothing was launched');
+  // An unfinished recipe the run does not select blocks nothing
+  const unfinished = { recipes: { overview: terminal, draft: { source: 'terminal', format: 'png', outputs: [] } } };
+  const report = await captureRun({ config: unfinished, cwd, out: join(cwd, 'out'), only: 'overview' });
+  assert.equal(report.recipes.overview.status, 'complete');
 }));
 
 test('a command that prints and exits is captured; an input after its exit, or a failing exit, is refused', () => inTemporary(async cwd => {
@@ -163,6 +167,11 @@ test('a command that prints and exits is captured; an input after its exit, or a
     /exited \(exit 0\) before an input step/);
   await assert.rejects(captureTerminalRecipe({ name: 'failing', cwd, out: join(cwd, 'out'), recipe: { ...recipe, command: ['python3', '-c', 'import sys; print("ready"); sys.exit(3)'] } }),
     /failed \(exit 3\)/);
+  // A command that fails before its screen appears fails the capture at once, not at the waitFor's timeout
+  const started = Date.now();
+  await assert.rejects(captureTerminalRecipe({ name: 'crash', cwd, out: join(cwd, 'out'), recipe: { ...recipe, command: ['python3', '-c', 'import sys; print("oops"); sys.exit(2)'], steps: [{ waitFor: 'ready', timeout: 10 }] } }),
+    /failed \(exit 2\)/);
+  assert.ok(Date.now() - started < 5000, `failed after ${Date.now() - started} ms`);
 }));
 
 test('a startCapture of its own marks the moment it is reached', () => inTemporary(async cwd => {

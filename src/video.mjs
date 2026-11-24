@@ -69,7 +69,11 @@ export async function encodeRawVideo({ frames, width, height, output, fps, color
       for await (const frame of frames) {
         if (frame.length !== width * height * 3) throw Error('raw video frame has the wrong size');
         if (closed) break;
-        if (!child.stdin.write(frame)) await Promise.race([once(child.stdin, 'drain').catch(() => {}), ended]);
+        if (!child.stdin.write(frame)) {
+          const waiting = new AbortController();
+          await Promise.race([once(child.stdin, 'drain', { signal: waiting.signal }).catch(() => {}), ended]);
+          waiting.abort();
+        }
       }
     } catch (error) {
       child.kill('SIGKILL');

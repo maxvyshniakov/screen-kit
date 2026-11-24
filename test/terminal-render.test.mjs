@@ -243,3 +243,15 @@ test('the first frame is the screen at the start, and the last one ends on the t
     assert.deepEqual((await sharp(animation.file, { animated: true }).metadata()).delay, [250, 500, 250]);
   });
 });
+
+test('a take shorter than one frame shows its last screen', async () => {
+  const events = [[0, 'o', HIDE_CURSOR + '\x1b[2J\x1b[H\x1b[38;2;250;10;10mfirst'], [0.05, 'o', '\x1b[H\x1b[38;2;10;10;250mlast '], [0.1, 'm', 'end']];
+  await withTake(12, 2, events, async ({ out, cast }) => {
+    const animation = await renderTerminalTake({ cast, out, name: 'brief', recipe: { format: 'webp', fps: 4, start: 0, duration: 0.1, theme: THEME } });
+    assert.equal(animation.frames, 1);
+    const image = await pixels(animation.file);
+    let blue = 0, red = 0;
+    for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) { const [r, , b] = image.at(x, y); if (b > 200 && r < 60) blue++; if (r > 200 && b < 60) red++; }
+    assert.ok(blue > 20 && red === 0, `blue ${blue}, red ${red}`);
+  });
+});

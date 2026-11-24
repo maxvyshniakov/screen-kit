@@ -5,8 +5,8 @@ The caller runs the recipe's steps: every recorded output event is also written 
 and stdin carries JSON-line commands: {"input", "label", "narration", "kind"} types now; {"check"} and {"start"} are
 noted in the actions file ({"start": null} at the moment it arrives); {"end": true, "at": seconds | null} stops the
 capture then (or at once). `duration` is the most a capture may last. A command may exit before the steps end: its
-output is drained and the steps go on against its last screen, but an input step after the exit, or an exit with a
-nonzero status, fails the capture.
+output is drained, stdout gets {"exit": status}, and the steps go on against its last screen, but an input step
+after the exit, or an exit with a nonzero status, fails the capture.
 """
 import codecs
 import errno
@@ -53,6 +53,9 @@ def record(config, leftover=b''):
     commands = leftover
     capture_start = None
     byte_count = 0
+    # Open until the command and every process that inherited the terminal have gone and their output is read
+    terminal_open = True
+    exit_reported = False
 
     def flush():
         nonlocal pending
@@ -66,8 +69,10 @@ def record(config, leftover=b''):
         sys.stdout.flush()
 
     def act(step, elapsed):
-        if process.poll() is not None and step.get('input'):
+        if step.get('input') and process.poll() is not None:
             raise RuntimeError(f'terminal command exited (exit {process.returncode}) before an input step')
+        if step.get('input') and not terminal_open:
+            raise RuntimeError('terminal command closed its terminal before an input step')
         if step.get('input'):
             os.write(master, step['input'].encode())
         action_entry = dict(at=round(elapsed, 3), input=step.get('input', ''))
@@ -96,8 +101,6 @@ def record(config, leftover=b''):
                                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         slave = None
-        # Open until the command and every process that inherited the terminal have gone and their output is read
-        terminal_open = True
         while True:
             elapsed = time.monotonic() - started
             if end_at is not None and elapsed >= end_at:
@@ -134,6 +137,13 @@ def record(config, leftover=b''):
                     terminal_open = False
             if pending and (master not in readable or time.monotonic() - pending_since > .1):
                 flush()
+            if not terminal_open and not exit_reported and process.poll() is not None:
+                # Its output is all out: the controller learns of the exit now, not at a waitFor's timeout
+                if pending:
+                    flush()
+                sys.stdout.write(json.dumps(dict(exit=process.returncode)) + '\n')
+                sys.stdout.flush()
+                exit_reported = True
         if pending:
             flush()
         if process.poll() is not None and process.returncode != 0:
