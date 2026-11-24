@@ -650,21 +650,21 @@ test('S3 unified Remotion session removes AbortSignal listeners symmetrically an
       // Bottom half: <video> playback of p3-take.mp4 at (24, 96) vs (104, 96). It needs a Chromium that decodes the
       // take: on CI runners the still often shows a black frame, so it belongs to the opt-in real-browser acceptance
       // (SCREEN_KIT_BROWSER_TESTS=1, docs/agents/checks.md) and stays out of the gate
-      if (!process.env.SCREEN_KIT_BROWSER_TESTS) {
-        t.diagnostic(`${label} <video> P3 separation not checked: set SCREEN_KIT_BROWSER_TESTS=1`);
-        continue;
-      }
-      const vidP3Red = px(24, 96);
-      const vidSrgbRed = px(104, 96);
-      const vidDist = Math.hypot(
-        vidP3Red[0] - vidSrgbRed[0],
-        vidP3Red[1] - vidSrgbRed[1],
-        vidP3Red[2] - vidSrgbRed[2]
-      );
-      assert.ok(
-        vidDist >= 20,
-        `${label} <video>: expected distinct Display P3 red (${vidP3Red}) vs sRGB red (${vidSrgbRed}), dist=${vidDist}`
-      );
+      await t.test(`${label}: <video> keeps Display P3 red apart from sRGB red`, {
+        skip: !process.env.SCREEN_KIT_BROWSER_TESTS && 'real-browser acceptance: set SCREEN_KIT_BROWSER_TESTS=1',
+      }, () => {
+        const vidP3Red = px(24, 96);
+        const vidSrgbRed = px(104, 96);
+        const vidDist = Math.hypot(
+          vidP3Red[0] - vidSrgbRed[0],
+          vidP3Red[1] - vidSrgbRed[1],
+          vidP3Red[2] - vidSrgbRed[2]
+        );
+        assert.ok(
+          vidDist >= 20,
+          `${label} <video>: expected distinct Display P3 red (${vidP3Red}) vs sRGB red (${vidSrgbRed}), dist=${vidDist}`
+        );
+      });
     }
   } finally {
     await rm(workDir, { recursive: true, force: true });
