@@ -52,16 +52,6 @@ function round(value, digits = 4) {
   return Object.is(result, -0) ? 0 : result;
 }
 
-function escapeXml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;',
-  })[char]);
-}
-
 function slugify(label) {
   return String(label ?? '')
     .toLowerCase()

@@ -83,7 +83,7 @@ npm install -D screen-kit
 ### System tools (macOS)
 
 ```sh
-brew install agg webp ffmpeg   # Python 3 is also required for PTY terminal capture
+brew install ffmpeg   # Python 3 is also required for PTY terminal capture
 bunx screen-kit --help
 ```
 
@@ -91,8 +91,7 @@ bunx screen-kit --help
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y ffmpeg webp python3
-# Install agg >= 1.9 from https://github.com/asciinema/agg/releases into /usr/local/bin/agg
+sudo apt-get install -y ffmpeg python3
 bunx screen-kit --help
 ```
 
@@ -202,10 +201,34 @@ screen-kit run --config demo.screen-kit.mjs --out out/demo-uk \
 
 ## Terminal Recordings & Stills
 
-`screen-kit` also records real PTY terminal sessions (`.cast` asciicast v2) verified against rendered screen state via `@xterm/headless`, and exports lossless animated WebP, PNG stills, or silent MP4/WebM via `agg` 1.9+ and FFmpeg:
+`screen-kit` records real PTY terminal sessions (`.cast` asciicast v2) and renders them to PNG stills, lossless animated WebP or silent MP4/WebM (through FFmpeg). Frames are drawn straight from the replayed terminal's cells in 24-bit colour, with no intermediate GIF: every cell sits on whole pixels, box drawing and block elements are geometry that joins seamlessly at any `lineHeight`, text uses the bundled JetBrains Mono (Screen Kit Mono), and two-cell emoji use the system colour emoji font (Apple Color Emoji, Noto Color Emoji).
+
+A scenario is a list of steps that run in order against a live `@xterm/headless` screen, so nothing depends on guessed start-up delays:
+
+```js
+export default { recipes: { dashboard: {
+  source: 'terminal', command: ['godfather'], columns: 156, rows: 43,
+  theme: 'seti',                                   // 'ghostty' | 'seti' | 'prolight' | { bg, fg, palette }
+  fps: 4,
+  steps: [
+    { waitFor: ['SLOTS', '1 2 3 pages'], startCapture: true, timeout: 15 },  // the animation starts here
+    { key: 'j', hold: 1.5 },                       // 'Enter', 'Shift+Tab', 'Up', 'PageDown', 'Ctrl+C', 'Alt+x', 'j', ['j', 'j']
+    { wheel: { col: 149, row: 11, down: 4 }, hold: 1.5 },   // SGR 1006 wheel; up: n scrolls up
+    { click: { col: 20, row: 9, button: 'left' } },          // SGR 1006 press + release
+    { input: 'raw text', hold: 2 },                // raw bytes, when nothing else fits
+  ],
+  outputs: [                                       // one take, several renders; or format/at/start for one
+    { format: 'png', at: 0.3 },                    // dashboard.png, 0.3 s after startCapture
+    { suffix: '-navigation', format: 'webp' },     // dashboard-navigation.webp, from startCapture to the end
+    { name: 'dashboard-clip', format: 'mp4', fps: 30 },
+  ],
+} } };
+```
+
+A step runs `waitFor` (all strings on screen, else it fails after `timeout`, 15 s by default, showing the screen), then `startCapture`, then its one action (`key`, `wheel`, `click` or `input`), then `hold`. The take ends when the last step does: end on a `hold` to leave a reading pause. The command may exit first, as a printing command does: later `waitFor` and `hold` steps see its last screen, while an action after the exit, or a nonzero exit status, fails the capture. Each `waitFor` is checked again on the saved take at the moment it was met. An output's name may not be another recipe's. An output's `at` and `start` count from `startCapture` (else from the take's beginning); a still defaults to the last screen, an animation to `startCapture` or else the application's first drawn screen. Other options: `fps` (4 by default), `fontSize`, `lineHeight`, `fontFamily`, `fontDir`. Re-render a saved take without running the application:
 
 ```sh
-screen-kit render --input out/screens/takes/navigation.cast --out demo.webp --fps 1
+screen-kit render --input out/screens/takes/navigation.cast --out demo.webp --fps 4
 screen-kit render --input out/screens/takes/navigation.cast --out still.png --at 4
 screen-kit render --input out/screens/takes/navigation.cast --out demo.mp4 --fps 30
 ```
@@ -217,7 +240,7 @@ screen-kit render --input out/screens/takes/navigation.cast --out demo.mp4 --fps
 - **Architecture & Contracts:** [`docs/SPEC.md`](docs/SPEC.md)
 - **End-to-End Benchmarks:** [`docs/benchmarks.md`](docs/benchmarks.md)
 - **Example Recipes:** [`examples/straylight.screen-kit.mjs`](examples/straylight.screen-kit.mjs), [`examples/data-grid.screen-kit.mjs`](examples/data-grid.screen-kit.mjs)
-- **Verification Gate:** `bun run verify` runs `package-kit check`, syntax checks, and the full test suite (`127` tests) on both macOS and Linux CI. Real browser tests are opt-in (`SCREEN_KIT_BROWSER_TESTS=1`).
+- **Verification Gate:** `bun run verify` runs the changelog and package-kit checks, `oxlint`, and the test suite in seven steps, on macOS and Linux CI; a lane check runs only the steps a change touches ([docs/agents/checks.md](docs/agents/checks.md)). Real browser tests are opt-in (`SCREEN_KIT_BROWSER_TESTS=1`).
 
 ## License
 

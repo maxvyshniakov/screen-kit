@@ -1,0 +1,33 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "eslint",
+    "unicorn",
+    "oxc",
+    "node",
+    "promise",
+    "import"
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "env": {
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": [
+    "node_modules/**",
+    "out/**",
+    "test/fixtures/**"
+  ],
+  "overrides": [
+    {
+      "files": [
+        "test/**"
+      ],
+      "rules": {
+        "import/namespace": "off"
+      }
+    }
+  ]
+}

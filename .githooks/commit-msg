@@ -1,0 +1,22 @@
+#!/bin/sh
+# Managed by @maxvyshniakov/package-kit (package-kit hooks sync); do not edit.
+# Checks that a change to changelog.paths adds a "## Unreleased" line or carries
+# the trailer "Changelog: none (<reason>)"; skip once with git commit --no-verify.
+# Without a kit to run it warns and lets the commit through.
+skip() {
+  echo "commit-msg: warning: $1. The changelog-entry check did not run; CI's check-changelog-entries still does." >&2
+  exit 0
+}
+root=$(git rev-parse --show-toplevel)
+cli="$root/node_modules/@maxvyshniakov/package-kit/src/cli.mjs"
+if [ ! -f "$cli" ]; then
+  common=$(cd "$root" && cd "$(git rev-parse --git-common-dir)/.." && pwd)
+  cli="$common/node_modules/@maxvyshniakov/package-kit/src/cli.mjs"
+fi
+if [ ! -f "$cli" ]; then
+  cli=$(command -v package-kit 2>/dev/null) || cli=""
+fi
+[ -n "$cli" ] && [ -f "$cli" ] || skip "package-kit is not installed; run bun install, or put package-kit on PATH"
+command -v node >/dev/null 2>&1 || skip "node is not on PATH; install Node.js 22 or newer, or add it to the PATH Git hooks run with"
+node "$cli" help 2>/dev/null | grep -q "commit-msg <message file>" || skip "this package-kit has no commit-msg command; update package-kit"
+exec node "$cli" commit-msg "$@"

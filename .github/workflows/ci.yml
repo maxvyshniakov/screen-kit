@@ -23,6 +23,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The changelog-entry guard reads every commit of the pushed or proposed range
+          fetch-depth: 0
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -36,13 +39,13 @@ jobs:
 
       - name: Install system tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg webp agg
+        run: brew install ffmpeg
 
       - name: Install system tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg webp python3
+          sudo apt-get install -y ffmpeg python3 fonts-noto-color-emoji
           sudo apt-get install -y \
             libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
             libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
@@ -51,35 +54,31 @@ jobs:
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
             libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
             libgbm1 libasound2
-          AGG_VERSION="v1.9.0"
-          case "$(uname -m)" in
-            x86_64)
-              AGG_ASSET="agg-x86_64-unknown-linux-gnu"
-              AGG_SHA256="f111e315cd71056b116302342553dd765b7297579ed511f111d0cedb442aeda6"
-              ;;
-            aarch64|arm64)
-              AGG_ASSET="agg-aarch64-unknown-linux-gnu"
-              AGG_SHA256="2b4be407b97e00e1c313a41d154ced8fa3d02c560c8f47a0db4950a2576444c9"
-              ;;
-            *)
-              echo "Unsupported architecture: $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          curl -fsSL "https://github.com/asciinema/agg/releases/download/${AGG_VERSION}/${AGG_ASSET}" -o /tmp/agg
-          echo "${AGG_SHA256}  /tmp/agg" | sha256sum -c -
-          chmod +x /tmp/agg
-          sudo mv /tmp/agg /usr/local/bin/agg
 
       - name: Verify system tools
         run: |
           python3 --version
-          agg --version
           ffmpeg -version | head -n 1
-          gif2webp -version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
       - name: Verify
         run: bun run verify
+
+      # The commit-msg hook asks each commit for a changelog entry or a "Changelog: none" trailer; a commit made with
+      # --no-verify skips it, so CI checks the range again (docs/agents/checks.md)
+      - name: Changelog entries
+        if: runner.os == 'Linux'
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base commit (a new branch): nothing to compare."
+          elif ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            # A force push replaced the base: check from where the new history meets main
+            bunx package-kit check-changelog-entries "$(git merge-base origin/main "$HEAD_SHA")..$HEAD_SHA"
+          else
+            bunx package-kit check-changelog-entries "$BASE..$HEAD_SHA"
+          fi

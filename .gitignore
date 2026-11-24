@@ -5,3 +5,5 @@ out/
 .env*
 .DS_Store
 *.tgz
+# Lanefather lane worktrees (.claude/worktrees/lane-<id>) and local agent settings
+.claude/

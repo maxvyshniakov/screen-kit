@@ -168,7 +168,7 @@ export async function withManagedServer(server, defaultCwd, fn) {
   }
 
   const serverCwd = resolve(defaultCwd, server.cwd ?? '.');
-  const mergedEnv = { ...process.env, ...(server.env ?? {}) };
+  const mergedEnv = { ...process.env, ...server.env };
 
   const child = Array.isArray(server.command)
     ? spawn(server.command[0], server.command.slice(1), {
@@ -291,11 +291,15 @@ async function isRecipeUnchanged({
 
   const bytes = await readFile(manifestArtifactPath);
   if (prevEntry.sha256 && hash(bytes) !== prevEntry.sha256) return false;
+  for (const output of prevEntry.outputs ?? []) {
+    const path = resolve(manifestDir, output.file);
+    if (!(await fileExists(path)) || hash(await readFile(path)) !== output.sha256) return false;
+  }
 
   if (outArtifactPath !== manifestArtifactPath && !(await fileExists(outArtifactPath))) {
     await mkdir(dirname(outArtifactPath), { recursive: true });
     await copyFile(manifestArtifactPath, outArtifactPath);
-    for (const input of prevEntry.inputs ?? []) {
+    for (const input of [...(prevEntry.inputs ?? []), ...(prevEntry.outputs ?? [])]) {
       const srcInput = resolve(manifestDir, input.file);
       const dstInput = resolve(outDir, input.file);
       if (await fileExists(srcInput)) {
@@ -306,6 +310,27 @@ async function isRecipeUnchanged({
   }
 
   return true;
+}
+
+/**
+ * Every name a configuration's recipes write in the output directory, checked before anything is captured: a
+ * recipe writes its own name (its take, its export), and a terminal recipe each of its outputs' names too. Two
+ * recipes claiming one name would overwrite each other's files, whichever of them this run captures or reuses.
+ */
+async function claimOutputNames(config) {
+  const all = Object.keys(config.recipes).map(name => [name, { ...config.defaults, ...config.recipes[name] }]);
+  const { terminalOutputNames } = all.some(([, recipe]) => recipe.source === 'terminal') ? await import('./terminal.mjs') : {};
+  // A recipe this run does not select may be unfinished: its own name still counts, its outputs when they parse
+  const outputsOf = (recipe, name) => { try { return terminalOutputNames(recipe, name); } catch { return []; } };
+  const owners = new Map();
+  for (const [name, recipe] of all) {
+    const names = new Set([name, ...(recipe.source === 'terminal' ? outputsOf(recipe, name) : [])]);
+    for (const claimed of names) {
+      const owner = owners.get(claimed);
+      if (owner !== undefined && owner !== name) throw Error(`recipes ${owner} and ${name} both write ${claimed}.*: rename one output`);
+      owners.set(claimed, name);
+    }
+  }
 }
 
 /** Capture through real source adapters; partial results and failures remain inspectable. */
@@ -319,6 +344,7 @@ export async function captureRun({
 } = {}) {
   const recipes = selectedRecipes(config, only);
   if (config?.server) validateServerConfig(config.server);
+  await claimOutputNames(config);
   cwd = resolve(cwd);
   out = resolve(cwd, out);
   const manifestPath = resolve(cwd, manifest ?? join(out, 'run.json'));
@@ -369,7 +395,7 @@ export async function captureRun({
         report.recipes[name] = { status: 'running', recipeHash: hash(JSON.stringify(recipe)) };
         await save();
         try {
-          const video = ['mp4', 'webm'].includes(recipe.format);
+          const video = ['mp4', 'webm'].includes(recipe.format ?? recipe.outputs?.[0]?.format);
           const browserTake = recipe.source === 'browser' && (video || recipe.captureMode !== undefined) && recipe.driver !== 'agent-browser';
           const effectiveBase = recipe.base ?? config.server?.url;
           let artifact;
@@ -394,16 +420,15 @@ export async function captureRun({
             const { captureTerminalRecipe } = recipe.source === 'terminal' ? await import('./terminal.mjs') : {};
             const { captureBrowserRecipe } = recipe.source === 'browser' ? await import('./browser.mjs') : {};
             const capture = captureTerminalRecipe ?? captureBrowserRecipe;
-            const captureRecipe = recipe.source === 'terminal' && video ? { ...recipe, format: 'webp' } : recipe;
             artifact = await capture({
               name,
-              recipe: captureRecipe,
+              recipe, // a terminal take encodes its video itself, straight from the replayed cells
               cwd,
               out,
               base: effectiveBase,
               ...(recipe.scale ? { scale: recipe.scale } : {}),
             });
-            if (video && resolve(artifact.file) !== join(out, `${name}.${recipe.format}`)) {
+            if (video && recipe.source !== 'terminal' && resolve(artifact.file) !== join(out, `${name}.${recipe.format}`)) {
               const { renderVideo } = await import('./video.mjs');
               const output = join(out, `${name}.${recipe.format}`);
               const encoded = await renderVideo({ input: artifact.videoInput ?? artifact.file, output, fps: recipe.fps });
@@ -432,10 +457,17 @@ export async function captureRun({
             ...(artifact.take ? { take: relative(out, resolve(out, artifact.take)) } : {}),
             ...(artifact.eventTrack ? { eventTrack: relative(out, resolve(out, artifact.eventTrack)) } : {}),
           };
+          // Every render of a multi-output take, hashed like the primary one (which it lists first)
+          const outputs = artifact.outputs && await Promise.all(artifact.outputs.map(async output => {
+            const data = await readFile(resolve(out, output.file));
+            return { file: relative(out, resolve(out, output.file)), bytes: data.length, sha256: hash(data),
+              width: output.width, height: output.height, frames: output.frames, duration: output.duration };
+          }));
           report.recipes[name] = {
             ...report.recipes[name],
             ...artifact,
             ...normalizedRefs,
+            ...(outputs ? { outputs } : {}),
             file: relative(out, file),
             inputs,
             status: 'complete',

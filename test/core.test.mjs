@@ -18,9 +18,9 @@ test('a real PTY run records input checkpoints and verifiable output provenance'
   const cwd = await mkdtemp(join(tmpdir(), 'screen-kit-core-pty-'));
   try {
     const config = { recipes: { navigation: {
-      source: 'terminal', format: 'png', columns: 40, rows: 8, duration: 1.4,
-      command: ['python3', '-u', '-c', 'import os,tty,time; tty.setraw(0); print("\\x1b[2J\\x1b[Hselected alpha",flush=True); os.read(0,3); print("\\r\\nselected beta",flush=True); time.sleep(2)'],
-      steps: [{ at: 0.4, input: '\x1b[B', expect: 'selected beta', settle: 0.2 }],
+      source: 'terminal', format: 'png', columns: 40, rows: 8,
+      command: ['python3', '-u', '-c', 'import os,tty,time; tty.setraw(0); print("\\x1b[2J\\x1b[Hselected alpha",flush=True); os.read(0,3); print("\\r\\nselected beta",flush=True); time.sleep(5)'],
+      steps: [{ waitFor: 'selected alpha' }, { key: 'Down' }, { waitFor: 'selected beta' }, { hold: 0.2 }],
     } } };
     const out = join(cwd, 'out');
     const report = await captureRun({ config, cwd, out });
@@ -40,7 +40,7 @@ test('failed capture retains a failed manifest instead of a successful artifact 
   try {
     const out = join(cwd, 'out');
     await assert.rejects(captureRun({ cwd, out, config: { recipes: { missing: {
-      source: 'terminal', command: ['/this/command/does/not/exist'], duration: 0.2,
+      source: 'terminal', command: ['/this/command/does/not/exist'], steps: [{ hold: 0.2 }],
     } } } }), /failed|No such file/i);
     const report = JSON.parse(await readFile(join(out, 'run.json'), 'utf8'));
     assert.equal(report.status, 'failed');
@@ -54,8 +54,9 @@ test('raw asciicast captures pass review and reject out-of-order events even whe
   try {
     const out = join(cwd, 'out');
     const report = await captureRun({ cwd, out, config: { recipes: { terminal: {
-      source: 'terminal', format: 'cast', columns: 30, rows: 6, duration: 0.6,
-      command: ['python3', '-u', '-c', 'import time; print("real terminal output",flush=True); time.sleep(2)'],
+      source: 'terminal', format: 'cast', columns: 30, rows: 6,
+      command: ['python3', '-u', '-c', 'import time; print("real terminal output",flush=True); time.sleep(5)'],
+      steps: [{ waitFor: 'real terminal output' }, { hold: 0.3 }],
     } } } });
     const manifest = join(out, 'run.json');
     assert.equal((await reviewRun({ manifest })).ok, true);

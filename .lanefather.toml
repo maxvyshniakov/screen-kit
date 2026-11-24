@@ -1,0 +1,31 @@
+# Repository facts for the shared Lanefather / Package-Kit workflow (docs/agents/orchestration.md).
+project = "screen-kit"
+command = "lanefather"
+# The shared Store of the Package-Kit repositories (Sid-Kit, Data Grid): lane ids and the queue live there.
+state_dir = "~/.local/state/lanefather/lanes"
+coding_standards = "AGENTS.md"
+report_doc = "docs/agents/orchestration.md"
+queue_name = "screen-kit engineering queue"
+
+[checks]
+# package-kit's lane adapter (`package-kit hooks sync` writes it): it runs the verify steps of package-kit.config.mjs
+# that the lane's diff touches, under its own Slotfather lease named through PACKAGE_KIT_SLOT_*.
+verify = ".githooks/lane-check"
+slot_env = "PACKAGE_KIT_SLOT"
+
+# The render and pipeline steps run real captures and encoders for over a minute: a lane check that selects one
+# leases at least two slots for it (times in docs/agents/checks.md, "Gate times").
+[checks.min_slots]
+"verify:render%20tests" = 2
+"verify:pipeline%20tests" = 2
+
+[admission]
+provider = "slotfather"
+
+# Issue lifecycle (docs/agents/issue-tracker.md): label `integrated` after a green post-merge smoke, comment the land,
+# close through "Fixes #N" when the merge reaches main, comment the published version.
+[tickets]
+integrated_label = true
+land_comment = true
+fixes_trailer = true
+release_comment = true

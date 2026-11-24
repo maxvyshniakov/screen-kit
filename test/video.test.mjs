@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import sharp from 'sharp';
-import { renderVideo, probeVideo } from '../src/video.mjs';
+import { encodeRawVideo, renderVideo, probeVideo } from '../src/video.mjs';
 
 test('a real image sequence exports a silent two-second MP4 and WebM', async () => {
   const out = await mkdtemp(join(tmpdir(), 'screen-kit-video-'));
@@ -92,4 +92,28 @@ test('renderVideo rejects unknown colorSpace values', async () => {
     renderVideo({ input: '/tmp/in.png', output: '/tmp/out.mp4', colorSpace: 'rec2020' }),
     /unsupported colorSpace/,
   );
+});
+
+test('an encoder killed while the next frame is drawn fails the encoding instead of hanging it', async () => {
+  // Killed by a signal, FFmpeg leaves exitCode null; its close may come before the next frame's write
+  const out = await mkdtemp(join(tmpdir(), 'screen-kit-video-'));
+  const path = process.env.PATH;
+  try {
+    await writeFile(join(out, 'ffmpeg'), '#!/bin/sh\nkill -9 $$\n');
+    await chmod(join(out, 'ffmpeg'), 0o755);
+    process.env.PATH = `${out}:${path}`;
+    const width = 320, height = 240;
+    async function* frames() {
+      for (let k = 0; k < 3; k++) {
+        yield Buffer.alloc(width * height * 3, k * 80);
+        await new Promise(done => setTimeout(done, 300)); // drawing the next frame
+      }
+    }
+    const hung = new Promise((_, fail) => setTimeout(() => fail(Error('encoding hung')), 5000).unref());
+    await assert.rejects(Promise.race([encodeRawVideo({ frames: frames(), width, height, output: join(out, 'clip.mp4'), fps: 4 }), hung]), /ffmpeg failed/);
+    assert.deepEqual((await readdir(out)).sort(), ['ffmpeg'], 'no hidden file is left behind');
+  } finally {
+    process.env.PATH = path;
+    await rm(out, { recursive: true, force: true });
+  }
 });

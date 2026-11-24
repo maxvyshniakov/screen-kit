@@ -37,10 +37,12 @@ consumer CI must not depend on a sibling developer checkout.
 ## Terminal capture
 
 - Execute the real application in a PTY with explicit rows/columns and environment.
-- Send real keys/mouse escape sequences at recipe times. Save the original ANSI stream and
-  input event track as a reusable asciicast take. Assertions inspect a real terminal emulator.
-- Export static PNG, lossless animated WebP, and video from saved takes. Frame rate and pause
-  duration are explicit. Fonts, terminal palette and line height are fixed capture settings.
+- Run the recipe's steps in order against a live terminal emulator fed the recorded output:
+  wait for screen text (`waitFor`), send real keys and SGR mouse input, pause (`hold`). No step
+  depends on a guessed delay. Save the original ANSI stream and input event track as a reusable
+  asciicast take; replay re-checks each wait at the moment it was met.
+- Export static PNG, lossless animated WebP, and video from saved takes, several from one take.
+  Frame rate is explicit; an animation starts at the step that marks it. Fonts, terminal palette and line height are fixed capture settings.
 - Ghostty's built-in default palette and JetBrains Mono are the default terminal presentation;
   symbol fallback fonts and licenses ship with the tool. Rendering is headless terminal
   emulation, not a screenshot of the Ghostty window.
